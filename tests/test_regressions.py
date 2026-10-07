@@ -1,21 +1,20 @@
 import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import service
 from app.config import settings
-from app.db import conn, init_db, set_setting, get_setting
+from app.db import conn, init_db, reset_test_data, set_setting, get_setting
 from app.main import app
 from app.security import encrypt_secret
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path):
-    settings.database_path = str(tmp_path / "regression.db")
+def isolated_db():
     init_db()
+    reset_test_data()
     service.set_runtime("automation_paused", "0")
     service.set_runtime("pause_reason", "")
     service.set_runtime("automation_running", "0")
@@ -244,7 +243,7 @@ def test_batch_timeout_marks_user_for_review(monkeypatch):
                 """INSERT INTO users(
                        source_email,target_email,cloudiway_object_id,migration_status,
                        batch_number,batch_started_at
-                   ) VALUES(?,?,?,?,?,datetime('now','-2 minutes'))""",
+                   ) VALUES(?,?,?,?,?,DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 MINUTE))""",
                 ("timeout@x.com", "timeout@y.com", 999, "migrating", 1),
             )
         import asyncio
