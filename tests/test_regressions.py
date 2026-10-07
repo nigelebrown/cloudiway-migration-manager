@@ -77,7 +77,7 @@ def test_session_cookie_is_secure():
     with TestClient(app) as client:
         r = client.post(
             "/login",
-            data={"admin_password": "test-admin"},
+            data={"admin_password": "test-admin-password"},
             follow_redirects=False,
         )
         assert "secure" in r.headers["set-cookie"].lower()
@@ -86,7 +86,7 @@ def test_session_cookie_is_secure():
 def test_login_rate_limit():
     with TestClient(app) as client:
         # Successful login clears any prior attempt state for this test host.
-        client.post("/login", data={"admin_password": "test-admin"})
+        client.post("/login", data={"admin_password": "test-admin-password"})
         client.post("/logout")
         codes = [
             client.post("/login", data={"admin_password": f"bad-{i}"}).status_code
@@ -97,7 +97,7 @@ def test_login_rate_limit():
 
 def test_reupload_does_not_change_inflight_target():
     with TestClient(app) as client:
-        client.post("/login", data={"admin_password": "test-admin"})
+        client.post("/login", data={"admin_password": "test-admin-password"})
         with conn() as db:
             db.execute(
                 """INSERT INTO users(source_email,target_email,migration_status)
@@ -121,7 +121,7 @@ def test_reupload_does_not_change_inflight_target():
 
 def test_blank_target_and_spaced_name_headers_are_normalized():
     with TestClient(app) as client:
-        client.post("/login", data={"admin_password": "test-admin"})
+        client.post("/login", data={"admin_password": "test-admin-password"})
         csv = (
             b"Email,Target Email,First Name,Last Name\n"
             b"a@x.com,,Ann,Lee\n"
@@ -144,7 +144,7 @@ def test_blank_target_and_spaced_name_headers_are_normalized():
 
 def test_blank_names_do_not_become_nan():
     with TestClient(app) as client:
-        client.post("/login", data={"admin_password": "test-admin"})
+        client.post("/login", data={"admin_password": "test-admin-password"})
         csv = b"source_email,target_email,first_name,last_name\na@x.com,a@y.com,,\n"
         client.post("/upload", files={"file": ("users.csv", csv, "text/csv")})
         with conn() as db:
