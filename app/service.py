@@ -256,7 +256,7 @@ async def refresh_status() -> dict:
             "WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready')"
         ).fetchall()
 
-    updated = completed = failed = 0
+    updated = completed = failed = attention = timed_out = 0
     for row in rows:
         try:
             data = await cloud.progress(
@@ -272,16 +272,50 @@ async def refresh_status() -> dict:
             updated += 1
             completed += int(status == "completed")
             failed += int(status == "failed")
+            attention += int(status == "attention")
         except Exception as exc:
             log_event(row["id"], "status_refresh_error", str(exc))
 
-    if failed and settings.pause_on_any_failure:
+    if settings.batch_timeout_minutes > 0:
+        with conn() as db:
+            stale = db.execute(
+                """SELECT id FROM users
+                   WHERE migration_status IN ('migrating','ready')
+                     AND batch_started_at IS NOT NULL
+                     AND datetime(batch_started_at) <= datetime('now', ?)""",
+                (f"-{int(settings.batch_timeout_minutes)} minutes",),
+            ).fetchall()
+            if stale:
+                ids = [row["id"] for row in stale]
+                placeholders = ",".join("?" for _ in ids)
+                db.execute(
+                    f"UPDATE users SET migration_status='timed_out',cloudiway_status='timed_out',"
+                    f"error_message='Migration exceeded configured timeout; review Cloudiway before retrying.',"
+                    f"updated_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
+                    ids,
+                )
+                timed_out = len(ids)
+                log_event(None, "batch_timeout", f"{timed_out} migration(s) exceeded the configured timeout")
+
+    if (failed or attention or timed_out) and settings.pause_on_any_failure:
         set_runtime("automation_paused", "1")
-        set_runtime("pause_reason", f"{failed} migration(s) failed")
+        if timed_out:
+            reason = f"{timed_out} migration(s) exceeded the configured timeout"
+        elif attention:
+            reason = f"{attention} migration(s) returned a Cloudiway status requiring review"
+        else:
+            reason = f"{failed} migration(s) failed"
+        set_runtime("pause_reason", reason)
     elif settings.auto_continue and rows and all_terminal_for_latest_batch():
         await launch_next_batch()
 
-    return {"updated": updated, "completed": completed, "failed": failed}
+    return {
+        "updated": updated,
+        "completed": completed,
+        "failed": failed,
+        "attention": attention,
+        "timed_out": timed_out,
+    }
 
 
 def parse_progress(data) -> tuple[str, float | None, str]:
@@ -348,7 +382,7 @@ def all_terminal_for_latest_batch() -> bool:
             return False
         row = db.execute(
             "SELECT COUNT(*) total, "
-            "SUM(CASE WHEN migration_status IN ('completed','failed') THEN 1 ELSE 0 END) terminal "
+            "SUM(CASE WHEN migration_status IN ('completed','failed','attention','timed_out') THEN 1 ELSE 0 END) terminal "
             "FROM users WHERE batch_number=?",
             (latest,),
         ).fetchone()
