@@ -121,9 +121,21 @@ async def ensure_cloudiway_user(user: dict) -> int:
                     "UPDATE users SET cloudiway_object_id=?,cloudiway_status='existing',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (object_id, user["id"]),
                 )
+            log_event(user["id"], "cloudiway_user_found", "Existing Cloudiway mail user found")
             return object_id
-    except Exception:
-        pass
+    except Exception as exc:
+        # Do not hide authorization/project failures. A 403 here usually means
+        # the authenticated account cannot access this project/mail endpoint.
+        message = str(exc)
+        log_event(user["id"], "cloudiway_verify_user_failed", message)
+        if "(401)" in message or "(403)" in message:
+            raise RuntimeError(
+                "Cloudiway denied access while checking this mail user. "
+                "Reconnect Cloudiway and verify the selected project and account permissions. "
+                + message
+            ) from exc
+        # Non-auth lookup failures may simply mean the user does not exist;
+        # continue to the create call in that case.
 
     payload = {
         "id": 0,
