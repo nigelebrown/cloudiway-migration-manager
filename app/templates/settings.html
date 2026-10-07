@@ -46,17 +46,16 @@
 <div id="rackUserPass">
 <div class="field"><label>Rackspace Administrator Username</label><input name="username" value="{{rackspace_username}}" placeholder="Rackspace administrator username"></div>
 <div class="field"><label>Rackspace Administrator Password</label><input name="password" type="password" placeholder="Rackspace administrator password"></div>
-<div class="field"><label>Customer Account Number / RAN</label><input name="customer_id" value="{{rackspace_customer_id}}" placeholder="Optional for Identity login; required to test mailbox administration"></div>
 <p class="hint">The app will first authenticate the username/password with Rackspace Identity. If Rackspace also accepts the returned token for Cloud Office Email administration, automated password reset can use it. If not, the test will tell you that Email API keys are required.</p>
 </div>
 
 <div id="rackApiKey">
 <div class="field"><label>Rackspace Email API User Key</label><input name="user_key" value="{{rackspace_user_key}}" placeholder="User Key"></div>
 <div class="field"><label>Rackspace Email API Secret Key</label><input name="secret_key" type="password" placeholder="Secret Key"></div>
-<div class="field"><label>Customer Account Number / RAN</label><input name="customer_id" value="{{rackspace_customer_id}}" placeholder="Customer account number"></div>
 <p class="hint">Rackspace documents this as the supported authentication method for the Cloud Office Email API.</p>
 </div>
 
+<div class="field"><label>Customer Account Number / RAN</label><input name="customer_id" value="{{rackspace_customer_id}}" placeholder="Required for mailbox administration; optional for username/password Identity test"></div>
 <button>Save Rackspace Credentials</button>
 </form>
 <p><button class="secondary" type="button" onclick="testRackspace()">Authenticate & Test Password Reset Capability</button></p>
