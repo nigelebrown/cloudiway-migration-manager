@@ -23,6 +23,9 @@ SCHEMA = [
         first_name VARCHAR(255) NULL,
         last_name VARCHAR(255) NULL,
         generated_password_enc LONGTEXT NULL,
+        password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic',
+        manual_password_generated_at DATETIME NULL,
+        manual_password_confirmed_at DATETIME NULL,
         rackspace_status VARCHAR(64) NOT NULL DEFAULT 'pending',
         cloudiway_status VARCHAR(128) NOT NULL DEFAULT 'not_submitted',
         cloudiway_object_id BIGINT NULL,
@@ -127,6 +130,29 @@ def init_db():
     with conn() as db:
         for statement in SCHEMA:
             db.execute(statement)
+
+        # Forward-only migrations for existing installations.
+        columns = {
+            row["COLUMN_NAME"]
+            for row in db.execute(
+                """SELECT COLUMN_NAME
+                   FROM INFORMATION_SCHEMA.COLUMNS
+                   WHERE TABLE_SCHEMA=? AND TABLE_NAME='users'""",
+                (settings.db_name,),
+            ).fetchall()
+        }
+        if "password_reset_method" not in columns:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic' AFTER generated_password_enc"
+            )
+        if "manual_password_generated_at" not in columns:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN manual_password_generated_at DATETIME NULL AFTER password_reset_method"
+            )
+        if "manual_password_confirmed_at" not in columns:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN manual_password_confirmed_at DATETIME NULL AFTER manual_password_generated_at"
+            )
 
 
 def reset_test_data():
