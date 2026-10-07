@@ -322,3 +322,73 @@ def test_diagnostics_download_requires_admin():
     with TestClient(app) as client:
         r = client.get("/diagnostics/download")
         assert r.status_code == 401
+
+
+def test_upload_accepts_rackspace_template_with_target_email():
+    with TestClient(app) as client:
+        client.post("/login", data={"admin_password": "test-admin-password"})
+        csv_data = (
+            b"Username,Password,Enabled,FirstName,LastName,TargetEmail\n"
+            b"user@rack.example,,TRUE,Test,User,user@jcf.gov.jm\n"
+        )
+        response = client.post(
+            "/upload",
+            files={"file": ("rackspace.csv", csv_data, "text/csv")},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        with conn() as db:
+            row = db.execute(
+                "SELECT source_email,target_email,first_name,last_name FROM users WHERE source_email=?",
+                ("user@rack.example",),
+            ).fetchone()
+        assert row["target_email"] == "user@jcf.gov.jm"
+        assert row["first_name"] == "Test"
+        assert row["last_name"] == "User"
+
+
+def test_manual_rackspace_generate_and_confirm_round_trip():
+    from app.security import decrypt_secret
+
+    with TestClient(app) as client:
+        client.post("/login", data={"admin_password": "test-admin-password"})
+        with conn() as db:
+            db.execute(
+                "INSERT INTO users(source_email,target_email,first_name,last_name) VALUES(?,?,?,?)",
+                ("manual@rack.example", "manual@jcf.gov.jm", "Manual", "User"),
+            )
+            uid = db.execute(
+                "SELECT id FROM users WHERE source_email=?",
+                ("manual@rack.example",),
+            ).fetchone()["id"]
+
+        generated = client.post(
+            "/manual-rackspace/generate",
+            data=[("user_ids", str(uid))],
+        )
+        assert generated.status_code == 200
+        assert "manual@rack.example" in generated.content.decode("utf-8-sig")
+
+        with conn() as db:
+            row = db.execute(
+                "SELECT generated_password_enc,password_reset_method,rackspace_status FROM users WHERE id=?",
+                (uid,),
+            ).fetchone()
+        generated_value = decrypt_secret(row["generated_password_enc"])
+        assert row["password_reset_method"] == "manual_bulk"
+        assert row["rackspace_status"] == "manual_file_generated"
+        assert generated_value in generated.content.decode("utf-8-sig")
+
+        confirmed = client.post(
+            "/manual-rackspace/confirm-upload",
+            files={"file": ("confirm.csv", generated.content, "text/csv")},
+            follow_redirects=False,
+        )
+        assert confirmed.status_code == 303
+        with conn() as db:
+            row = db.execute(
+                "SELECT rackspace_status,manual_password_confirmed_at FROM users WHERE id=?",
+                (uid,),
+            ).fetchone()
+        assert row["rackspace_status"] == "manual_confirmed"
+        assert row["manual_password_confirmed_at"] is not None
