@@ -1,6 +1,10 @@
 import asyncio
 import io
+import re
 import secrets
+import time
+from collections import defaultdict, deque
+
 import pandas as pd
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -20,14 +24,52 @@ from app.service import (
 )
 
 app = FastAPI(title="JCF Mail Migration Console")
-app.add_middleware(SessionMiddleware, secret_key=settings.session_secret, https_only=False)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret,
+    https_only=settings.session_https_only,
+    same_site="strict",
+)
 templates = Jinja2Templates(directory="app/templates")
 _poller_task: asyncio.Task | None = None
+_login_attempts: dict[str, deque[float]] = defaultdict(deque)
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
+
+
+def _validate_runtime_secrets():
+    bad = {
+        "change-this-now",
+        "change-this-too",
+        "CHANGE-ME-TO-A-STRONG-ADMIN-PASSWORD",
+        "CHANGE-ME-TO-A-LONG-RANDOM-ENCRYPTION-SECRET",
+        "CHANGE-ME-TO-A-LONG-RANDOM-SESSION-SECRET",
+        "",
+    }
+    values = {
+        "APP_ADMIN_PASSWORD": settings.app_admin_password,
+        "APP_ENCRYPTION_KEY": settings.app_encryption_key,
+        "SESSION_SECRET": settings.session_secret,
+    }
+    weak = [name for name, value in values.items() if value in bad or len(value) < 12]
+    if weak:
+        raise RuntimeError("Unsafe default/weak application secret(s): " + ", ".join(weak))
 
 
 def require_admin(request: Request):
     if not request.session.get("admin"):
         raise HTTPException(status_code=401, detail="Administrator session required")
+
+
+def _page_auth(request: Request):
+    if not request.session.get("admin"):
+        return RedirectResponse("/", 303)
+    return None
+
+
+def _clean_cell(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
 async def status_poller():
@@ -43,7 +85,14 @@ async def status_poller():
 @app.on_event("startup")
 async def startup():
     global _poller_task
+    _validate_runtime_secrets()
     init_db()
+    # Recover from an interrupted process so a stale 'preparing' row never blocks the app.
+    with conn() as db:
+        db.execute(
+            "UPDATE users SET migration_status='failed',error_message='Recovered after interrupted preparation; retry this user.' "
+            "WHERE migration_status='preparing'"
+        )
     _poller_task = asyncio.create_task(status_poller())
 
 
@@ -62,12 +111,25 @@ async def home(request: Request):
 
 @app.post("/login")
 async def login(request: Request, admin_password: str = Form(...)):
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    q = _login_attempts[key]
+    while q and now - q[0] > settings.login_window_seconds:
+        q.popleft()
+    if len(q) >= settings.login_max_attempts:
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Too many failed sign-in attempts. Try again later."},
+            status_code=429,
+        )
     if not secrets.compare_digest(admin_password, settings.app_admin_password):
+        q.append(now)
         return templates.TemplateResponse(
             "login.html",
             {"request": request, "error": "Invalid administrator password"},
             status_code=401,
         )
+    q.clear()
     request.session["admin"] = True
     return RedirectResponse("/dashboard", 303)
 
@@ -80,7 +142,9 @@ async def logout(request: Request):
 
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
-    require_admin(request)
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
     return templates.TemplateResponse(
         "settings.html",
         {
@@ -92,6 +156,8 @@ async def settings_page(request: Request):
             "project_header": get_setting("cloudiway_project_header") or settings.cloudiway_project_header,
             "source_pool": get_setting("cloudiway_source_pool_id") or "",
             "target_pool": get_setting("cloudiway_target_pool_id") or "",
+            "error": request.session.pop("settings_error", None),
+            "notice": request.session.pop("settings_notice", None),
         },
     )
 
@@ -107,6 +173,7 @@ async def save_rackspace(
     set_setting("rackspace_user_key", user_key.strip())
     set_setting("rackspace_secret_key", encrypt_secret(secret_key.strip()), True)
     set_setting("rackspace_customer_id", customer_id.strip())
+    request.session["settings_notice"] = "Rackspace API settings saved."
     return RedirectResponse("/settings", 303)
 
 
@@ -140,9 +207,10 @@ async def cloudiway_login(
             set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
         if data.get("expiration"):
             set_setting("cloudiway_token_expiration", data["expiration"])
-        return RedirectResponse("/settings", 303)
+        request.session["settings_notice"] = "Cloudiway connection successful."
     except Exception as exc:
-        return RedirectResponse(f"/settings?error={str(exc)[:200]}", 303)
+        request.session["settings_error"] = str(exc)[:500]
+    return RedirectResponse("/settings", 303)
 
 
 @app.post("/settings/cloudiway/pools")
@@ -154,28 +222,34 @@ async def save_pools(
     require_admin(request)
     set_setting("cloudiway_source_pool_id", str(source_pool_id))
     set_setting("cloudiway_target_pool_id", str(target_pool_id))
+    request.session["settings_notice"] = "Cloudiway connector pool IDs saved."
     return RedirectResponse("/settings", 303)
 
 
 @app.get("/api/cloudiway/projects")
 async def api_projects(request: Request):
     require_admin(request)
-    return await _cloudiway_client().projects()
+    try:
+        return await _cloudiway_client().projects()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
 
 
 @app.get("/api/cloudiway/connectors")
 async def api_connectors(request: Request):
     require_admin(request)
-    client = _cloudiway_client()
-    return {
-        "connectors": await client.connectors(),
-        "pools": await client.connector_pools(),
-    }
+    try:
+        client = _cloudiway_client()
+        return {"connectors": await client.connectors(), "pools": await client.connector_pools()}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
 
 
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page(request: Request):
-    require_admin(request)
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
     return templates.TemplateResponse("upload.html", {"request": request})
 
 
@@ -200,25 +274,37 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
         "target email": "target_email",
         "firstname": "first_name",
         "lastname": "last_name",
+        "first name": "first_name",
+        "last name": "last_name",
     }
     df.rename(columns={c: aliases.get(c, c) for c in df.columns}, inplace=True)
     if "source_email" not in df.columns:
         return templates.TemplateResponse(
-            "upload.html", {"request": request, "error": "The file must include source_email (or Email)."}, status_code=400
+            "upload.html",
+            {"request": request, "error": "The file must include source_email (or Email)."},
+            status_code=400,
         )
-    if "target_email" not in df.columns:
-        df["target_email"] = df["source_email"]
 
-    imported = skipped = 0
+    imported = skipped = protected = 0
     with conn() as db:
         for _, row in df.iterrows():
-            src = str(row.get("source_email", "")).strip().lower()
-            tgt = str(row.get("target_email", "")).strip().lower()
-            if "@" not in src or "@" not in tgt:
+            src = _clean_cell(row.get("source_email")).lower()
+            tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
+            if not tgt:
+                tgt = src
+            if not EMAIL_RE.fullmatch(src) or not EMAIL_RE.fullmatch(tgt):
                 skipped += 1
                 continue
-            first = str(row.get("first_name", "") or "").strip()
-            last = str(row.get("last_name", "") or "").strip()
+            first = _clean_cell(row.get("first_name"))
+            last = _clean_cell(row.get("last_name"))
+
+            existing = db.execute(
+                "SELECT migration_status FROM users WHERE source_email=?", (src,)
+            ).fetchone()
+            if existing and existing["migration_status"] in ("preparing", "ready", "migrating", "completed"):
+                protected += 1
+                continue
+
             db.execute(
                 """INSERT INTO users(source_email,target_email,first_name,last_name)
                    VALUES(?,?,?,?)
@@ -229,13 +315,24 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
                 (src, tgt, first, last),
             )
             imported += 1
-    log_event(None, "file_upload", f"Imported/updated {imported}; skipped {skipped}; file={file.filename}")
+
+    log_event(
+        None,
+        "file_upload",
+        f"Imported/updated {imported}; skipped invalid {skipped}; protected active/completed {protected}; file={file.filename}",
+    )
+    request.session["upload_notice"] = (
+        f"Upload complete: {imported} imported/updated, {skipped} invalid skipped, "
+        f"{protected} active/completed users left unchanged."
+    )
     return RedirectResponse("/dashboard", 303)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, q: str = ""):
-    require_admin(request)
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
     return templates.TemplateResponse(
         "dashboard.html",
         {
@@ -243,8 +340,7 @@ async def dashboard(request: Request, q: str = ""):
             "q": q,
             "pilot_size": settings.pilot_size,
             "batch_size": settings.batch_size,
-            "paused": get_runtime("automation_paused", "0") == "1",
-            "pause_reason": get_runtime("pause_reason", ""),
+            "upload_notice": request.session.pop("upload_notice", None),
         },
     )
 
@@ -288,8 +384,7 @@ async def automation_start(request: Request):
     set_runtime("automation_paused", "0")
     set_runtime("pause_reason", "")
     set_runtime("automation_running", "1")
-    result = await launch_next_batch(force=True)
-    return JSONResponse(result)
+    return JSONResponse(await launch_next_batch(force=True))
 
 
 @app.post("/automation/pause")
@@ -342,11 +437,9 @@ async def retry_user(request: Request, user_id: int):
     require_admin(request)
     with conn() as db:
         db.execute(
-            "UPDATE users SET migration_status='waiting',error_message=NULL,progress_percent=NULL WHERE id=?",
+            "UPDATE users SET migration_status='waiting',error_message=NULL,progress_percent=NULL,batch_number=NULL WHERE id=?",
             (user_id,),
         )
-    set_runtime("automation_paused", "0")
-    set_runtime("pause_reason", "")
     return {"ok": True}
 
 
