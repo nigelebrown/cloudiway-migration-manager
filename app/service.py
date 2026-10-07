@@ -358,23 +358,48 @@ async def refresh_status() -> dict:
             )
             status, percent, detail = parse_progress(data)
             error_message = None
-            if status == "attention":
-                error_message = (
-                    "Cloudiway returned a status/value the app does not yet classify. "
-                    "Open Logs & Issues to review the raw Cloudiway response."
-                )
-                log_event(
-                    row["id"],
-                    "cloudiway_status_attention",
-                    f"Cloudiway progress requires review. Raw response: {detail}",
-                )
-            elif status == "failed":
-                error_message = "Cloudiway reported the migration as failed. Review Logs & Issues."
-                log_event(
-                    row["id"],
-                    "cloudiway_status_failed",
-                    f"Cloudiway progress reported failure. Raw response: {detail}",
-                )
+            cloud_status = status
+
+            logs_data = None
+            if status in ("attention", "failed"):
+                try:
+                    logs_data = await cloud.logs(int(row["cloudiway_object_id"]))
+                except Exception as log_exc:
+                    log_event(row["id"], "cloudiway_logs_fetch_failed", str(log_exc))
+
+                status_override, issue_code, friendly = classify_cloudiway_issue(data, logs_data)
+                if status_override:
+                    status = status_override
+                    cloud_status = issue_code or status_override
+                    error_message = friendly
+                    log_event(
+                        row["id"],
+                        issue_code or "cloudiway_known_error",
+                        friendly + " Raw Cloudiway logs: " + json.dumps(logs_data, default=str)[:2200],
+                    )
+                elif status == "attention":
+                    error_message = (
+                        "Cloudiway returned a status/value that requires review. "
+                        "Open Logs & Issues for the raw Cloudiway response."
+                    )
+                    log_event(
+                        row["id"],
+                        "cloudiway_status_attention",
+                        "Cloudiway progress requires review. Raw progress: "
+                        + detail
+                        + " Raw logs: "
+                        + json.dumps(logs_data, default=str)[:2200],
+                    )
+                else:
+                    error_message = "Cloudiway reported the migration as failed. Review Logs & Issues."
+                    log_event(
+                        row["id"],
+                        "cloudiway_status_failed",
+                        "Cloudiway progress reported failure. Raw progress: "
+                        + detail
+                        + " Raw logs: "
+                        + json.dumps(logs_data, default=str)[:2200],
+                    )
 
             with conn() as db:
                 db.execute(
@@ -382,7 +407,7 @@ async def refresh_status() -> dict:
                        SET migration_status=?,progress_percent=?,progress_detail=?,
                            cloudiway_status=?,error_message=?,updated_at=CURRENT_TIMESTAMP
                        WHERE id=?""",
-                    (status, percent, detail, status, error_message, row["id"]),
+                    (status, percent, detail, cloud_status, error_message, row["id"]),
                 )
             updated += 1
             completed += int(status == "completed")
@@ -435,6 +460,50 @@ async def refresh_status() -> dict:
         "attention": attention,
         "timed_out": timed_out,
     }
+
+
+def classify_cloudiway_issue(progress_data, logs_data=None) -> tuple[str | None, str | None, str | None]:
+    """Map known Cloudiway log messages to actionable migration errors."""
+    combined = json.dumps(
+        {"progress": progress_data, "logs": logs_data},
+        default=str,
+    ).lower()
+
+    if "smtp address has no mailbox associated with it" in combined:
+        return (
+            "failed",
+            "target_mailbox_missing",
+            "Target mailbox is not provisioned in Microsoft 365. "
+            "Cloudiway authenticated to the target, but Exchange Online could not find "
+            "a mailbox for the target SMTP address. Verify the Exchange Online licence, "
+            "mailbox provisioning, and primary SMTP address, then retry.",
+        )
+
+    if "unable to connect to mailbox in the target" in combined:
+        return (
+            "failed",
+            "target_mailbox_connection_failed",
+            "Cloudiway could not open the target Microsoft 365 mailbox. "
+            "Verify that the mailbox exists in Exchange Online and that the target connector "
+            "has access to it.",
+        )
+
+    if "unable to connect to mailbox in the source" in combined:
+        return (
+            "failed",
+            "source_mailbox_connection_failed",
+            "Cloudiway could not open the source Rackspace mailbox. "
+            "Verify the source mailbox exists and that the generated password was applied.",
+        )
+
+    if "invalid credential" in combined or "authentication failed" in combined:
+        return (
+            "failed",
+            "mailbox_authentication_failed",
+            "Mailbox authentication failed. Verify the source password/credentials and connector access.",
+        )
+
+    return None, None, None
 
 
 def parse_progress(data) -> tuple[str, float | None, str]:
