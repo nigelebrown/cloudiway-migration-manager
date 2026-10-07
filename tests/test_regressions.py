@@ -504,3 +504,28 @@ def test_invalid_cloudiway_refresh_token_clears_session_and_pauses(monkeypatch):
     assert get_setting("cloudiway_refresh_token") == ""
     assert service.get_runtime("automation_paused", "0") == "1"
     assert "Reconnect Cloudiway" in service.get_runtime("pause_reason", "")
+
+
+def test_classify_target_mailbox_missing_from_cloudiway_logs():
+    status, code, message = service.classify_cloudiway_issue(
+        {"status": "Stopped"},
+        {
+            "logs": [
+                "Unable to connect to Mailbox in the TARGET",
+                "The SMTP address has no mailbox associated with it.",
+            ]
+        },
+    )
+    assert status == "failed"
+    assert code == "target_mailbox_missing"
+    assert "not provisioned" in message.lower()
+
+
+def test_classify_source_mailbox_connection_failure():
+    status, code, message = service.classify_cloudiway_issue(
+        {"status": "Stopped"},
+        {"logs": ["Unable to connect to Mailbox in the SOURCE"]},
+    )
+    assert status == "failed"
+    assert code == "source_mailbox_connection_failed"
+    assert "source rackspace mailbox" in message.lower()
