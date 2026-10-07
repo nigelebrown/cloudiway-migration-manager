@@ -63,7 +63,27 @@ async def _cloudiway_client_ready() -> CloudiwayClient:
                 if data.get("expiration"):
                     set_setting("cloudiway_token_expiration", data["expiration"])
         except Exception as exc:
-            log_event(None, "cloudiway_token_refresh_failed", str(exc))
+            # An invalid/expired refresh token cannot recover by retrying every
+            # poll cycle. Clear the unusable session once and require a fresh
+            # Cloudiway login instead of flooding the event log.
+            set_setting("cloudiway_token", "", True)
+            set_setting("cloudiway_refresh_token", "", True)
+            set_setting("cloudiway_token_expiration", "")
+            set_runtime("automation_paused", "1")
+            set_runtime(
+                "pause_reason",
+                "Cloudiway session expired or refresh token is invalid. Reconnect Cloudiway in Connections.",
+            )
+            log_event(
+                None,
+                "cloudiway_reauthentication_required",
+                "Cloudiway token refresh failed; stored session cleared. Reconnect Cloudiway in Connections. "
+                + str(exc)[:1000],
+            )
+            raise RuntimeError(
+                "Cloudiway session expired or refresh token is invalid. "
+                "Go to Connections and sign in to Cloudiway again."
+            ) from exc
     return client
 
 
