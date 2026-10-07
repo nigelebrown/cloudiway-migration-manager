@@ -1,15 +1,10 @@
-from pathlib import Path
 from fastapi.testclient import TestClient
-from app.config import settings
-from app.db import init_db
+from app.db import init_db, reset_test_data
 from app.main import app
 
 def setup_function():
-    path = Path("/tmp/cloudiway-test.db")
-    if path.exists():
-        path.unlink()
-    settings.database_path = str(path)
     init_db()
+    reset_test_data()
 
 def test_health():
     with TestClient(app) as client:
