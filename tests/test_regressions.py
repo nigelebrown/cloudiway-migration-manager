@@ -28,9 +28,9 @@ def test_progress_one_percent_is_not_complete():
     assert pct == 1
 
 
-def test_progress_incomplete_is_not_complete():
+def test_progress_incomplete_requires_attention():
     status, pct, _ = service.parse_progress({"status": "Incomplete", "percentage": 40})
-    assert status == "migrating"
+    assert status == "attention"
     assert pct == 40
 
 
