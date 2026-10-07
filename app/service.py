@@ -254,9 +254,7 @@ async def run_batch(user_ids: list[int], batch_number: int):
 
 
 def _cloudiway_preflight():
-    _cloudiway_client()
-    if not get_setting("cloudiway_source_pool_id") or not get_setting("cloudiway_target_pool_id"):
-        raise RuntimeError("Cloudiway source and target connector pools are not configured")
+    _cloudiway_preflight()
 
 
 def _automatic_preflight():
