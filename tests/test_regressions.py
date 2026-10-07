@@ -182,3 +182,80 @@ def test_progress_window_uses_minutes(monkeypatch):
     asyncio.run(service.refresh_status())
     assert fake.seen == settings.progress_window_minutes
     assert fake.seen != settings.status_poll_seconds
+
+
+def test_unknown_cloudiway_status_requires_attention():
+    status, pct, _ = service.parse_progress({"status": "Stopped", "percentage": 42})
+    assert status == "attention"
+    assert pct == 42
+
+
+def test_completed_with_warnings_requires_attention():
+    status, _, _ = service.parse_progress({"status": "Completed with warnings", "percentage": 100})
+    assert status == "attention"
+
+
+def test_numeric_status_stays_active_until_100():
+    status, pct, _ = service.parse_progress({"status": 3, "percentage": 1})
+    assert status == "migrating"
+    assert pct == 1
+    status, pct, _ = service.parse_progress({"status": 3, "percentage": 100})
+    assert status == "completed"
+    assert pct == 100
+
+
+def test_correct_password_bypasses_failed_attempt_limit():
+    with TestClient(app) as client:
+        for i in range(settings.login_max_attempts + 2):
+            client.post("/login", data={"admin_password": f"wrong-{i}"})
+        r = client.post(
+            "/login",
+            data={"admin_password": "test-admin-password"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+
+
+def test_http_login_explains_secure_cookie_requirement():
+    with TestClient(app, base_url="http://testserver") as client:
+        r = client.post(
+            "/login",
+            data={"admin_password": "test-admin-password"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
+        assert "HTTPS is required" in r.text
+
+
+def test_batch_timeout_marks_user_for_review(monkeypatch):
+    class FakeCloud:
+        async def progress(self, object_id, since_minutes):
+            return {"status": "Running", "percentage": 50}
+
+    async def fake_ready():
+        return FakeCloud()
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
+    old_timeout = settings.batch_timeout_minutes
+    settings.batch_timeout_minutes = 1
+    try:
+        with conn() as db:
+            db.execute(
+                """INSERT INTO users(
+                       source_email,target_email,cloudiway_object_id,migration_status,
+                       batch_number,batch_started_at
+                   ) VALUES(?,?,?,?,?,datetime('now','-2 minutes'))""",
+                ("timeout@x.com", "timeout@y.com", 999, "migrating", 1),
+            )
+        import asyncio
+        result = asyncio.run(service.refresh_status())
+        assert result["timed_out"] == 1
+        with conn() as db:
+            row = db.execute(
+                "SELECT migration_status,error_message FROM users WHERE source_email=?",
+                ("timeout@x.com",),
+            ).fetchone()
+        assert row["migration_status"] == "timed_out"
+        assert "timeout" in row["error_message"].lower()
+    finally:
+        settings.batch_timeout_minutes = old_timeout
