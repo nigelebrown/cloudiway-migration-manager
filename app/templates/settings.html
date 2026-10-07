@@ -7,12 +7,15 @@
 <div class="card"><h2>Cloudiway</h2><p class="{{'ok' if cloudiway_connected else 'bad'}}">{{'Connected' if cloudiway_connected else 'Not connected'}}</p>
 <form method="post" action="/settings/cloudiway/login">
 <div class="field"><label>Project</label><input name="project_header" value="{{project_header}}" placeholder="JCF"></div>
-<div class="field"><label>Cloudiway Username</label><input name="username" type="email" placeholder="Cloudiway username" required></div>
+<div class="field"><label>Cloudiway Username</label><input name="username" type="email" value="{{cloudiway_username}}" placeholder="Cloudiway username" required></div>
 <div class="field"><label>Cloudiway Password</label><input name="password" type="password" placeholder="Cloudiway password" required></div>
+<div class="field"><label><input style="width:auto" type="checkbox" name="keep_connected" value="1" {% if cloudiway_keep_connected %}checked{% endif %}> Keep Cloudiway connected in the background</label></div>
+<p class="hint">When enabled, the app stores the Cloudiway login encrypted and first uses the refresh token. If Cloudiway rejects the refresh token, it automatically signs in again. Logging out of this web console does not disconnect Cloudiway or stop a migration already started on Cloudiway.</p>
 <button>Connect Cloudiway</button>
 </form>
 <hr><h3>Existing Cloudiway Connector Pools</h3>
 {% if cloudiway_connected %}
+<form method="post" action="/settings/cloudiway/disconnect" style="margin-bottom:12px"><button class="secondary">Disconnect Cloudiway</button></form>
 <form method="post" action="/settings/cloudiway/pools">
 <div class="field"><label>Source connector — Rackspace / IMAP</label>
 <select name="source_pool_id" id="sourcePool" required><option value="">Select source connector pool...</option>
