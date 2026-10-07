@@ -589,7 +589,7 @@ async def manual_rackspace_page(request: Request):
 @app.post("/manual-rackspace/generate")
 async def manual_rackspace_generate(
     request: Request,
-    user_ids: list[int] = Form(...),
+    user_ids: list[int] = Form(default=[]),
 ):
     require_admin(request)
     if not user_ids:
@@ -762,9 +762,12 @@ async def manual_rackspace_confirm_upload(
 @app.post("/manual-rackspace/start")
 async def manual_rackspace_start(
     request: Request,
-    user_ids: list[int] = Form(...),
+    user_ids: list[int] = Form(default=[]),
 ):
     require_admin(request)
+    if not user_ids:
+        request.session["manual_error"] = "Select at least one confirmed user to start."
+        return RedirectResponse("/manual-rackspace", 303)
     try:
         result = await start_manual_migrations(user_ids)
         request.session["manual_notice"] = (
