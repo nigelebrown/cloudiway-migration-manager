@@ -357,10 +357,32 @@ async def refresh_status() -> dict:
                 max(1, settings.progress_window_minutes),
             )
             status, percent, detail = parse_progress(data)
+            error_message = None
+            if status == "attention":
+                error_message = (
+                    "Cloudiway returned a status/value the app does not yet classify. "
+                    "Open Logs & Issues to review the raw Cloudiway response."
+                )
+                log_event(
+                    row["id"],
+                    "cloudiway_status_attention",
+                    f"Cloudiway progress requires review. Raw response: {detail}",
+                )
+            elif status == "failed":
+                error_message = "Cloudiway reported the migration as failed. Review Logs & Issues."
+                log_event(
+                    row["id"],
+                    "cloudiway_status_failed",
+                    f"Cloudiway progress reported failure. Raw response: {detail}",
+                )
+
             with conn() as db:
                 db.execute(
-                    "UPDATE users SET migration_status=?,progress_percent=?,progress_detail=?,cloudiway_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, percent, detail, status, row["id"]),
+                    """UPDATE users
+                       SET migration_status=?,progress_percent=?,progress_detail=?,
+                           cloudiway_status=?,error_message=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (status, percent, detail, status, error_message, row["id"]),
                 )
             updated += 1
             completed += int(status == "completed")
