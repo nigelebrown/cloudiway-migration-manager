@@ -510,6 +510,10 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
         "destinationemail": "target_email",
         "destination email": "target_email",
         "destination email address": "target_email",
+        "computer number": "computer_number",
+        "computernumber": "computer_number",
+        "computer_no": "computer_number",
+        "computer no": "computer_number",
     }
     df.rename(columns={c: aliases.get(c, c) for c in df.columns}, inplace=True)
     if "source_email" not in df.columns:
@@ -527,6 +531,7 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
                 continue
             first = _clean_cell(row.get("first_name"))
             last = _clean_cell(row.get("last_name"))
+            computer_number = _clean_cell(row.get("computer_number"))
 
             existing = db.execute(
                 "SELECT migration_status FROM users WHERE source_email=?", (src,)
@@ -536,13 +541,14 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
                 continue
 
             db.execute(
-                """INSERT INTO users(source_email,target_email,first_name,last_name)
-                   VALUES(?,?,?,?)
+                """INSERT INTO users(source_email,target_email,first_name,last_name,computer_number)
+                   VALUES(?,?,?,?,?)
                    ON DUPLICATE KEY UPDATE
                      target_email=VALUES(target_email),
                      first_name=VALUES(first_name),
-                     last_name=VALUES(last_name)""",
-                (src, tgt, first, last),
+                     last_name=VALUES(last_name),
+                     computer_number=VALUES(computer_number)""",
+                (src, tgt, first, last, computer_number),
             )
             imported += 1
 
@@ -566,7 +572,7 @@ async def manual_rackspace_page(request: Request):
 
     with conn() as db:
         rows = db.execute(
-            """SELECT id,source_email,target_email,first_name,last_name,
+            """SELECT id,source_email,target_email,first_name,last_name,computer_number,
                       password_reset_method,rackspace_status,migration_status,
                       manual_password_generated_at,manual_password_confirmed_at,
                       error_message,updated_at
@@ -633,15 +639,54 @@ async def manual_rackspace_generate(
         request.session["manual_error"] = "No eligible users were selected."
         return RedirectResponse("/manual-rackspace", 303)
 
-    output = io.StringIO()
     import csv as _csv
-    writer = _csv.writer(output, lineterminator="\n")
+
+    # Exact Rackspace import CSV.
+    rackspace_output = io.StringIO()
+    writer = _csv.writer(rackspace_output, lineterminator="\n")
     writer.writerow(RACKSPACE_MAILBOX_HEADERS)
     for user, password in generated:
         writer.writerow(rackspace_row(user, password))
+    rackspace_payload = rackspace_output.getvalue().encode("utf-8-sig")
 
-    payload = output.getvalue().encode("utf-8-sig")
-    filename = "rackspace-password-update-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + ".csv"
+    # Administrative mapping workbook requested by ICTD.
+    admin_rows = []
+    for user, password in generated:
+        admin_rows.append(
+            {
+                "email": user["source_email"],
+                "password": password,
+                "source_email": user["source_email"],
+                "target_email": user["target_email"],
+                "first_name": user.get("first_name") or "",
+                "last_name": user.get("last_name") or "",
+                "computer_number": user.get("computer_number") or "",
+            }
+        )
+    admin_df = pd.DataFrame(
+        admin_rows,
+        columns=[
+            "email",
+            "password",
+            "source_email",
+            "target_email",
+            "first_name",
+            "last_name",
+            "computer_number",
+        ],
+    )
+    workbook = io.BytesIO()
+    with pd.ExcelWriter(workbook, engine="openpyxl") as writer_xlsx:
+        admin_df.to_excel(writer_xlsx, index=False, sheet_name="Password Map")
+    workbook.seek(0)
+
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    archive_name = f"rackspace-password-package-{stamp}.zip"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"rackspace-password-update-{stamp}.csv", rackspace_payload)
+        zf.writestr(f"migration-password-map-{stamp}.xlsx", workbook.getvalue())
+    archive.seek(0)
 
     for user, _ in generated:
         log_event(
@@ -649,12 +694,12 @@ async def manual_rackspace_generate(
             "manual_password_file_generated",
             "Password generated for Rackspace bulk update file",
         )
-    log_info("manual_rackspace_file_generated", user_count=len(generated), filename=filename)
+    log_info("manual_rackspace_file_generated", user_count=len(generated), filename=archive_name)
 
     return StreamingResponse(
-        io.BytesIO(payload),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{archive_name}"'},
     )
 
 
@@ -676,7 +721,12 @@ async def manual_rackspace_confirm_upload(
         return RedirectResponse("/manual-rackspace", 303)
 
     columns = {str(col).strip().lower(): col for col in df.columns}
-    username_col = columns.get("username") or columns.get("source_email") or columns.get("sourceemail")
+    username_col = (
+        columns.get("username")
+        or columns.get("email")
+        or columns.get("source_email")
+        or columns.get("sourceemail")
+    )
     password_col = columns.get("password")
     if not username_col or not password_col:
         request.session["manual_error"] = (
@@ -812,7 +862,7 @@ async def dashboard_data(request: Request, q: str = ""):
             rows = db.execute(
                 """SELECT id,source_email,target_email,first_name,last_name,rackspace_status,
                           cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at,
-                          password_reset_method,manual_password_generated_at,manual_password_confirmed_at
+                          password_reset_method,manual_password_generated_at,manual_password_confirmed_at,computer_number
                    FROM users WHERE source_email LIKE ? OR target_email LIKE ? OR first_name LIKE ? OR last_name LIKE ?
                    ORDER BY id DESC LIMIT 1000""",
                 values,
