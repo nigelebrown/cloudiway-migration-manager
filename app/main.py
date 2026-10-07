@@ -3,11 +3,13 @@ import io
 import re
 import secrets
 import time
+import json
+import zipfile
 from collections import defaultdict, deque
 
 import pandas as pd
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -15,6 +17,7 @@ from app.config import settings
 from app.db import init_db, conn, set_setting, get_setting, set_runtime, get_runtime, log_event
 from app.security import encrypt_secret, decrypt_secret
 from app.clients.cloudiway import CloudiwayClient
+from app.diagnostics import log_info, log_error, tail_log, redact
 from app.service import (
     launch_next_batch,
     refresh_status,
@@ -35,6 +38,28 @@ templates = Jinja2Templates(directory="app/templates")
 _poller_task: asyncio.Task | None = None
 _login_attempts: dict[str, deque[float]] = defaultdict(deque)
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
+
+@app.middleware("http")
+async def diagnostic_request_log(request: Request, call_next):
+    started = time.monotonic()
+    try:
+        response = await call_next(request)
+        log_info(
+            "http_request",
+            method=request.method,
+            path=request.url.path,
+            status=response.status_code,
+            duration_ms=round((time.monotonic() - started) * 1000, 1),
+        )
+        return response
+    except Exception as exc:
+        log_error(
+            "http_exception",
+            method=request.method,
+            path=request.url.path,
+            error=exc,
+        )
+        raise
 
 
 def _validate_runtime_secrets():
@@ -182,6 +207,7 @@ async def startup():
     global _poller_task
     _validate_runtime_secrets()
     init_db()
+    log_info("application_startup", database=settings.db_name)
     # Recover from an interrupted process so a stale 'preparing' row never blocks the app.
     with conn() as db:
         db.execute(
@@ -332,8 +358,10 @@ async def test_rackspace(request: Request):
     require_admin(request)
     try:
         result = await _rackspace_client().test_connection()
+        log_info("rackspace_capability_test", result=result)
         return JSONResponse(result)
     except Exception as exc:
+        log_error("rackspace_capability_test_failed", error=exc)
         return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
 
 
@@ -383,14 +411,17 @@ async def cloudiway_login(
                 f"Cloudiway connection successful. Project '{selected_project['name']}' "
                 f"(ID {selected_project['id']}) selected. Found {len(pools)} connector pool(s)."
             )
+            log_info("cloudiway_connected", project_name=selected_project["name"], project_id=selected_project["id"], pool_count=len(pools))
         except Exception as pool_exc:
             request.session["settings_notice"] = "Cloudiway authentication successful."
             request.session["settings_error"] = (
                 "Authenticated, but project/connector discovery failed: "
                 + str(pool_exc)[:500]
             )
+            log_error("cloudiway_discovery_failed", requested_project=requested_project, error=pool_exc)
     except Exception as exc:
         request.session["settings_error"] = str(exc)[:500]
+        log_error("cloudiway_login_failed", error=exc)
     return RedirectResponse("/settings", 303)
 
 
@@ -632,6 +663,75 @@ async def retry_user(request: Request, user_id: int):
             (user_id,),
         )
     return {"ok": True}
+
+
+@app.get("/diagnostics/download")
+async def download_diagnostics(request: Request):
+    require_admin(request)
+
+    with conn() as db:
+        status_counts = [
+            dict(r) for r in db.execute(
+                "SELECT migration_status,COUNT(*) AS count FROM users GROUP BY migration_status"
+            ).fetchall()
+        ]
+        recent_users = [
+            dict(r) for r in db.execute(
+                """SELECT id,cloudiway_object_id,rackspace_status,cloudiway_status,
+                          migration_status,progress_percent,batch_number,error_message,updated_at
+                   FROM users ORDER BY updated_at DESC LIMIT 100"""
+            ).fetchall()
+        ]
+        recent_events = [
+            dict(r) for r in db.execute(
+                """SELECT id,user_id,event_type,message,created_at
+                   FROM events ORDER BY id DESC LIMIT 200"""
+            ).fetchall()
+        ]
+
+    summary = {
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "application": "JCF Cloudiway Migration Manager",
+        "configuration": {
+            "cloudiway_base_url": settings.cloudiway_base_url,
+            "cloudiway_project_name": get_setting("cloudiway_project_name"),
+            "cloudiway_project_id": get_setting("cloudiway_project_id"),
+            "cloudiway_source_pool_id": get_setting("cloudiway_source_pool_id"),
+            "cloudiway_target_pool_id": get_setting("cloudiway_target_pool_id"),
+            "cloudiway_token_configured": bool(get_setting("cloudiway_token")),
+            "rackspace_base_url": settings.rackspace_base_url,
+            "rackspace_auth_mode": get_setting("rackspace_auth_mode") or "api_key",
+            "rackspace_credentials_configured": bool(
+                get_setting("rackspace_secret_key") or get_setting("rackspace_password")
+            ),
+        },
+        "runtime": {
+            "automation_running": get_runtime("automation_running", "0"),
+            "automation_paused": get_runtime("automation_paused", "0"),
+            "pause_reason": get_runtime("pause_reason", ""),
+        },
+        "migration_status_counts": status_counts,
+        "recent_users": recent_users,
+        "recent_events": recent_events,
+    }
+
+    summary_text = redact(json.dumps(summary, default=str, indent=2))
+    log_text = tail_log()
+
+    import io as _io
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("diagnostic-summary.json", summary_text)
+        zf.writestr("application.log", log_text)
+    buffer.seek(0)
+
+    filename = "cloudiway-diagnostics-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + ".zip"
+    log_info("diagnostics_downloaded", filename=filename)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/health")
