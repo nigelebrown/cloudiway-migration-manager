@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     app_encryption_key: str
     session_secret: str
     database_path: str = "data/migration.db"
-    cloudiway_base_url: str = "https://api-production.cloudiway.com/api"
+    cloudiway_base_url: str = "https://api-production.cloudiway.com/ap1"
     cloudiway_credential_path: str = ""
     cloudiway_product_type_mail: int = 5
     cloudiway_job_type_audit: int = 30
