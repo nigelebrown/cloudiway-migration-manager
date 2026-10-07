@@ -8,8 +8,10 @@ class CloudiwayClient:
         self.token = token
         self.project_header = project_header or settings.cloudiway_project_header
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"accept": "application/json", "projectId": self.project_header}
+    def _headers(self, include_project: bool = True) -> dict[str, str]:
+        headers = {"accept": "application/json"}
+        if include_project and self.project_header:
+            headers["projectId"] = str(self.project_header)
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
@@ -36,8 +38,12 @@ class CloudiwayClient:
         self._raise(r, "Cloudiway token refresh failed")
         return r.json()
 
-    async def projects(self):
-        return await self._get("/Projects", "Could not retrieve Cloudiway projects")
+    async def projects(self, include_project_header: bool = False):
+        return await self._get(
+            "/Projects",
+            "Could not retrieve Cloudiway projects",
+            include_project=include_project_header,
+        )
 
     async def connectors(self):
         return await self._get("/Connectors", "Could not retrieve Cloudiway connectors")
@@ -109,9 +115,12 @@ class CloudiwayClient:
     async def logs(self, object_id: int):
         return await self._get(f"/Mail/logs/{object_id}", "Could not retrieve Cloudiway logs")
 
-    async def _get(self, path: str, error: str):
+    async def _get(self, path: str, error: str, include_project: bool = True):
         async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(f"{settings.cloudiway_base_url}{path}", headers=self._headers())
+            r = await client.get(
+                f"{settings.cloudiway_base_url}{path}",
+                headers=self._headers(include_project=include_project),
+            )
         self._raise(r, error)
         return r.json() if r.content else {}
 
