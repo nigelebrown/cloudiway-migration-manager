@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Migration Dashboard</title><meta http-equiv="refresh" content="20">
+<style>body{font-family:system-ui;margin:0;background:#07111f;color:#e5e7eb}.wrap{max-width:1500px;margin:24px auto;padding:0 20px}nav{display:flex;gap:14px;align-items:center}a{color:#38bdf8}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:20px 0}.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px}.n{font-size:30px;font-weight:800}.lbl{color:#94a3b8}table{width:100%;border-collapse:collapse;background:#111827}th,td{padding:10px;border-bottom:1px solid #1f2937;text-align:left;font-size:14px}button,input{padding:9px;border-radius:7px;border:1px solid #334155}button{background:#0284c7;color:white;font-weight:700}</style></head>
+<body><div class="wrap"><nav><h2 style="margin-right:auto">JCF Mail Migration</h2><a href="/upload">Upload users</a><form method="post" action="/logout"><button>Logout</button></form></nav>
+<div class="cards">{% for s in ['waiting','preparing','migrating','completed','failed'] %}<div class="card"><div class="n">{{counts.get(s,0)}}</div><div class="lbl">{{s|title}}</div></div>{% endfor %}</div>
+<form method="get"><input name="q" value="{{q}}" placeholder="Search email or name"><button>Search</button></form>
+<p>Pilot target: 5 users; subsequent cohorts: 10. Auto-refresh: 20 seconds.</p>
+<table><thead><tr><th>ID</th><th>Source</th><th>Target</th><th>Rackspace</th><th>Cloudiway</th><th>Migration</th><th>Batch</th><th>Error</th></tr></thead><tbody>
+{% for u in users %}<tr><td>{{u.id}}</td><td>{{u.source_email}}</td><td>{{u.target_email}}</td><td>{{u.rackspace_status}}</td><td>{{u.cloudiway_status}}</td><td>{{u.migration_status}}</td><td>{{u.batch_number or ''}}</td><td>{{u.error_message or ''}}</td></tr>{% endfor %}
+</tbody></table></div></body></html>
