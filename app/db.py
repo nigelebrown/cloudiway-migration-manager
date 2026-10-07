@@ -22,6 +22,7 @@ SCHEMA = [
         target_email VARCHAR(320) NOT NULL,
         first_name VARCHAR(255) NULL,
         last_name VARCHAR(255) NULL,
+        computer_number VARCHAR(64) NULL,
         generated_password_enc LONGTEXT NULL,
         password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic',
         manual_password_generated_at DATETIME NULL,
@@ -141,6 +142,10 @@ def init_db():
                 (settings.db_name,),
             ).fetchall()
         }
+        if "computer_number" not in columns:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN computer_number VARCHAR(64) NULL AFTER last_name"
+            )
         if "password_reset_method" not in columns:
             db.execute(
                 "ALTER TABLE users ADD COLUMN password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic' AFTER generated_password_enc"
