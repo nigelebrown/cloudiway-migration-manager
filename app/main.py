@@ -109,7 +109,7 @@ async def shutdown():
 async def home(request: Request):
     if request.session.get("admin"):
         return RedirectResponse("/dashboard", 303)
-    return templates.TemplateResponse("login.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="login.html", context={"request": request})
 
 
 @app.post("/login")
@@ -120,18 +120,10 @@ async def login(request: Request, admin_password: str = Form(...)):
     while q and now - q[0] > settings.login_window_seconds:
         q.popleft()
     if len(q) >= settings.login_max_attempts:
-        return templates.TemplateResponse(
-            "login.html",
-            {"request": request, "error": "Too many failed sign-in attempts. Try again later."},
-            status_code=429,
-        )
+        return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "Too many failed sign-in attempts. Try again later."}, status_code=429)
     if not secrets.compare_digest(admin_password, settings.app_admin_password):
         q.append(now)
-        return templates.TemplateResponse(
-            "login.html",
-            {"request": request, "error": "Invalid administrator password"},
-            status_code=401,
-        )
+        return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "Invalid administrator password"}, status_code=401)
     q.clear()
     request.session["admin"] = True
     return RedirectResponse("/dashboard", 303)
@@ -149,8 +141,9 @@ async def settings_page(request: Request):
     if redirect:
         return redirect
     return templates.TemplateResponse(
-        "settings.html",
-        {
+        request=request,
+        name="settings.html",
+        context={
             "request": request,
             "cloudiway_connected": bool(get_setting("cloudiway_token")),
             "rackspace_configured": bool(get_setting("rackspace_secret_key")),
@@ -253,7 +246,7 @@ async def upload_page(request: Request):
     redirect = _page_auth(request)
     if redirect:
         return redirect
-    return templates.TemplateResponse("upload.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="upload.html", context={"request": request})
 
 
 @app.post("/upload")
@@ -266,9 +259,7 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
         else:
             df = pd.read_excel(io.BytesIO(raw))
     except Exception as exc:
-        return templates.TemplateResponse(
-            "upload.html", {"request": request, "error": f"Could not read file: {exc}"}, status_code=400
-        )
+        return templates.TemplateResponse(request=request, name="upload.html", context={"request": request, "error": f"Could not read file: {exc}"}, status_code=400)
 
     df.columns = [str(c).strip().lower() for c in df.columns]
     aliases = {
@@ -282,11 +273,7 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
     }
     df.rename(columns={c: aliases.get(c, c) for c in df.columns}, inplace=True)
     if "source_email" not in df.columns:
-        return templates.TemplateResponse(
-            "upload.html",
-            {"request": request, "error": "The file must include source_email (or Email)."},
-            status_code=400,
-        )
+        return templates.TemplateResponse(request=request, name="upload.html", context={"request": request, "error": "The file must include source_email (or Email)."}, status_code=400)
 
     imported = skipped = protected = 0
     with conn() as db:
@@ -337,8 +324,9 @@ async def dashboard(request: Request, q: str = ""):
     if redirect:
         return redirect
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
+        request=request,
+        name="dashboard.html",
+        context={
             "request": request,
             "q": q,
             "pilot_size": settings.pilot_size,
