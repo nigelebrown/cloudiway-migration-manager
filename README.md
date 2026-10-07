@@ -128,3 +128,23 @@ Main tables:
 - `runtime` — automation state such as paused/running and pause reason.
 
 Database schema is created automatically when the application starts. MySQL data is persisted in the Docker volume `mysql_data`.
+
+
+## One-click CentOS update
+
+If the application was installed with the CentOS installer, update it with:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/nigelebrown/cloudiway-migration-manager/main/update-centos.sh)"
+```
+
+The updater:
+
+- backs up the MySQL database first;
+- pulls the latest `main` branch;
+- rebuilds and restarts the Docker stack;
+- waits for the application health check;
+- automatically rolls the code back to the previous commit if the new version fails to start;
+- keeps the latest 10 compressed database backups in `/opt/cloudiway-migration-manager/backups`.
+
+Your existing `.env`, MySQL Docker volume, passwords, and migration data are preserved.
