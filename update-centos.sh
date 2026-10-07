@@ -23,6 +23,34 @@ OLD_COMMIT="$(git rev-parse HEAD)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p backups
 
+log "Checking DNS and GitHub connectivity..."
+if ! getent hosts github.com >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+[cloudiway-update] ERROR: This server cannot resolve github.com.
+This is a server DNS/network issue, not an application error.
+
+Check:
+  cat /etc/resolv.conf
+  getent hosts github.com
+  curl -I https://github.com
+
+On CentOS/RHEL with NetworkManager, inspect DNS with:
+  nmcli dev show | grep -i DNS
+  nmcli con show --active
+
+If your network policy permits public DNS, set DNS on the ACTIVE connection, for example:
+  nmcli con mod "<CONNECTION_NAME>" ipv4.ignore-auto-dns yes ipv4.dns "1.1.1.1 8.8.8.8"
+  nmcli con up "<CONNECTION_NAME>"
+
+If your organization uses internal DNS, use the approved internal DNS servers instead.
+EOF
+  exit 1
+fi
+
+if ! curl -fsSI --connect-timeout 10 https://github.com >/dev/null 2>&1; then
+  fail "github.com resolves, but HTTPS connectivity to GitHub failed. Check firewall/proxy/egress rules."
+fi
+
 log "Creating MySQL backup before update..."
 if docker compose ps --status running mysql 2>/dev/null | grep -q mysql; then
   if docker compose exec -T mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --routines --triggers "$MYSQL_DATABASE"' > "backups/cloudiway-${STAMP}.sql"; then
