@@ -370,7 +370,9 @@ async def refresh_status() -> dict:
             reason = f"{failed} migration(s) failed"
         set_runtime("pause_reason", reason)
     elif settings.auto_continue and rows and all_terminal_for_latest_batch():
-        await launch_next_batch()
+        manual_result = await launch_next_confirmed_manual_batch()
+        if not manual_result.get("started"):
+            await launch_next_batch()
 
     return {
         "updated": updated,
