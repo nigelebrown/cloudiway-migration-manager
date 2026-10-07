@@ -475,3 +475,32 @@ def test_manual_confirmed_user_is_eligible_for_manual_start(monkeypatch):
             (uid,),
         ).fetchone()
     assert row["migration_status"] == "migrating"
+
+
+def test_invalid_cloudiway_refresh_token_clears_session_and_pauses(monkeypatch):
+    from app import service as svc
+    from datetime import datetime, timedelta, timezone
+    import asyncio
+
+    class FakeCloud:
+        def __init__(self):
+            self.token = "expired-access-token"
+
+        async def refresh_token(self, token, refresh_token):
+            raise RuntimeError('Cloudiway token refresh failed (400): "Invalid refresh token"')
+
+    monkeypatch.setattr(svc, "_cloudiway_client", lambda: FakeCloud())
+    set_setting("cloudiway_token", encrypt_secret("expired-access-token"), True)
+    set_setting("cloudiway_refresh_token", encrypt_secret("invalid-refresh"), True)
+    set_setting(
+        "cloudiway_token_expiration",
+        (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+    )
+
+    with pytest.raises(RuntimeError, match="sign in to Cloudiway again"):
+        asyncio.run(svc._cloudiway_client_ready())
+
+    assert get_setting("cloudiway_token") == ""
+    assert get_setting("cloudiway_refresh_token") == ""
+    assert service.get_runtime("automation_paused", "0") == "1"
+    assert "Reconnect Cloudiway" in service.get_runtime("pause_reason", "")
