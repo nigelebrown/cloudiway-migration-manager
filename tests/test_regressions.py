@@ -297,3 +297,11 @@ def test_cloudiway_pool_dropdown_page(monkeypatch):
         assert 'Rackspace IMAP' in r.text
         assert 'value="22"' in r.text
         assert 'JCF Microsoft 365' in r.text
+
+
+def test_cloudiway_project_resolution_uses_numeric_id():
+    from app.main import _normalize_cloudiway_projects, _resolve_cloudiway_project
+    payload = {"responseData": [{"id": 14780, "name": "JCF"}, {"id": 99, "name": "Other"}]}
+    projects = _normalize_cloudiway_projects(payload)
+    chosen = _resolve_cloudiway_project(projects, "JCF")
+    assert chosen == {"id": "14780", "name": "JCF"}
