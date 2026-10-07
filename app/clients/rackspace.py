@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import httpx
 
 from app.config import settings
+from app.diagnostics import log_info, log_error
 
 
 class RackspaceClient:
@@ -63,7 +64,9 @@ class RackspaceClient:
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
                 json=payload,
             )
+        log_info("rackspace_identity_response", url=str(r.request.url), status=r.status_code)
         if r.status_code >= 400:
+            log_error("rackspace_identity_failed", url=str(r.request.url), status=r.status_code, body=r.text[:500])
             raise RuntimeError(self._error("Rackspace username/password authentication failed", r))
 
         data = r.json()
@@ -202,4 +205,5 @@ class RackspaceClient:
     @staticmethod
     def _error(prefix: str, response: httpx.Response) -> str:
         detail = response.headers.get("x-error-message") or response.text[:800]
-        return f"{prefix} ({response.status_code}): {detail}"
+        url = str(response.request.url) if response.request else "unknown-url"
+        return f"{prefix} ({response.status_code}) [{url}]: {detail}"
