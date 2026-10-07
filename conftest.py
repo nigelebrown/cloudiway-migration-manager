@@ -6,6 +6,12 @@ os.environ.setdefault("APP_ENCRYPTION_KEY", "test-encryption-secret")
 os.environ.setdefault("SESSION_SECRET", "test-session-secret")
 os.environ.setdefault("SESSION_HTTPS_ONLY", "true")
 
+os.environ.setdefault("DB_HOST", "127.0.0.1")
+os.environ.setdefault("DB_PORT", "3306")
+os.environ.setdefault("DB_NAME", "cloudiway_test")
+os.environ.setdefault("DB_USER", "cloudiway")
+os.environ.setdefault("DB_PASSWORD", "testpass")
+
 _original_init = TestClient.__init__
 
 def _https_init(self, *args, **kwargs):
@@ -17,8 +23,6 @@ TestClient.__init__ = _https_init
 
 
 def pytest_runtest_setup(item):
-    # Isolate the in-memory login limiter between tests while production keeps
-    # the limiter across requests.
     try:
         from app.main import _login_attempts
         _login_attempts.clear()
