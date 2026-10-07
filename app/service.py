@@ -221,11 +221,49 @@ async def run_batch(user_ids: list[int], batch_number: int):
         set_runtime("pause_reason", f"Batch {batch_number} has {len(set(failed))} failed user(s)")
 
 
-def _preflight():
-    _rackspace_client()
+def _cloudiway_preflight():
     _cloudiway_client()
     if not get_setting("cloudiway_source_pool_id") or not get_setting("cloudiway_target_pool_id"):
         raise RuntimeError("Cloudiway source and target connector pools are not configured")
+
+
+def _automatic_preflight():
+    _rackspace_client()
+    _cloudiway_preflight()
+
+
+async def launch_next_confirmed_manual_batch() -> dict:
+    """Launch the next group of manually-confirmed Rackspace users without Rackspace API."""
+    try:
+        _cloudiway_preflight()
+    except Exception as exc:
+        return {"started": False, "reason": str(exc), "mode": "manual"}
+
+    with conn() as db:
+        active = db.execute(
+            "SELECT COUNT(*) c FROM users WHERE migration_status IN ('preparing','ready','migrating')"
+        ).fetchone()["c"]
+        if active:
+            return {"started": False, "reason": "A batch is already active", "mode": "manual"}
+
+        max_batch = db.execute("SELECT COALESCE(MAX(batch_number),0) n FROM users").fetchone()["n"]
+        size = settings.pilot_size if max_batch == 0 else settings.batch_size
+        rows = db.execute(
+            """SELECT id FROM users
+               WHERE migration_status='waiting'
+                 AND password_reset_method='manual_bulk'
+                 AND rackspace_status='manual_confirmed'
+               ORDER BY id LIMIT ?""",
+            (size,),
+        ).fetchall()
+
+    if not rows:
+        return {"started": False, "reason": "No manually confirmed users are waiting", "mode": "manual"}
+
+    ids = [int(r["id"]) for r in rows]
+    result = await start_manual_migrations(ids)
+    result["mode"] = "manual"
+    return result
 
 
 async def launch_next_batch(force: bool = False) -> dict:
@@ -234,7 +272,7 @@ async def launch_next_batch(force: bool = False) -> dict:
         return {"started": False, "reason": get_runtime("pause_reason", "Automation is paused")}
 
     try:
-        _preflight()
+        _automatic_preflight()
     except Exception as exc:
         set_runtime("automation_paused", "1")
         set_runtime("pause_reason", str(exc))
