@@ -167,3 +167,25 @@ The app supports two Rackspace authentication modes:
 The Rackspace username/password and API secrets are stored encrypted in MySQL using `APP_ENCRYPTION_KEY`.
 
 Rackspace Identity documentation supports password-based authentication for obtaining an `X-Auth-Token`. Rackspace separately documents API-key setup for the Cloud Office Email API, so the username/password mode is intentionally implemented as a capability test before it is allowed to administer mailboxes.
+
+
+## Manual Rackspace bulk-password workflow
+
+This workflow is independent of Rackspace API access and is intended for use while Rackspace Email API credentials are unavailable.
+
+1. Upload users through the normal Upload Users page.
+   - Standard columns: source_email, target_email, first_name, last_name.
+   - The Rackspace mailbox-import template is also accepted. Username is treated as the source address; append TargetEmail or DestinationEmail for the Microsoft 365 target.
+2. Open **Manual Rackspace Reset** from the dashboard.
+3. Select one or more users and click **Generate Passwords & Download Rackspace CSV**.
+   - The app generates a unique password for each selected mailbox and stores it encrypted in MySQL.
+   - The downloaded file uses the Rackspace mailbox-import columns exactly.
+4. Upload that CSV to Rackspace **Add/Edit Multiple Mailboxes** and allow Rackspace to apply the password changes.
+5. Upload the same generated CSV back to the app.
+   - The app verifies Username + Password against its encrypted generated values.
+   - Uploading the file back is the administrator's confirmation that the Rackspace bulk update completed.
+6. Either:
+   - select **Start Cloudiway migration automatically** while uploading the confirmation file; or
+   - select confirmed users individually/in groups and click **Start Selected Migrations**.
+
+Cloudiway migration is not permitted through the manual stream until the generated file has been uploaded back and the user is in the `manual_confirmed` Rackspace state. The automatic Rackspace API workflow and manual bulk workflow are independent; missing Rackspace API credentials do not block the manual path.
