@@ -760,9 +760,22 @@ async def manual_rackspace_confirm_upload(
 
             user = db.execute(
                 """SELECT id,source_email,generated_password_enc,password_reset_method
-                   FROM users WHERE source_email=?""",
+                   FROM users WHERE LOWER(source_email)=?""",
                 (email,),
             ).fetchone()
+
+            # Rackspace's own import file contains only the mailbox local-part
+            # in Username because the domain is selected in the control panel.
+            # Allow that exact generated file to be uploaded back as confirmation.
+            if not user and "@" not in email:
+                candidates = db.execute(
+                    """SELECT id,source_email,generated_password_enc,password_reset_method
+                       FROM users
+                       WHERE LOWER(SUBSTRING_INDEX(source_email,'@',1))=?""",
+                    (email,),
+                ).fetchall()
+                if len(candidates) == 1:
+                    user = candidates[0]
 
             if not user:
                 missing.append(email)
