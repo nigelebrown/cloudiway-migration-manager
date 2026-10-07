@@ -180,7 +180,7 @@ async def run_batch(user_ids: list[int], batch_number: int):
             with conn() as db:
                 placeholders = ",".join("?" for _ in user_ids)
                 db.execute(
-                    f"UPDATE users SET migration_status='migrating',batch_number=?,updated_at=CURRENT_TIMESTAMP "
+                    f"UPDATE users SET migration_status='migrating',batch_number=?,batch_started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP "
                     f"WHERE id IN ({placeholders}) AND cloudiway_object_id IS NOT NULL AND migration_status!='failed'",
                     (batch_number, *user_ids),
                 )
