@@ -8,6 +8,33 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: cloudiway_test
+          MYSQL_USER: cloudiway
+          MYSQL_PASSWORD: testpass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -prootpass"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      APP_ADMIN_PASSWORD: test-admin-password
+      APP_ENCRYPTION_KEY: test-encryption-secret
+      SESSION_SECRET: test-session-secret
+      SESSION_HTTPS_ONLY: "true"
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_NAME: cloudiway_test
+      DB_USER: cloudiway
+      DB_PASSWORD: testpass
+      CLOUDIWAY_BASE_URL: https://example.invalid/ap1
+      RACKSPACE_BASE_URL: https://example.invalid/v1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
