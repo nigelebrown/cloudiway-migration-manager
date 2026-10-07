@@ -9,12 +9,31 @@ from app.clients.cloudiway import CloudiwayClient
 
 
 def _rackspace_client() -> RackspaceClient:
+    mode = get_setting("rackspace_auth_mode") or "api_key"
+    customer = get_setting("rackspace_customer_id") or ""
+
+    if mode == "username_password":
+        username = get_setting("rackspace_username") or ""
+        password = decrypt_secret(get_setting("rackspace_password"))
+        if not username or not password:
+            raise RuntimeError("Rackspace username/password settings are incomplete")
+        return RackspaceClient(
+            customer_id=customer,
+            auth_mode="username_password",
+            username=username,
+            password=password,
+        )
+
     user_key = get_setting("rackspace_user_key")
     secret = decrypt_secret(get_setting("rackspace_secret_key"))
-    customer = get_setting("rackspace_customer_id")
     if not all([user_key, secret, customer]):
-        raise RuntimeError("Rackspace API settings are incomplete")
-    return RackspaceClient(user_key, secret, customer)
+        raise RuntimeError("Rackspace Email API settings are incomplete")
+    return RackspaceClient(
+        user_key=user_key,
+        secret_key=secret,
+        customer_id=customer,
+        auth_mode="api_key",
+    )
 
 
 def _cloudiway_client() -> CloudiwayClient:
