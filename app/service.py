@@ -286,16 +286,20 @@ async def refresh_status() -> dict:
 
 def parse_progress(data) -> tuple[str, float | None, str]:
     detail = json.dumps(data, default=str)[:1500]
-    statuses: list[str] = []
+    text_statuses: list[str] = []
+    numeric_status_seen = False
     percent = None
 
     def walk(obj):
-        nonlocal percent
+        nonlocal percent, numeric_status_seen
         if isinstance(obj, dict):
             for key, value in obj.items():
                 lk = str(key).lower()
-                if lk in ("status", "state", "jobstatus", "migrationstatus") and isinstance(value, (str, int)):
-                    statuses.append(str(value).strip().lower())
+                if lk in ("status", "state", "jobstatus", "migrationstatus"):
+                    if isinstance(value, str):
+                        text_statuses.append(value.strip().lower())
+                    elif isinstance(value, (int, float)):
+                        numeric_status_seen = True
                 if percent is None and lk in ("percent", "percentage", "progresspercent", "progresspercentage") and isinstance(value, (int, float)):
                     percent = float(value)
                 walk(value)
@@ -304,22 +308,38 @@ def parse_progress(data) -> tuple[str, float | None, str]:
                 walk(item)
 
     walk(data)
-    normalized = {s.replace("_", " ").strip() for s in statuses}
+    normalized = {s.replace("_", " ").replace("-", " ").strip() for s in text_statuses if s.strip()}
 
-    failed_words = {"failed", "fatal", "faulted", "error", "errored"}
-    completed_words = {"completed", "complete", "success", "succeeded", "finished", "done"}
+    active = {
+        "running", "migrating", "in progress", "processing", "pending",
+        "queued", "started", "starting", "active", "auditing", "ready",
+    }
+    failed = {"failed", "error", "errored", "faulted"}
+    complete = {"completed", "complete", "success", "succeeded", "finished", "done"}
+    needs_review = {
+        "stopped", "cancelled", "canceled", "aborted", "terminated",
+        "completed with warnings", "complete with warnings",
+        "partially completed", "partial success",
+    }
 
-    if normalized & failed_words:
+    if normalized & failed:
         status = "failed"
-    elif normalized & completed_words:
+    elif normalized & needs_review:
+        status = "attention"
+    elif normalized & complete:
         status = "completed"
+    elif normalized and normalized.issubset(active):
+        status = "completed" if percent is not None and percent >= 100 else "migrating"
+    elif normalized:
+        status = "attention"
     elif percent is not None and percent >= 100:
         status = "completed"
-    else:
+    elif numeric_status_seen or percent is not None:
         status = "migrating"
+    else:
+        status = "attention"
 
     return status, percent, detail
-
 
 def all_terminal_for_latest_batch() -> bool:
     with conn() as db:
