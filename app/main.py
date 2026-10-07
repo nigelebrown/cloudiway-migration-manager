@@ -198,7 +198,15 @@ def _normalize_cloudiway_pools(payload) -> list[dict]:
 async def status_poller():
     while True:
         try:
-            if get_runtime("automation_running", "0") == "1" and get_setting("cloudiway_token"):
+            token_present = bool(get_setting("cloudiway_token"))
+            keep_connected = get_setting("cloudiway_keep_connected") == "1"
+
+            # Keep the Cloudiway API session healthy independently of the web
+            # administrator login session.
+            if token_present and keep_connected:
+                await _cloudiway_client_ready()
+
+            if get_runtime("automation_running", "0") == "1" and token_present:
                 await refresh_status()
         except Exception as exc:
             log_event(None, "background_refresh_failed", str(exc))
@@ -297,6 +305,8 @@ async def settings_page(request: Request):
         context={
             "request": request,
             "cloudiway_connected": bool(get_setting("cloudiway_token")),
+            "cloudiway_username": get_setting("cloudiway_username") or "",
+            "cloudiway_keep_connected": get_setting("cloudiway_keep_connected") == "1",
             "rackspace_auth_mode": get_setting("rackspace_auth_mode") or "api_key",
             "rackspace_configured": bool(
                 get_setting("rackspace_secret_key") or get_setting("rackspace_password")
@@ -374,6 +384,7 @@ async def cloudiway_login(
     username: str = Form(...),
     password: str = Form(...),
     project_header: str = Form("JCF"),
+    keep_connected: str = Form(""),
 ):
     require_admin(request)
     client = CloudiwayClient(project_header=project_header.strip() or "JCF")
@@ -387,6 +398,15 @@ async def cloudiway_login(
             set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
         if data.get("expiration"):
             set_setting("cloudiway_token_expiration", data["expiration"])
+
+        if keep_connected:
+            set_setting("cloudiway_keep_connected", "1")
+            set_setting("cloudiway_username", username.strip())
+            set_setting("cloudiway_password", encrypt_secret(password), True)
+        else:
+            set_setting("cloudiway_keep_connected", "0")
+            set_setting("cloudiway_username", "")
+            set_setting("cloudiway_password", "", True)
 
         requested_project = project_header.strip() or "JCF"
         set_setting("cloudiway_project_name", requested_project)
@@ -412,7 +432,8 @@ async def cloudiway_login(
             request.session["cloudiway_pools"] = pools
             request.session["settings_notice"] = (
                 f"Cloudiway connection successful. Project '{selected_project['name']}' "
-                f"(ID {selected_project['id']}) selected. Found {len(pools)} connector pool(s)."
+                f"(ID {selected_project['id']}) selected. Found {len(pools)} connector pool(s). "
+                + ("Background reconnect is enabled." if keep_connected else "Background reconnect is disabled.")
             )
             log_info("cloudiway_connected", project_name=selected_project["name"], project_id=selected_project["id"], pool_count=len(pools))
         except Exception as pool_exc:
@@ -425,6 +446,21 @@ async def cloudiway_login(
     except Exception as exc:
         request.session["settings_error"] = str(exc)[:500]
         log_error("cloudiway_login_failed", error=exc)
+    return RedirectResponse("/settings", 303)
+
+
+@app.post("/settings/cloudiway/disconnect")
+async def cloudiway_disconnect(request: Request):
+    require_admin(request)
+    set_setting("cloudiway_token", "", True)
+    set_setting("cloudiway_refresh_token", "", True)
+    set_setting("cloudiway_token_expiration", "")
+    set_setting("cloudiway_keep_connected", "0")
+    set_setting("cloudiway_username", "")
+    set_setting("cloudiway_password", "", True)
+    request.session["settings_notice"] = (
+        "Cloudiway disconnected from this application. Existing Cloudiway migration jobs continue on Cloudiway."
+    )
     return RedirectResponse("/settings", 303)
 
 
