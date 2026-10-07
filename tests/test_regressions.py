@@ -348,14 +348,19 @@ def test_upload_accepts_rackspace_template_with_target_email():
 
 
 def test_manual_rackspace_generate_and_confirm_round_trip():
+    import io
+    import zipfile
+    import pandas as pd
     from app.security import decrypt_secret
 
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         with conn() as db:
             db.execute(
-                "INSERT INTO users(source_email,target_email,first_name,last_name) VALUES(?,?,?,?)",
-                ("manual@rack.example", "manual@jcf.gov.jm", "Manual", "User"),
+                """INSERT INTO users(
+                       source_email,target_email,first_name,last_name,computer_number
+                   ) VALUES(?,?,?,?,?)""",
+                ("manual@rack.example", "manual@jcf.gov.jm", "Manual", "User", "14323"),
             )
             uid = db.execute(
                 "SELECT id FROM users WHERE source_email=?",
@@ -364,10 +369,17 @@ def test_manual_rackspace_generate_and_confirm_round_trip():
 
         generated = client.post(
             "/manual-rackspace/generate",
-            data=[("user_ids", str(uid))],
+            data={"user_ids": str(uid)},
         )
         assert generated.status_code == 200
-        assert "manual@rack.example" in generated.content.decode("utf-8-sig")
+        assert "application/zip" in generated.headers["content-type"]
+
+        archive = zipfile.ZipFile(io.BytesIO(generated.content))
+        names = archive.namelist()
+        rackspace_name = next(n for n in names if n.endswith(".csv"))
+        map_name = next(n for n in names if n.endswith(".xlsx"))
+        rackspace_csv = archive.read(rackspace_name)
+        password_map = pd.read_excel(io.BytesIO(archive.read(map_name)))
 
         with conn() as db:
             row = db.execute(
@@ -377,11 +389,14 @@ def test_manual_rackspace_generate_and_confirm_round_trip():
         generated_value = decrypt_secret(row["generated_password_enc"])
         assert row["password_reset_method"] == "manual_bulk"
         assert row["rackspace_status"] == "manual_file_generated"
-        assert generated_value in generated.content.decode("utf-8-sig")
+        assert generated_value in rackspace_csv.decode("utf-8-sig")
+        assert password_map.iloc[0]["source_email"] == "manual@rack.example"
+        assert password_map.iloc[0]["target_email"] == "manual@jcf.gov.jm"
+        assert str(password_map.iloc[0]["computer_number"]) == "14323"
 
         confirmed = client.post(
             "/manual-rackspace/confirm-upload",
-            files={"file": ("confirm.csv", generated.content, "text/csv")},
+            files={"file": ("confirm.csv", rackspace_csv, "text/csv")},
             follow_redirects=False,
         )
         assert confirmed.status_code == 303
