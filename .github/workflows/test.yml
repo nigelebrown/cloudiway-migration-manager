@@ -44,4 +44,5 @@ jobs:
       - run: pip check
       - run: python -m compileall -q app
       - run: bash -n install-centos.sh
+      - run: bash -n update-centos.sh
       - run: pytest -q
