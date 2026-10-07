@@ -27,6 +27,7 @@ from app.service import (
     _cloudiway_client,
     _cloudiway_client_ready,
     start_manual_migrations,
+    launch_next_confirmed_manual_batch,
 )
 
 app = FastAPI(title="JCF Mail Migration Console")
@@ -882,7 +883,8 @@ async def dashboard_data(request: Request, q: str = ""):
         else:
             rows = db.execute(
                 """SELECT id,source_email,target_email,first_name,last_name,rackspace_status,
-                          cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at
+                          cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at,
+                          password_reset_method,manual_password_generated_at,manual_password_confirmed_at,computer_number
                    FROM users ORDER BY id DESC LIMIT 1000"""
             ).fetchall()
     return {
@@ -899,6 +901,25 @@ async def automation_start(request: Request):
     set_runtime("automation_paused", "0")
     set_runtime("pause_reason", "")
     set_runtime("automation_running", "1")
+
+    # Prefer manually-confirmed users when they are waiting. This path does not
+    # require Rackspace API credentials because the administrator has already
+    # applied the generated password in Rackspace and uploaded the file back.
+    with conn() as db:
+        manual_waiting = db.execute(
+            """SELECT COUNT(*) c FROM users
+               WHERE migration_status='waiting'
+                 AND password_reset_method='manual_bulk'
+                 AND rackspace_status='manual_confirmed'"""
+        ).fetchone()["c"]
+
+    if manual_waiting:
+        result = await launch_next_confirmed_manual_batch()
+        if result.get("started"):
+            return JSONResponse(result)
+        if result.get("reason") not in ("No manually confirmed users are waiting",):
+            return JSONResponse(result)
+
     return JSONResponse(await launch_next_batch(force=True))
 
 
@@ -915,6 +936,22 @@ async def automation_continue(request: Request):
     require_admin(request)
     set_runtime("automation_paused", "0")
     set_runtime("pause_reason", "")
+
+    with conn() as db:
+        manual_waiting = db.execute(
+            """SELECT COUNT(*) c FROM users
+               WHERE migration_status='waiting'
+                 AND password_reset_method='manual_bulk'
+                 AND rackspace_status='manual_confirmed'"""
+        ).fetchone()["c"]
+
+    if manual_waiting:
+        result = await launch_next_confirmed_manual_batch()
+        if result.get("started"):
+            return result
+        if result.get("reason") not in ("No manually confirmed users are waiting",):
+            return result
+
     return await launch_next_batch(force=True)
 
 
@@ -956,6 +993,97 @@ async def retry_user(request: Request, user_id: int):
             (user_id,),
         )
     return {"ok": True}
+
+
+@app.get("/logs", response_class=HTMLResponse)
+async def logs_page(request: Request, level: str = "", q: str = ""):
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
+
+    with conn() as db:
+        event_rows = db.execute(
+            """SELECT e.id,e.user_id,e.event_type,e.message,e.created_at,
+                      u.source_email,u.target_email
+               FROM events e
+               LEFT JOIN users u ON u.id=e.user_id
+               ORDER BY e.id DESC
+               LIMIT 500"""
+        ).fetchall()
+
+    events = [dict(r) for r in event_rows]
+    if q:
+        needle = q.lower()
+        events = [
+            e for e in events
+            if needle in str(e.get("event_type") or "").lower()
+            or needle in str(e.get("message") or "").lower()
+            or needle in str(e.get("source_email") or "").lower()
+            or needle in str(e.get("target_email") or "").lower()
+        ]
+
+    raw_log = tail_log(max_bytes=512 * 1024)
+    lines = [line for line in raw_log.splitlines() if line.strip()]
+    if level:
+        level_upper = level.upper()
+        lines = [line for line in lines if f" {level_upper} " in line]
+    if q:
+        needle = q.lower()
+        lines = [line for line in lines if needle in line.lower()]
+    lines = lines[-500:]
+
+    with conn() as db:
+        issue_counts = {
+            "failed_users": db.execute(
+                "SELECT COUNT(*) c FROM users WHERE migration_status='failed'"
+            ).fetchone()["c"],
+            "attention_users": db.execute(
+                "SELECT COUNT(*) c FROM users WHERE migration_status='attention'"
+            ).fetchone()["c"],
+            "timed_out_users": db.execute(
+                "SELECT COUNT(*) c FROM users WHERE migration_status='timed_out'"
+            ).fetchone()["c"],
+            "users_with_errors": db.execute(
+                "SELECT COUNT(*) c FROM users WHERE error_message IS NOT NULL AND error_message<>''"
+            ).fetchone()["c"],
+        }
+
+    return templates.TemplateResponse(
+        request=request,
+        name="logs.html",
+        context={
+            "request": request,
+            "events": events,
+            "log_lines": lines,
+            "level": level,
+            "q": q,
+            "issue_counts": issue_counts,
+            "pause_reason": get_runtime("pause_reason", ""),
+            "automation_paused": get_runtime("automation_paused", "0") == "1",
+        },
+    )
+
+
+@app.get("/api/logs/issues")
+async def logs_issue_summary(request: Request):
+    require_admin(request)
+    with conn() as db:
+        issues = [
+            dict(r) for r in db.execute(
+                """SELECT id,source_email,target_email,rackspace_status,cloudiway_status,
+                          migration_status,error_message,updated_at
+                   FROM users
+                   WHERE migration_status IN ('failed','attention','timed_out')
+                      OR (error_message IS NOT NULL AND error_message<>'')
+                   ORDER BY updated_at DESC
+                   LIMIT 200"""
+            ).fetchall()
+        ]
+    return {
+        "paused": get_runtime("automation_paused", "0") == "1",
+        "pause_reason": get_runtime("pause_reason", ""),
+        "issues": issues,
+    }
 
 
 @app.get("/diagnostics/download")
