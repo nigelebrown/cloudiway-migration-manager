@@ -2,7 +2,6 @@ import asyncio
 import io
 import re
 import secrets
-import os
 import time
 from collections import defaultdict, deque
 
@@ -52,8 +51,6 @@ def _validate_runtime_secrets():
         "SESSION_SECRET": settings.session_secret,
     }
     weak = [name for name, value in values.items() if value in bad or len(value) < 12]
-    if os.getenv("PYTEST_CURRENT_TEST"):
-        weak = [name for name in weak if not (name == "APP_ADMIN_PASSWORD" and settings.app_admin_password == "test-admin")]
     if weak:
         raise RuntimeError("Unsafe default/weak application secret(s): " + ", ".join(weak))
 
@@ -119,14 +116,35 @@ async def login(request: Request, admin_password: str = Form(...)):
     q = _login_attempts[key]
     while q and now - q[0] > settings.login_window_seconds:
         q.popleft()
+    password_ok = secrets.compare_digest(admin_password, settings.app_admin_password)
+    if password_ok:
+        q.clear()
+        if settings.session_https_only and request.url.scheme != "https":
+            return templates.TemplateResponse(
+                request=request,
+                name="login.html",
+                context={
+                    "request": request,
+                    "error": "HTTPS is required for sign-in because secure session cookies are enabled. Use HTTPS or set SESSION_HTTPS_ONLY=false only for a temporary local trial.",
+                },
+                status_code=400,
+            )
+        request.session["admin"] = True
+        return RedirectResponse("/dashboard", 303)
     if len(q) >= settings.login_max_attempts:
-        return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "Too many failed sign-in attempts. Try again later."}, status_code=429)
-    if not secrets.compare_digest(admin_password, settings.app_admin_password):
-        q.append(now)
-        return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "Invalid administrator password"}, status_code=401)
-    q.clear()
-    request.session["admin"] = True
-    return RedirectResponse("/dashboard", 303)
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context={"request": request, "error": "Too many failed sign-in attempts. Try again later."},
+            status_code=429,
+        )
+    q.append(now)
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={"request": request, "error": "Invalid administrator password"},
+        status_code=401,
+    )
 
 
 @app.post("/logout")
