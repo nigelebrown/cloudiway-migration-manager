@@ -295,7 +295,9 @@ async def refresh_status() -> dict:
                     ids,
                 )
                 timed_out = len(ids)
-                log_event(None, "batch_timeout", f"{timed_out} migration(s) exceeded the configured timeout")
+
+    if timed_out:
+        log_event(None, "batch_timeout", f"{timed_out} migration(s) exceeded the configured timeout")
 
     if (failed or attention or timed_out) and settings.pause_on_any_failure:
         set_runtime("automation_paused", "1")
