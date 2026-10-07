@@ -1053,6 +1053,11 @@ async def user_cloudiway_logs(request: Request, user_id: int):
     }
 
     try:
+        result["mail_user"] = await client.get_mail_user(object_id)
+    except Exception as exc:
+        result["mail_user_error"] = str(exc)
+
+    try:
         result["logs"] = await client.logs(object_id)
     except Exception as exc:
         result["logs_error"] = str(exc)
