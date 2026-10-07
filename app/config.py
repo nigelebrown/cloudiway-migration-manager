@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     batch_size: int = 10
     status_poll_seconds: int = 15
     progress_window_minutes: int = 1
+    batch_timeout_minutes: int = 1440
     auto_continue: bool = True
     pause_on_any_failure: bool = True
     session_https_only: bool = True
