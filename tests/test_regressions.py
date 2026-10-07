@@ -377,7 +377,7 @@ def test_manual_rackspace_generate_and_confirm_round_trip():
         archive = zipfile.ZipFile(io.BytesIO(generated.content))
         names = archive.namelist()
         rackspace_name = next(n for n in names if n.endswith(".csv"))
-        map_name = next(n for n in names if n.endswith(".xlsx"))
+        map_name = next(n for n in names if n.startswith("migration-password-map-") and n.endswith(".xlsx"))
         rackspace_csv = archive.read(rackspace_name)
         password_map = pd.read_excel(io.BytesIO(archive.read(map_name)))
 
@@ -407,3 +407,71 @@ def test_manual_rackspace_generate_and_confirm_round_trip():
             ).fetchone()
         assert row["rackspace_status"] == "manual_confirmed"
         assert row["manual_password_confirmed_at"] is not None
+
+
+def test_logs_page_is_available_to_admin():
+    with TestClient(app) as client:
+        client.post("/login", data={"admin_password": "test-admin-password"})
+        r = client.get("/logs")
+        assert r.status_code == 200
+        assert "Logs &amp; Issues" in r.text or "Logs & Issues" in r.text
+        assert "Application Events" in r.text
+
+
+def test_manual_confirmed_user_is_eligible_for_manual_start(monkeypatch):
+    from app import service as svc
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,password_reset_method,rackspace_status,
+                   migration_status,generated_password_enc
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                "confirmed@rack.example",
+                "confirmed@jcf.gov.jm",
+                "manual_bulk",
+                "manual_confirmed",
+                "waiting",
+                encrypt_secret("SafePass123!"),
+            ),
+        )
+        uid = db.execute(
+            "SELECT id FROM users WHERE source_email=?",
+            ("confirmed@rack.example",),
+        ).fetchone()["id"]
+
+    class FakeCloud:
+        async def get_self_service_token(self, object_id):
+            return "token"
+        async def register_source_credentials(self, token, username, password):
+            return {}
+        async def start_migration(self, object_ids):
+            return {"ok": True}
+
+    async def fake_ready():
+        return FakeCloud()
+
+    async def fake_ensure(user):
+        with conn() as db:
+            db.execute(
+                "UPDATE users SET cloudiway_object_id=? WHERE id=?",
+                (1234, user["id"]),
+            )
+        return 1234
+
+    monkeypatch.setattr(svc, "_cloudiway_client_ready", fake_ready)
+    monkeypatch.setattr(svc, "ensure_cloudiway_user", fake_ensure)
+    monkeypatch.setattr(svc, "_cloudiway_preflight", lambda: None)
+
+    import asyncio
+    result = asyncio.run(svc.launch_next_confirmed_manual_batch())
+    assert result["started"] is True
+    assert result["users_started"] == 1
+
+    with conn() as db:
+        row = db.execute(
+            "SELECT migration_status FROM users WHERE id=?",
+            (uid,),
+        ).fetchone()
+    assert row["migration_status"] == "migrating"
