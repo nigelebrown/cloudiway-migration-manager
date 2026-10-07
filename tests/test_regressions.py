@@ -463,6 +463,9 @@ def test_manual_confirmed_user_is_eligible_for_manual_start(monkeypatch):
     monkeypatch.setattr(svc, "_cloudiway_client_ready", fake_ready)
     monkeypatch.setattr(svc, "ensure_cloudiway_user", fake_ensure)
     monkeypatch.setattr(svc, "_cloudiway_preflight", lambda: None)
+    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
+    set_setting("cloudiway_source_pool_id", "4")
+    set_setting("cloudiway_target_pool_id", "3")
 
     import asyncio
     result = asyncio.run(svc.launch_next_confirmed_manual_batch())
@@ -529,3 +532,74 @@ def test_classify_source_mailbox_connection_failure():
     assert status == "failed"
     assert code == "source_mailbox_connection_failed"
     assert "source rackspace mailbox" in message.lower()
+
+
+def test_cloudiway_refresh_failure_falls_back_to_background_login(monkeypatch):
+    from app import service as svc
+    import asyncio
+
+    class ExpiringCloud:
+        def __init__(self):
+            self.token = "old-token"
+
+        async def refresh_token(self, token, refresh_token):
+            raise RuntimeError("Invalid refresh token")
+
+    class FreshCloud:
+        def __init__(self):
+            self.token = "fresh-token"
+
+    async def fake_reauth():
+        return FreshCloud()
+
+    monkeypatch.setattr(svc, "_cloudiway_client", lambda: ExpiringCloud())
+    monkeypatch.setattr(svc, "_cloudiway_reauthenticate", fake_reauth)
+
+    set_setting("cloudiway_token", encrypt_secret("old-token"), True)
+    set_setting("cloudiway_refresh_token", encrypt_secret("bad-refresh"), True)
+    set_setting("cloudiway_keep_connected", "1")
+    set_setting(
+        "cloudiway_token_expiration",
+        (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+    )
+
+    client = asyncio.run(svc._cloudiway_client_ready())
+    assert client.token == "fresh-token"
+
+
+def test_cloudiway_mapping_mismatch_is_blocked(monkeypatch):
+    from app import service as svc
+    import asyncio
+
+    class FakeCloud:
+        async def get_mail_user(self, object_id):
+            return {
+                "id": object_id,
+                "sourceEmail": "user@jcf.gov.jm",
+                "targetEmail": "wrong.target@jcf.gov.jm",
+            }
+
+    with pytest.raises(RuntimeError, match="target mapping mismatch"):
+        asyncio.run(
+            svc._validate_cloudiway_user_mapping(
+                FakeCloud(),
+                123,
+                "user@jcf.gov.jm",
+                "correct.target@jcf.gov.jm",
+            )
+        )
+
+
+def test_logout_does_not_disconnect_cloudiway():
+    set_setting("cloudiway_token", encrypt_secret("persistent-token"), True)
+    set_setting("cloudiway_keep_connected", "1")
+    set_setting("cloudiway_username", "admin@example.com")
+
+    with TestClient(app) as client:
+        client.post("/login", data={"admin_password": "test-admin-password"})
+        r = client.post("/logout", follow_redirects=False)
+        assert r.status_code == 303
+
+    assert get_setting("cloudiway_token") != ""
+    assert get_setting("cloudiway_keep_connected") == "1"
+    assert get_setting("cloudiway_username") == "admin@example.com"
