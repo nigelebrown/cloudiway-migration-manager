@@ -250,7 +250,11 @@ async def launch_next_batch(force: bool = False) -> dict:
         max_batch = db.execute("SELECT COALESCE(MAX(batch_number),0) n FROM users").fetchone()["n"]
         size = settings.pilot_size if max_batch == 0 else settings.batch_size
         rows = db.execute(
-            "SELECT id FROM users WHERE migration_status='waiting' ORDER BY id LIMIT ?", (size,)
+            """SELECT id FROM users
+               WHERE migration_status='waiting'
+                 AND COALESCE(password_reset_method,'automatic')='automatic'
+               ORDER BY id LIMIT ?""",
+            (size,),
         ).fetchall()
         if not rows:
             return {"started": False, "reason": "No waiting users"}
@@ -408,6 +412,132 @@ def all_terminal_for_latest_batch() -> bool:
             (latest,),
         ).fetchone()
         return bool(row["total"] and row["terminal"] == row["total"])
+
+
+async def prepare_manual_user(user_id: int) -> int:
+    """Register a manually-applied Rackspace password with Cloudiway."""
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row:
+        raise RuntimeError(f"User {user_id} not found")
+    user = dict(row)
+
+    if user.get("password_reset_method") != "manual_bulk":
+        raise RuntimeError("User is not assigned to the manual Rackspace reset workflow")
+    if user.get("rackspace_status") != "manual_confirmed":
+        raise RuntimeError("Rackspace password has not been confirmed as applied")
+    if not user.get("generated_password_enc"):
+        raise RuntimeError("No generated Rackspace password is stored for this user")
+
+    password = decrypt_secret(user["generated_password_enc"])
+    cloud = await _cloudiway_client_ready()
+    object_id = await ensure_cloudiway_user(user)
+    token = await cloud.get_self_service_token(object_id)
+    await cloud.register_source_credentials(token, user["source_email"], password)
+
+    with conn() as db:
+        db.execute(
+            """UPDATE users
+               SET cloudiway_status='credentials_set',
+                   migration_status='ready',
+                   error_message=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (user_id,),
+        )
+    log_event(
+        user_id,
+        "manual_cloudiway_credentials",
+        "Manually-applied Rackspace password registered with Cloudiway",
+    )
+    return object_id
+
+
+async def start_manual_migrations(user_ids: list[int]) -> dict:
+    """Start Cloudiway migrations without using the Rackspace administration API."""
+    if not user_ids:
+        return {"started": False, "reason": "No users selected"}
+
+    _cloudiway_client()
+    if not get_setting("cloudiway_source_pool_id") or not get_setting("cloudiway_target_pool_id"):
+        raise RuntimeError("Cloudiway source and target connector pools are not configured")
+
+    object_ids: list[int] = []
+    started_user_ids: list[int] = []
+    failed: list[dict] = []
+
+    with conn() as db:
+        max_batch = db.execute(
+            "SELECT COALESCE(MAX(batch_number),0) n FROM users"
+        ).fetchone()["n"]
+    batch_no = int(max_batch or 0) + 1
+
+    for uid in user_ids:
+        try:
+            oid = await prepare_manual_user(uid)
+            object_ids.append(oid)
+            started_user_ids.append(uid)
+        except Exception as exc:
+            failed.append({"user_id": uid, "error": str(exc)})
+            with conn() as db:
+                db.execute(
+                    """UPDATE users SET migration_status='failed',error_message=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (str(exc)[:3000], uid),
+                )
+            log_event(uid, "manual_migration_prepare_failed", str(exc))
+
+    if object_ids:
+        try:
+            cloud = await _cloudiway_client_ready()
+            await cloud.start_migration(object_ids)
+            with conn() as db:
+                placeholders = ",".join("?" for _ in started_user_ids)
+                db.execute(
+                    f"""UPDATE users
+                        SET migration_status='migrating',
+                            batch_number=?,
+                            batch_started_at=CURRENT_TIMESTAMP,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id IN ({placeholders})""",
+                    (batch_no, *started_user_ids),
+                )
+            log_event(
+                None,
+                "manual_batch_started",
+                f"Manual Rackspace batch {batch_no} started with {len(started_user_ids)} users",
+            )
+            set_runtime("automation_running", "1")
+        except Exception as exc:
+            with conn() as db:
+                placeholders = ",".join("?" for _ in started_user_ids)
+                db.execute(
+                    f"""UPDATE users
+                        SET migration_status='failed',error_message=?,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id IN ({placeholders})""",
+                    (str(exc)[:3000], *started_user_ids),
+                )
+            failed.extend(
+                {"user_id": uid, "error": str(exc)} for uid in started_user_ids
+            )
+            object_ids = []
+            started_user_ids = []
+            log_event(None, "manual_batch_start_failed", str(exc))
+
+    if failed and settings.pause_on_any_failure:
+        set_runtime("automation_paused", "1")
+        set_runtime(
+            "pause_reason",
+            f"Manual migration has {len(failed)} failed user(s)",
+        )
+
+    return {
+        "started": bool(started_user_ids),
+        "batch": batch_no if started_user_ids else None,
+        "users_started": len(started_user_ids),
+        "failed": failed,
+    }
 
 
 async def rotate_user_password(user_id: int) -> str:
