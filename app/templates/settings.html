@@ -1,16 +1,78 @@
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connections</title>
 <style>
-:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}body{margin:0;background:#07111f;color:#e5e7eb}.wrap{max-width:1100px;margin:0 auto;padding:28px 20px}.top{display:flex;justify-content:space-between;align-items:center}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#101a2b;border:1px solid #22324a;border-radius:14px;padding:22px}.ok{color:#86efac}.bad{color:#fca5a5}.field{margin:10px 0}.notice{padding:11px 14px;border-radius:8px;margin:12px 0}.notice.okbox{background:#064e3b;color:#d1fae5}.notice.errbox{background:#451a1a;color:#fecaca}input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#fff}button{padding:10px 14px;border:0;border-radius:8px;background:#0284c7;color:#fff;font-weight:750;cursor:pointer}.secondary{background:#334155}a{color:#38bdf8;text-decoration:none}pre{white-space:pre-wrap;background:#020617;padding:12px;border-radius:8px;max-height:250px;overflow:auto}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}body{margin:0;background:#07111f;color:#e5e7eb}.wrap{max-width:1100px;margin:0 auto;padding:28px 20px}.top{display:flex;justify-content:space-between;align-items:center}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#101a2b;border:1px solid #22324a;border-radius:14px;padding:22px}.ok{color:#86efac}.bad{color:#fca5a5}.field{margin:10px 0}.notice{padding:11px 14px;border-radius:8px;margin:12px 0}.notice.okbox{background:#064e3b;color:#d1fae5}.notice.errbox{background:#451a1a;color:#fecaca}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#fff}label{display:block;margin-bottom:6px;color:#cbd5e1;font-size:14px}button{padding:10px 14px;border:0;border-radius:8px;background:#0284c7;color:#fff;font-weight:750;cursor:pointer}.secondary{background:#334155}a{color:#38bdf8;text-decoration:none}pre{white-space:pre-wrap;background:#020617;padding:12px;border-radius:8px;max-height:250px;overflow:auto}.hint{color:#94a3b8;font-size:13px}@media(max-width:800px){.grid{grid-template-columns:1fr}}
 </style></head><body><div class="wrap"><div class="top"><div><h1>Connections</h1><a href="/dashboard">← Dashboard</a></div></div>
 {% if error %}<div class="notice errbox">{{error}}</div>{% endif %}{% if notice %}<div class="notice okbox">{{notice}}</div>{% endif %}
 <div class="grid">
 <div class="card"><h2>Cloudiway</h2><p class="{{'ok' if cloudiway_connected else 'bad'}}">{{'Connected' if cloudiway_connected else 'Not connected'}}</p>
-<form method="post" action="/settings/cloudiway/login"><div class="field"><input name="project_header" value="{{project_header}}" placeholder="Project header (JCF)"></div><div class="field"><input name="username" type="email" placeholder="Cloudiway username" required></div><div class="field"><input name="password" type="password" placeholder="Cloudiway password" required></div><button>Connect Cloudiway</button></form>
-<hr><h3>Connector pools</h3><form method="post" action="/settings/cloudiway/pools"><div class="field"><input name="source_pool_id" value="{{source_pool}}" placeholder="Rackspace/IMAP source pool ID" required></div><div class="field"><input name="target_pool_id" value="{{target_pool}}" placeholder="Microsoft 365 target pool ID" required></div><button>Save Pool IDs</button></form><p><button class="secondary" type="button" onclick="showCloudiway()">Show projects & connector pools</button></p><pre id="cloudOut">Connect to Cloudiway first, then use this to identify source and target pool IDs.</pre></div>
-<div class="card"><h2>Rackspace Email API</h2><p class="{{'ok' if rackspace_configured else 'bad'}}">{{'Configured' if rackspace_configured else 'Not configured'}}</p><p>Use the Rackspace Email & Apps API User Key, Secret Key and Customer Account Number.</p>
-<form method="post" action="/settings/rackspace"><div class="field"><input name="user_key" value="{{rackspace_user_key}}" placeholder="User Key" required></div><div class="field"><input name="secret_key" type="password" placeholder="Secret Key" required></div><div class="field"><input name="customer_id" value="{{rackspace_customer_id}}" placeholder="Customer account number" required></div><button>Save Rackspace API</button></form><p><button class="secondary" type="button" onclick="testRackspace()">Test Rackspace Connection</button></p><pre id="rackOut">No connection test run yet.</pre></div>
-</div></div><script>
+<form method="post" action="/settings/cloudiway/login">
+<div class="field"><label>Project</label><input name="project_header" value="{{project_header}}" placeholder="JCF"></div>
+<div class="field"><label>Cloudiway Username</label><input name="username" type="email" placeholder="Cloudiway username" required></div>
+<div class="field"><label>Cloudiway Password</label><input name="password" type="password" placeholder="Cloudiway password" required></div>
+<button>Connect Cloudiway</button>
+</form>
+<hr><h3>Existing Cloudiway Connector Pools</h3>
+{% if cloudiway_connected %}
+<form method="post" action="/settings/cloudiway/pools">
+<div class="field">
+<label>Source connector — Rackspace / IMAP</label>
+<select name="source_pool_id" id="sourcePool" required>
+<option value="">Select source connector pool...</option>
+{% for p in cloudiway_pools %}
+<option value="{{p.id}}" {% if source_pool|string == p.id|string %}selected{% endif %}>{{p.label}} [ID {{p.id}}]</option>
+{% endfor %}
+</select>
+</div>
+<div class="field">
+<label>Target connector — Microsoft 365</label>
+<select name="target_pool_id" id="targetPool" required>
+<option value="">Select target connector pool...</option>
+{% for p in cloudiway_pools %}
+<option value="{{p.id}}" {% if target_pool|string == p.id|string %}selected{% endif %}>{{p.label}} [ID {{p.id}}]</option>
+{% endfor %}
+</select>
+</div>
+<button>Save Selected Connectors</button>
+<button class="secondary" type="button" onclick="reloadPools()">Reload Connectors</button>
+</form>
+<p class="hint">These are existing Cloudiway connector pools. The app does not create a new Rackspace or Microsoft 365 migration connector.</p>
+{% if not cloudiway_pools %}<div class="notice errbox">Connected, but no connector pools were returned. Click Reload Connectors or verify the JCF project in Cloudiway.</div>{% endif %}
+{% else %}
+<p class="hint">Connect to Cloudiway first. The existing Rackspace/IMAP and Microsoft 365 connector pools will then appear here automatically.</p>
+{% endif %}
+<pre id="cloudOut">Connector discovery status will appear here.</pre>
+</div>
+
+<div class="card"><h2>Rackspace Password Administration API</h2><p class="{{'ok' if rackspace_configured else 'bad'}}">{{'Configured' if rackspace_configured else 'Not configured'}}</p>
+<p>This is used only to automatically reset individual Rackspace mailbox passwords. Cloudiway continues to use your existing Rackspace/IMAP migration connector.</p>
+<form method="post" action="/settings/rackspace">
+<div class="field"><label>Rackspace API User Key</label><input name="user_key" value="{{rackspace_user_key}}" placeholder="User Key" required></div>
+<div class="field"><label>Rackspace API Secret Key</label><input name="secret_key" type="password" placeholder="Secret Key" required></div>
+<div class="field"><label>Customer Account Number</label><input name="customer_id" value="{{rackspace_customer_id}}" placeholder="Customer account number" required></div>
+<button>Save Rackspace API</button>
+</form>
+<p><button class="secondary" type="button" onclick="testRackspace()">Test Rackspace Password API</button></p>
+<pre id="rackOut">No connection test run yet.</pre>
+</div>
+</div></div>
+<script>
 async function asJson(r){try{return await r.json()}catch(e){return {ok:false,message:'Unexpected server response ('+r.status+')'}}}
 async function testRackspace(){const r=await fetch('/settings/rackspace/test',{method:'POST'});document.getElementById('rackOut').textContent=JSON.stringify(await asJson(r),null,2)}
-async function showCloudiway(){let out={};for(const p of [['projects','/api/cloudiway/projects'],['connectors','/api/cloudiway/connectors']]){try{const r=await fetch(p[1]);out[p[0]]=await asJson(r)}catch(e){out[p[0]]={ok:false,message:String(e)}}}document.getElementById('cloudOut').textContent=JSON.stringify(out,null,2)}
+async function reloadPools(){
+ const out=document.getElementById('cloudOut');
+ out.textContent='Loading Cloudiway connector pools...';
+ const r=await fetch('/api/cloudiway/pools');
+ const d=await asJson(r);
+ if(!r.ok){out.textContent=d.message||'Unable to load connector pools';return}
+ const source=document.getElementById('sourcePool'), target=document.getElementById('targetPool');
+ const selectedSource=source.value, selectedTarget=target.value;
+ for(const el of [source,target]){
+   el.innerHTML='<option value="">Select connector pool...</option>';
+   for(const p of d.choices||[]){
+     const o=document.createElement('option');o.value=p.id;o.textContent=p.label+' [ID '+p.id+']';el.appendChild(o);
+   }
+ }
+ source.value=selectedSource; target.value=selectedTarget;
+ out.textContent='Loaded '+(d.choices||[]).length+' connector pool(s).';
+}
 </script></body></html>
