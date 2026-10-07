@@ -2,19 +2,19 @@ RACKSPACE_MAILBOX_HEADERS = [
     "Username",
     "Password",
     "Enabled",
-    "First Name",
-    "Middle Initial",
-    "Last Name",
-    "Alternate Email",
+    "FirstName",
+    "MiddleInitial",
+    "LastName",
+    "AlternateEmail",
     "Organization",
     "Department",
     "Title",
-    "Mobile Phone Number",
-    "Business Phone Number",
+    "MobilePhoneNumber",
+    "BusinessPhoneNumber",
     "Street",
     "City",
     "State",
-    "Postal Code",
+    "PostalCode",
     "Country",
     "Notes",
     "UserID",
@@ -25,8 +25,8 @@ RACKSPACE_MAILBOX_HEADERS = [
 
 
 def rackspace_row(user: dict, password: str) -> list[str]:
-    # Rackspace import is scoped to the selected domain, so Username must be
-    # the mailbox local-part only (e.g. nigel.brown), not the full email.
+    # Rackspace import is already scoped to the selected domain, therefore
+    # Username is the mailbox local-part only (e.g. nigel.brown).
     source_email = (user.get("source_email") or "").strip()
     username = source_email.split("@", 1)[0] if "@" in source_email else source_email
 
