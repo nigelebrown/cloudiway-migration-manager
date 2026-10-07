@@ -73,6 +73,46 @@ def _clean_cell(value) -> str:
     return str(value).strip()
 
 
+def _normalize_cloudiway_projects(payload) -> list[dict]:
+    projects: list[dict] = []
+
+    def walk(value):
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        if isinstance(value.get("id"), (int, str)) and value.get("name"):
+            pid = str(value.get("id")).strip()
+            name = str(value.get("name")).strip()
+            if pid and name and pid.isdigit():
+                projects.append({"id": pid, "name": name})
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                walk(child)
+
+    walk(payload)
+    dedup = {}
+    for p in projects:
+        dedup[p["id"]] = p
+    return list(dedup.values())
+
+
+def _resolve_cloudiway_project(projects: list[dict], requested: str) -> dict | None:
+    wanted = (requested or "").strip().lower()
+    for p in projects:
+        if p["name"].strip().lower() == wanted:
+            return p
+    if wanted.isdigit():
+        for p in projects:
+            if p["id"] == wanted:
+                return p
+    if len(projects) == 1:
+        return projects[0]
+    return None
+
+
 def _normalize_cloudiway_pools(payload) -> list[dict]:
     """Flatten Cloudiway connector-pool responses into dropdown choices."""
     choices: dict[str, dict] = {}
@@ -235,7 +275,7 @@ async def settings_page(request: Request):
             "rackspace_user_key": get_setting("rackspace_user_key") or "",
             "rackspace_username": get_setting("rackspace_username") or "",
             "rackspace_customer_id": get_setting("rackspace_customer_id") or "",
-            "project_header": get_setting("cloudiway_project_header") or settings.cloudiway_project_header,
+            "project_header": get_setting("cloudiway_project_name") or get_setting("cloudiway_project_header") or settings.cloudiway_project_header,
             "source_pool": get_setting("cloudiway_source_pool_id") or "",
             "target_pool": get_setting("cloudiway_target_pool_id") or "",
             "cloudiway_pools": pools,
@@ -312,25 +352,42 @@ async def cloudiway_login(
         if not token:
             raise RuntimeError("Cloudiway login succeeded but no access token was returned")
         set_setting("cloudiway_token", encrypt_secret(token), True)
-        set_setting("cloudiway_project_header", project_header.strip() or "JCF")
         if data.get("refreshToken"):
             set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
         if data.get("expiration"):
             set_setting("cloudiway_token_expiration", data["expiration"])
 
+        requested_project = project_header.strip() or "JCF"
+        set_setting("cloudiway_project_name", requested_project)
+
         try:
+            project_payload = await client.projects(include_project_header=False)
+            projects = _normalize_cloudiway_projects(project_payload)
+            selected_project = _resolve_cloudiway_project(projects, requested_project)
+            if not selected_project:
+                names = ", ".join(p["name"] for p in projects[:10]) or "none returned"
+                raise RuntimeError(
+                    f"Could not resolve Cloudiway project '{requested_project}'. Accessible projects: {names}"
+                )
+
+            # Connector endpoints expect the actual projectId, not the display name.
+            client.project_header = selected_project["id"]
+            set_setting("cloudiway_project_header", selected_project["id"])
+            set_setting("cloudiway_project_id", selected_project["id"])
+            set_setting("cloudiway_project_name", selected_project["name"])
+
             pools_payload = await client.connector_pools()
             pools = _normalize_cloudiway_pools(pools_payload)
             request.session["cloudiway_pools"] = pools
             request.session["settings_notice"] = (
-                f"Cloudiway connection successful. Found {len(pools)} connector pool(s). "
-                "Select the existing Rackspace/IMAP source and Microsoft 365 target below."
+                f"Cloudiway connection successful. Project '{selected_project['name']}' "
+                f"(ID {selected_project['id']}) selected. Found {len(pools)} connector pool(s)."
             )
         except Exception as pool_exc:
-            request.session["settings_notice"] = "Cloudiway connection successful."
+            request.session["settings_notice"] = "Cloudiway authentication successful."
             request.session["settings_error"] = (
-                "Connected, but connector pools could not be loaded automatically: "
-                + str(pool_exc)[:350]
+                "Authenticated, but project/connector discovery failed: "
+                + str(pool_exc)[:500]
             )
     except Exception as exc:
         request.session["settings_error"] = str(exc)[:500]
