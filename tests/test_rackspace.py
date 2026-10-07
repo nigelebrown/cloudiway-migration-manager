@@ -98,7 +98,7 @@ async def test_username_password_capability_test_can_verify_mailbox_admin():
         )
     )
     route = respx.get(
-        "https://api.emailsrvr.com/v1/customers/12345/domains"
+        f"{settings.rackspace_base_url}/customers/12345/domains"
     ).mock(return_value=httpx.Response(200, json={"domains": []}))
 
     client = RackspaceClient(
