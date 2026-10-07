@@ -10,6 +10,10 @@ def test_progress_completed():
     assert status == "completed"
     assert percent == 100
 
-def test_progress_failed_count():
-    status, _, _ = parse_progress({"status": "Running", "failedItems": 2})
+def test_progress_failed_only_on_mailbox_status():
+    status, _, _ = parse_progress({"status": "Failed", "failedItems": 2})
     assert status == "failed"
+
+def test_failed_item_does_not_fail_active_mailbox():
+    status, _, _ = parse_progress({"status": "Running", "failedItems": 2, "migratedItems": 48000})
+    assert status == "migrating"
