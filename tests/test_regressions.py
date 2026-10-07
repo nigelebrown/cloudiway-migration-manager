@@ -258,3 +258,42 @@ def test_batch_timeout_marks_user_for_review(monkeypatch):
         assert "timeout" in row["error_message"].lower()
     finally:
         settings.batch_timeout_minutes = old_timeout
+
+
+def test_cloudiway_pool_normalization():
+    from app.main import _normalize_cloudiway_pools
+    payload = {
+        "responseData": [
+            {"id": 11, "name": "Rackspace IMAP", "platform": "IMAP"},
+            {"poolId": 22, "poolName": "JCF Microsoft 365", "technology": "Microsoft365"},
+        ]
+    }
+    choices = _normalize_cloudiway_pools(payload)
+    assert [x["id"] for x in choices] == ["22", "11"] or [x["id"] for x in choices] == ["11", "22"]
+    by_id = {x["id"]: x for x in choices}
+    assert "Rackspace IMAP" in by_id["11"]["label"]
+    assert "Microsoft 365" in by_id["22"]["label"]
+
+
+def test_cloudiway_pool_dropdown_page(monkeypatch):
+    from app import main as main_module
+
+    async def fake_ready():
+        class FakeCloud:
+            async def connector_pools(self):
+                return [
+                    {"id": 11, "name": "Rackspace IMAP"},
+                    {"id": 22, "name": "JCF Microsoft 365"},
+                ]
+        return FakeCloud()
+
+    monkeypatch.setattr(main_module, "_cloudiway_client_ready", fake_ready)
+    set_setting("cloudiway_token", encrypt_secret("token"), True)
+    with TestClient(app) as client:
+        client.post("/login", data={"admin_password": "test-admin-password"})
+        r = client.get("/settings")
+        assert r.status_code == 200
+        assert 'value="11"' in r.text
+        assert 'Rackspace IMAP' in r.text
+        assert 'value="22"' in r.text
+        assert 'JCF Microsoft 365' in r.text
