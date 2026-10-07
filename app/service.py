@@ -282,8 +282,8 @@ async def refresh_status() -> dict:
                 """SELECT id FROM users
                    WHERE migration_status IN ('migrating','ready')
                      AND batch_started_at IS NOT NULL
-                     AND datetime(batch_started_at) <= datetime('now', ?)""",
-                (f"-{int(settings.batch_timeout_minutes)} minutes",),
+                     AND TIMESTAMPDIFF(MINUTE, batch_started_at, UTC_TIMESTAMP()) >= ?""",
+                (int(settings.batch_timeout_minutes),),
             ).fetchall()
             if stale:
                 ids = [row["id"] for row in stale]
