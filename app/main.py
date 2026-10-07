@@ -316,10 +316,10 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
             db.execute(
                 """INSERT INTO users(source_email,target_email,first_name,last_name)
                    VALUES(?,?,?,?)
-                   ON CONFLICT(source_email) DO UPDATE SET
-                     target_email=excluded.target_email,
-                     first_name=excluded.first_name,
-                     last_name=excluded.last_name""",
+                   ON DUPLICATE KEY UPDATE
+                     target_email=VALUES(target_email),
+                     first_name=VALUES(first_name),
+                     last_name=VALUES(last_name)""",
                 (src, tgt, first, last),
             )
             imported += 1
