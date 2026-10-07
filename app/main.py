@@ -228,8 +228,12 @@ async def settings_page(request: Request):
         context={
             "request": request,
             "cloudiway_connected": bool(get_setting("cloudiway_token")),
-            "rackspace_configured": bool(get_setting("rackspace_secret_key")),
+            "rackspace_auth_mode": get_setting("rackspace_auth_mode") or "api_key",
+            "rackspace_configured": bool(
+                get_setting("rackspace_secret_key") or get_setting("rackspace_password")
+            ),
             "rackspace_user_key": get_setting("rackspace_user_key") or "",
+            "rackspace_username": get_setting("rackspace_username") or "",
             "rackspace_customer_id": get_setting("rackspace_customer_id") or "",
             "project_header": get_setting("cloudiway_project_header") or settings.cloudiway_project_header,
             "source_pool": get_setting("cloudiway_source_pool_id") or "",
@@ -244,15 +248,42 @@ async def settings_page(request: Request):
 @app.post("/settings/rackspace")
 async def save_rackspace(
     request: Request,
-    user_key: str = Form(...),
-    secret_key: str = Form(...),
-    customer_id: str = Form(...),
+    auth_mode: str = Form("api_key"),
+    user_key: str = Form(""),
+    secret_key: str = Form(""),
+    username: str = Form(""),
+    password: str = Form(""),
+    customer_id: str = Form(""),
 ):
     require_admin(request)
-    set_setting("rackspace_user_key", user_key.strip())
-    set_setting("rackspace_secret_key", encrypt_secret(secret_key.strip()), True)
+    mode = auth_mode.strip() or "api_key"
+    if mode not in ("api_key", "username_password"):
+        request.session["settings_error"] = "Invalid Rackspace authentication mode."
+        return RedirectResponse("/settings", 303)
+
+    set_setting("rackspace_auth_mode", mode)
     set_setting("rackspace_customer_id", customer_id.strip())
-    request.session["settings_notice"] = "Rackspace API settings saved."
+
+    if mode == "username_password":
+        if not username.strip() or not password:
+            request.session["settings_error"] = "Rackspace username and password are required."
+            return RedirectResponse("/settings", 303)
+        set_setting("rackspace_username", username.strip())
+        set_setting("rackspace_password", encrypt_secret(password), True)
+        request.session["settings_notice"] = (
+            "Rackspace username/password saved. Use Test Rackspace Access to verify "
+            "Identity authentication and whether mailbox password administration is permitted."
+        )
+    else:
+        if not user_key.strip() or not secret_key or not customer_id.strip():
+            request.session["settings_error"] = (
+                "Rackspace Email API User Key, Secret Key and Customer Account Number are required."
+            )
+            return RedirectResponse("/settings", 303)
+        set_setting("rackspace_user_key", user_key.strip())
+        set_setting("rackspace_secret_key", encrypt_secret(secret_key), True)
+        request.session["settings_notice"] = "Rackspace Email API settings saved."
+
     return RedirectResponse("/settings", 303)
 
 
@@ -260,8 +291,8 @@ async def save_rackspace(
 async def test_rackspace(request: Request):
     require_admin(request)
     try:
-        await _rackspace_client().test_connection()
-        return JSONResponse({"ok": True, "message": "Rackspace API connection successful"})
+        result = await _rackspace_client().test_connection()
+        return JSONResponse(result)
     except Exception as exc:
         return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
 
