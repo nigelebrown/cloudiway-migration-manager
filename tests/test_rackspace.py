@@ -4,6 +4,7 @@ import respx
 import pytest
 
 from app.clients.rackspace import RackspaceClient
+from app.config import settings
 
 
 def test_signature_shape():
@@ -67,7 +68,7 @@ async def test_username_password_capability_test_reports_email_api_rejection():
         )
     )
     respx.get(
-        "https://api.emailsrvr.com/v1/customers/12345/domains"
+        f"{settings.rackspace_base_url}/customers/12345/domains"
     ).mock(return_value=httpx.Response(403, text="Forbidden"))
 
     client = RackspaceClient(
