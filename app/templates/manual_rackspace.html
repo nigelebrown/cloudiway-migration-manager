@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Manual Rackspace Password Reset</title>
+<style>
+:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}
+body{margin:0;background:#07111f;color:#e5e7eb}
+.wrap{max-width:1500px;margin:0 auto;padding:24px}
+a{color:#38bdf8;text-decoration:none}
+h1{margin-bottom:6px}.muted{color:#94a3b8}
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}
+.step{background:#101a2b;border:1px solid #22324a;border-radius:12px;padding:14px}
+.step b{display:block;margin-bottom:6px}
+.notice{padding:12px 14px;border-radius:9px;margin:12px 0}.ok{background:#064e3b;color:#d1fae5}.err{background:#451a1a;color:#fecaca}
+.card{background:#101a2b;border:1px solid #22324a;border-radius:12px;padding:18px;margin-top:16px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button{padding:9px 13px;border:0;border-radius:8px;background:#0284c7;color:#fff;font-weight:800;cursor:pointer}
+.secondary{background:#334155}.success{background:#047857}.danger{background:#b91c1c}
+input[type=file]{padding:8px;background:#0b1220;border:1px solid #334155;border-radius:8px}
+.tablewrap{overflow:auto;border:1px solid #22324a;border-radius:12px;margin-top:12px}
+table{width:100%;border-collapse:collapse;background:#101a2b;min-width:1150px}
+th,td{padding:9px;border-bottom:1px solid #1f2937;text-align:left;font-size:13px}
+th{background:#0f172a;position:sticky;top:0}
+.bad{color:#fca5a5}.good{color:#86efac}.wait{color:#fde68a}
+@media(max-width:900px){.flow{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Manual Rackspace Password Reset</h1>
+<p><a href="/dashboard">← Dashboard</a></p>
+<p class="muted">This workflow is completely independent of the Rackspace API. Cloudiway migration cannot start for these users until the generated Rackspace file is uploaded back to this application and the passwords are verified against the generated values.</p>
+
+{% if notice %}<div class="notice ok">{{notice}}</div>{% endif %}
+{% if error %}<div class="notice err">{{error}}</div>{% endif %}
+
+<div class="flow">
+<div class="step"><b>1. Upload users</b>Use the normal upload page. The app keeps source → destination mapping.</div>
+<div class="step"><b>2. Generate Rackspace file</b>Select users below. New passwords are generated and stored encrypted.</div>
+<div class="step"><b>3. Update Rackspace</b>Upload the downloaded CSV to Rackspace Add/Edit Multiple Mailboxes.</div>
+<div class="step"><b>4. Upload file back</b>Upload the same generated CSV here. Matching users become eligible for migration.</div>
+</div>
+
+<div class="card">
+<h2>A. Generate Rackspace bulk password file</h2>
+<p class="muted">The downloaded CSV uses the exact Rackspace mailbox-import columns. <b>Username</b> is the source mailbox and <b>Password</b> is the generated password. Your destination address remains stored in this app and is not written into the Rackspace template.</p>
+<form method="post" action="/manual-rackspace/generate">
+<div class="toolbar">
+<button type="button" class="secondary" onclick="setChecks('generate_users',true)">Select all eligible</button>
+<button type="button" class="secondary" onclick="setChecks('generate_users',false)">Clear</button>
+<button type="submit">Generate Passwords & Download Rackspace CSV</button>
+</div>
+<div class="tablewrap"><table>
+<thead><tr><th></th><th>Source</th><th>Destination</th><th>Name</th><th>Rackspace state</th><th>Migration state</th><th>Password file generated</th></tr></thead>
+<tbody>
+{% for u in users %}
+{% if u.migration_status not in ['migrating','completed'] %}
+<tr>
+<td><input type="checkbox" name="user_ids" value="{{u.id}}" data-group="generate_users"></td>
+<td>{{u.source_email}}</td><td>{{u.target_email}}</td>
+<td>{{(u.first_name or '')}} {{(u.last_name or '')}}</td>
+<td>{{u.rackspace_status}}</td><td>{{u.migration_status}}</td>
+<td>{{u.manual_password_generated_at or ''}}</td>
+</tr>
+{% endif %}
+{% endfor %}
+</tbody></table></div>
+</form>
+</div>
+
+<div class="card">
+<h2>B. Confirm the Rackspace bulk update</h2>
+<p>After Rackspace finishes processing the file, upload the <b>same generated CSV</b> back here. The app checks every Username + Password against what it generated. A successful match is treated as your confirmation that the password was applied in Rackspace.</p>
+<form method="post" action="/manual-rackspace/confirm-upload" enctype="multipart/form-data">
+<div class="toolbar">
+<input type="file" name="file" accept=".csv,.xlsx,.xls" required>
+<label><input type="checkbox" name="auto_start" value="yes"> Start Cloudiway migration automatically for every successfully confirmed user</label>
+<button type="submit" class="success">Upload Back & Confirm</button>
+</div>
+</form>
+</div>
+
+<div class="card">
+<h2>C. Start confirmed users manually</h2>
+<p class="muted">Use this when you do not select automatic start above. You can start one person or any selected group. Only users showing <b>manual_confirmed</b> are accepted.</p>
+<form method="post" action="/manual-rackspace/start">
+<div class="toolbar">
+<button type="button" class="secondary" onclick="setChecks('start_users',true)">Select all confirmed</button>
+<button type="button" class="secondary" onclick="setChecks('start_users',false)">Clear</button>
+<button type="submit" class="success">Start Selected Migrations</button>
+</div>
+<div class="tablewrap"><table>
+<thead><tr><th></th><th>Source</th><th>Destination</th><th>Rackspace state</th><th>Cloudiway</th><th>Migration</th><th>Confirmed</th><th>Error</th></tr></thead>
+<tbody>
+{% for u in users %}
+{% if u.password_reset_method == 'manual_bulk' %}
+<tr>
+<td>{% if u.rackspace_status == 'manual_confirmed' and u.migration_status not in ['migrating','completed'] %}<input type="checkbox" name="user_ids" value="{{u.id}}" data-group="start_users">{% endif %}</td>
+<td>{{u.source_email}}</td><td>{{u.target_email}}</td>
+<td class="{{'good' if u.rackspace_status=='manual_confirmed' else 'wait'}}">{{u.rackspace_status}}</td>
+<td>{{u.cloudiway_status}}</td><td>{{u.migration_status}}</td>
+<td>{{u.manual_password_confirmed_at or ''}}</td>
+<td class="bad">{{u.error_message or ''}}</td>
+</tr>
+{% endif %}
+{% endfor %}
+</tbody></table></div>
+</form>
+</div>
+
+</div>
+<script>
+function setChecks(group,state){document.querySelectorAll('input[data-group="'+group+'"]').forEach(x=>x.checked=state)}
+</script>
+</body></html>
