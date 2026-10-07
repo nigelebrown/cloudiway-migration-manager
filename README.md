@@ -4,7 +4,7 @@ Linux-hosted console for Rackspace Email to Microsoft 365 migrations through Clo
 
 ## Workflow
 
-1. Configure Rackspace Email API User Key, Secret Key and Customer Account Number.
+1. Configure Rackspace password administration using either Rackspace administrator username/password (capability-tested) or the documented Rackspace Email API User Key/Secret Key method.
 2. Sign in to Cloudiway and save the existing source and target connector pool IDs.
 3. Upload XLSX/CSV users.
 4. Run a 5-user pilot.
@@ -148,3 +148,22 @@ The updater:
 - keeps the latest 10 compressed database backups in `/opt/cloudiway-migration-manager/backups`.
 
 Your existing `.env`, MySQL Docker volume, passwords, and migration data are preserved.
+
+
+## Rackspace password administration authentication
+
+The app supports two Rackspace authentication modes:
+
+1. **Rackspace Username + Password**
+   - The app authenticates the supplied administrator credentials against Rackspace Identity and obtains an `X-Auth-Token`.
+   - If a Customer Account Number/RAN is supplied, the app then tests whether that token is also accepted by the Rackspace Cloud Office Email administration API.
+   - If the Email API rejects the token with 401/403, the application clearly reports that username/password authentication succeeded but automated mailbox password reset requires Email API credentials for that account.
+   - The app will not silently proceed with a reset if mailbox administration permission is not available.
+
+2. **Rackspace Email API User Key + Secret Key**
+   - This is Rackspace's documented Cloud Office Email API authentication method.
+   - It requires User Key, Secret Key, and Customer Account Number/RAN.
+
+The Rackspace username/password and API secrets are stored encrypted in MySQL using `APP_ENCRYPTION_KEY`.
+
+Rackspace Identity documentation supports password-based authentication for obtaining an `X-Auth-Token`. Rackspace separately documents API-key setup for the Cloud Office Email API, so the username/password mode is intentionally implemented as a capability test before it is allowed to administer mailboxes.
