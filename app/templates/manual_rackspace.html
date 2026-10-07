@@ -43,7 +43,7 @@ th{background:#0f172a;position:sticky;top:0}
 
 <div class="card">
 <h2>A. Generate Rackspace bulk password file</h2>
-<p class="muted">The download is a ZIP containing two files: (1) the exact Rackspace mailbox-import CSV and (2) an administrative Excel password map with <b>email, password, source_email, target_email, first_name, last_name, computer_number</b>.</p>
+<p class="muted">The download is a ZIP containing two files: (1) the exact Rackspace mailbox-import CSV and (2) an administrative Excel password map with <b>email, password, source_email, target_email, first_name, last_name, computer_number</b>. For the Rackspace CSV, <b>Username is the mailbox name only</b> (for example <code>nigel.brown</code>), because Rackspace already knows the selected domain.</p>
 <form method="post" action="/manual-rackspace/generate">
 <div class="toolbar">
 <button type="button" class="secondary" onclick="setChecks('generate_users',true)">Select all eligible</button>
