@@ -36,11 +36,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 
-Set strong values in .env for APP_ADMIN_PASSWORD, APP_ENCRYPTION_KEY and SESSION_SECRET, then run:
+Set strong values in .env for APP_ADMIN_PASSWORD, APP_ENCRYPTION_KEY and SESSION_SECRET.
 
-uvicorn app.main:app --host 0.0.0.0 --port 8080
+For a temporary same-machine or isolated LAN trial over plain HTTP only, set:
 
-Use HTTPS before entering real credentials.
+SESSION_HTTPS_ONLY=false
+
+Do not use that setting for production or when entering real migration credentials.
+
+Run:
+
+uvicorn app.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*'
+
+For normal use, put HTTPS in front of the app (for example nginx or Caddy) and leave SESSION_HTTPS_ONLY=true. Ensure the reverse proxy forwards X-Forwarded-Proto so the app sees HTTPS correctly.
 
 ## Cloudiway operations used
 
@@ -60,3 +68,12 @@ GET /ap1/Mail/MailProgress/{objectId}
 Run: pytest -q
 
 The automated tests cover password generation/encryption, Rackspace signature construction, Cloudiway headers/token parsing, progress parsing, administrator login, CSV import and dashboard state. Automated tests do not call production Rackspace or Cloudiway. Use the in-app connection tests and 5-user pilot before mass migration.
+
+
+## Migration safety controls
+
+- Unknown or review-required Cloudiway text statuses pause automation instead of leaving a batch running forever.
+- Numeric/undocumented status codes remain active until progress reaches 100%.
+- BATCH_TIMEOUT_MINUTES defaults to 1440 (24 hours). A migration that remains active beyond that time is marked timed_out and pauses automation for review.
+- Stopped, cancelled, aborted, terminated, and completed-with-warnings states require administrator review.
+- A correct administrator password is always allowed even after repeated failed attempts from the same source; the rate limit only throttles additional wrong attempts.
