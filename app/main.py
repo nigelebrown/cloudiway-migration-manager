@@ -446,7 +446,7 @@ async def retry_user(request: Request, user_id: int):
     require_admin(request)
     with conn() as db:
         db.execute(
-            "UPDATE users SET migration_status='waiting',error_message=NULL,progress_percent=NULL,batch_number=NULL WHERE id=?",
+            "UPDATE users SET migration_status='waiting',error_message=NULL,progress_percent=NULL,batch_number=NULL,batch_started_at=NULL WHERE id=?",
             (user_id,),
         )
     return {"ok": True}
