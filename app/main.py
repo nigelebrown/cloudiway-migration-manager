@@ -987,6 +987,81 @@ async def reveal_password(request: Request, user_id: int):
     return {"source_email": row["source_email"], "password": decrypt_secret(row["generated_password_enc"])}
 
 
+@app.get("/users/{user_id}/cloudiway-logs")
+async def user_cloudiway_logs(request: Request, user_id: int):
+    require_admin(request)
+
+    with conn() as db:
+        row = db.execute(
+            """SELECT id,source_email,target_email,cloudiway_object_id,
+                      migration_status,cloudiway_status,error_message
+               FROM users WHERE id=?""",
+            (user_id,),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not row["cloudiway_object_id"]:
+        raise HTTPException(status_code=400, detail="This user does not yet have a Cloudiway object ID")
+
+    client = await _cloudiway_client_ready()
+    object_id = int(row["cloudiway_object_id"])
+
+    result = {
+        "user_id": user_id,
+        "source_email": row["source_email"],
+        "target_email": row["target_email"],
+        "object_id": object_id,
+        "migration_status": row["migration_status"],
+        "cloudiway_status": row["cloudiway_status"],
+    }
+
+    try:
+        result["logs"] = await client.logs(object_id)
+    except Exception as exc:
+        result["logs_error"] = str(exc)
+
+    try:
+        result["audit"] = await client.audit(object_id)
+    except Exception as exc:
+        result["audit_error"] = str(exc)
+
+    try:
+        result["progress"] = await client.progress(
+            object_id,
+            max(1, settings.progress_window_minutes),
+        )
+    except Exception as exc:
+        result["progress_error"] = str(exc)
+
+    from app.service import classify_cloudiway_issue
+    status_override, issue_code, friendly = classify_cloudiway_issue(
+        result.get("progress"),
+        result.get("logs"),
+    )
+    if status_override:
+        result["diagnosis"] = {
+            "status": status_override,
+            "code": issue_code,
+            "message": friendly,
+        }
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET migration_status=?,cloudiway_status=?,error_message=?,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (status_override, issue_code or status_override, friendly, user_id),
+            )
+        log_event(
+            user_id,
+            issue_code or "cloudiway_diagnosed",
+            friendly + " Raw logs: " + json.dumps(result.get("logs"), default=str)[:2200],
+        )
+
+    return result
+
+
 @app.post("/users/{user_id}/rotate-password")
 async def rotate_password(request: Request, user_id: int):
     require_admin(request)
