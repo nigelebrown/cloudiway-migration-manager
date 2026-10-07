@@ -647,7 +647,18 @@ async def manual_rackspace_generate(
     writer.writerow(RACKSPACE_MAILBOX_HEADERS)
     for user, password in generated:
         writer.writerow(rackspace_row(user, password))
-    rackspace_payload = rackspace_output.getvalue().encode("utf-8-sig")
+    # Rackspace's legacy parser is strict; emit plain UTF-8 without BOM.
+    rackspace_payload = rackspace_output.getvalue().encode("utf-8")
+
+    # Also provide an Excel version of the exact Rackspace template.
+    rackspace_df = pd.DataFrame(
+        [rackspace_row(user, password) for user, password in generated],
+        columns=RACKSPACE_MAILBOX_HEADERS,
+    )
+    rackspace_xlsx = io.BytesIO()
+    with pd.ExcelWriter(rackspace_xlsx, engine="openpyxl") as rack_writer:
+        rackspace_df.to_excel(rack_writer, index=False, sheet_name="Mailboxes")
+    rackspace_xlsx.seek(0)
 
     # Administrative mapping workbook requested by ICTD.
     admin_rows = []
@@ -685,6 +696,7 @@ async def manual_rackspace_generate(
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"rackspace-password-update-{stamp}.csv", rackspace_payload)
+        zf.writestr(f"rackspace-password-update-{stamp}.xlsx", rackspace_xlsx.getvalue())
         zf.writestr(f"migration-password-map-{stamp}.xlsx", workbook.getvalue())
     archive.seek(0)
 
