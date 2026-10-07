@@ -44,46 +44,115 @@ def _cloudiway_client() -> CloudiwayClient:
     return CloudiwayClient(token=token, project_header=project_header)
 
 
+def _save_cloudiway_session(data: dict) -> None:
+    if data.get("token"):
+        set_setting("cloudiway_token", encrypt_secret(data["token"]), True)
+    if data.get("refreshToken"):
+        set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
+    if data.get("expiration"):
+        set_setting("cloudiway_token_expiration", data["expiration"])
+
+
+async def _cloudiway_reauthenticate() -> CloudiwayClient:
+    if get_setting("cloudiway_keep_connected") != "1":
+        raise RuntimeError("Background Cloudiway reauthentication is not enabled")
+
+    username = get_setting("cloudiway_username") or ""
+    password = decrypt_secret(get_setting("cloudiway_password"))
+    if not username or not password:
+        raise RuntimeError(
+            "Cloudiway background reauthentication is enabled but stored credentials are incomplete"
+        )
+
+    login_project = (
+        get_setting("cloudiway_project_name")
+        or settings.cloudiway_project_header
+        or "JCF"
+    )
+    login_client = CloudiwayClient(project_header=login_project)
+    data = await login_client.login(username, password)
+    if not data.get("token"):
+        raise RuntimeError("Cloudiway reauthentication succeeded but returned no access token")
+
+    _save_cloudiway_session(data)
+    project_id = (
+        get_setting("cloudiway_project_id")
+        or get_setting("cloudiway_project_header")
+        or login_project
+    )
+    log_event(
+        None,
+        "cloudiway_reauthenticated",
+        "Cloudiway session was renewed automatically using encrypted stored credentials.",
+    )
+    return CloudiwayClient(token=data["token"], project_header=project_id)
+
+
 async def _cloudiway_client_ready() -> CloudiwayClient:
     client = _cloudiway_client()
     expiration = get_setting("cloudiway_token_expiration")
     refresh = decrypt_secret(get_setting("cloudiway_refresh_token"))
-    if expiration and refresh:
+
+    should_refresh = False
+    if expiration:
         try:
             exp = datetime.fromisoformat(expiration.replace("Z", "+00:00"))
             if exp.tzinfo is None:
                 exp = exp.replace(tzinfo=timezone.utc)
-            if (exp - datetime.now(timezone.utc)).total_seconds() < 120:
-                data = await client.refresh_token(client.token, refresh)
-                if data.get("token"):
-                    set_setting("cloudiway_token", encrypt_secret(data["token"]), True)
-                    client.token = data["token"]
-                if data.get("refreshToken"):
-                    set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
-                if data.get("expiration"):
-                    set_setting("cloudiway_token_expiration", data["expiration"])
+            # Refresh early enough that a long API operation does not start
+            # with a token that is about to expire.
+            should_refresh = (exp - datetime.now(timezone.utc)).total_seconds() < 300
+        except Exception:
+            should_refresh = True
+
+    if should_refresh and refresh:
+        try:
+            data = await client.refresh_token(client.token, refresh)
+            _save_cloudiway_session(data)
+            if data.get("token"):
+                client.token = data["token"]
+            log_event(None, "cloudiway_token_refreshed", "Cloudiway access token refreshed automatically.")
+        except Exception as refresh_exc:
+            # Some Cloudiway sessions have returned an unusable refresh token.
+            # If the admin opted into background connectivity, transparently
+            # perform a fresh login using the encrypted stored credentials.
+            try:
+                client = await _cloudiway_reauthenticate()
+            except Exception as relogin_exc:
+                set_setting("cloudiway_token", "", True)
+                set_setting("cloudiway_refresh_token", "", True)
+                set_setting("cloudiway_token_expiration", "")
+                set_runtime("automation_paused", "1")
+                set_runtime(
+                    "pause_reason",
+                    "Cloudiway authentication expired and automatic reauthentication failed. Reconnect Cloudiway in Connections.",
+                )
+                log_event(
+                    None,
+                    "cloudiway_reauthentication_required",
+                    "Refresh failed: "
+                    + str(refresh_exc)[:700]
+                    + " | automatic login failed: "
+                    + str(relogin_exc)[:700],
+                )
+                raise RuntimeError(
+                    "Cloudiway authentication expired and automatic reauthentication failed. "
+                    "Go to Connections and sign in again."
+                ) from relogin_exc
+
+    elif should_refresh and not refresh:
+        try:
+            client = await _cloudiway_reauthenticate()
         except Exception as exc:
-            # An invalid/expired refresh token cannot recover by retrying every
-            # poll cycle. Clear the unusable session once and require a fresh
-            # Cloudiway login instead of flooding the event log.
-            set_setting("cloudiway_token", "", True)
-            set_setting("cloudiway_refresh_token", "", True)
-            set_setting("cloudiway_token_expiration", "")
             set_runtime("automation_paused", "1")
             set_runtime(
                 "pause_reason",
-                "Cloudiway session expired or refresh token is invalid. Reconnect Cloudiway in Connections.",
-            )
-            log_event(
-                None,
-                "cloudiway_reauthentication_required",
-                "Cloudiway token refresh failed; stored session cleared. Reconnect Cloudiway in Connections. "
-                + str(exc)[:1000],
+                "Cloudiway access token is expiring and no usable refresh/relogin method is available.",
             )
             raise RuntimeError(
-                "Cloudiway session expired or refresh token is invalid. "
-                "Go to Connections and sign in to Cloudiway again."
+                "Cloudiway access token is expiring. Enable Keep Cloudiway Connected and sign in again."
             ) from exc
+
     return client
 
 
@@ -102,6 +171,42 @@ def _extract_object_id(data) -> int | None:
     return None
 
 
+async def _validate_cloudiway_user_mapping(
+    client: CloudiwayClient,
+    object_id: int,
+    expected_source: str,
+    expected_target: str,
+) -> dict:
+    """Pull Cloudiway's stored mailbox mapping and reject a wrong target before migration."""
+    remote = await client.get_mail_user(object_id)
+    record = remote.get("responseData") if isinstance(remote, dict) else None
+    if not isinstance(record, dict):
+        record = remote if isinstance(remote, dict) else {}
+
+    remote_source = str(record.get("sourceEmail") or "").strip()
+    remote_target = str(record.get("targetEmail") or "").strip()
+    exchange_guid = str(record.get("exchangeGuid") or "").strip()
+    identity = str(record.get("identity") or "").strip()
+
+    if remote_source and remote_source.lower() != expected_source.lower():
+        raise RuntimeError(
+            f"Cloudiway source mapping mismatch: app={expected_source}, Cloudiway={remote_source}"
+        )
+    if remote_target and remote_target.lower() != expected_target.lower():
+        raise RuntimeError(
+            f"Cloudiway target mapping mismatch: app={expected_target}, Cloudiway={remote_target}. "
+            "Correct the Cloudiway mail user mapping before starting migration."
+        )
+
+    return {
+        "sourceEmail": remote_source or expected_source,
+        "targetEmail": remote_target or expected_target,
+        "exchangeGuid": exchange_guid,
+        "identity": identity,
+        "targetRecipientType": record.get("targetRecipientType"),
+    }
+
+
 async def ensure_cloudiway_user(user: dict) -> int:
     client = await _cloudiway_client_ready()
     source_pool = get_setting("cloudiway_source_pool_id")
@@ -110,7 +215,17 @@ async def ensure_cloudiway_user(user: dict) -> int:
         raise RuntimeError("Select the Cloudiway source and target connector pools first")
 
     if user.get("cloudiway_object_id"):
-        return int(user["cloudiway_object_id"])
+        object_id = int(user["cloudiway_object_id"])
+        mapping = await _validate_cloudiway_user_mapping(
+            client, object_id, user["source_email"], user["target_email"]
+        )
+        log_event(
+            user["id"],
+            "cloudiway_mapping_verified",
+            "Cloudiway mapping verified before migration: "
+            + json.dumps(mapping, default=str)[:1200],
+        )
+        return object_id
 
     try:
         found = await client.verify_mail_user(user["source_email"])
@@ -121,7 +236,15 @@ async def ensure_cloudiway_user(user: dict) -> int:
                     "UPDATE users SET cloudiway_object_id=?,cloudiway_status='existing',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (object_id, user["id"]),
                 )
-            log_event(user["id"], "cloudiway_user_found", "Existing Cloudiway mail user found")
+            mapping = await _validate_cloudiway_user_mapping(
+                client, object_id, user["source_email"], user["target_email"]
+            )
+            log_event(
+                user["id"],
+                "cloudiway_user_found",
+                "Existing Cloudiway mail user found and mapping verified: "
+                + json.dumps(mapping, default=str)[:1200],
+            )
             return object_id
     except Exception as exc:
         # Do not hide authorization/project failures. A 403 here usually means
@@ -158,11 +281,20 @@ async def ensure_cloudiway_user(user: dict) -> int:
         object_id = _extract_object_id(verify)
     if not object_id:
         raise RuntimeError(f"Cloudiway user was created/submitted but no object ID was returned: {created}")
+    mapping = await _validate_cloudiway_user_mapping(
+        client, object_id, user["source_email"], user["target_email"]
+    )
     with conn() as db:
         db.execute(
             "UPDATE users SET cloudiway_object_id=?,cloudiway_status='created',updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (object_id, user["id"]),
         )
+    log_event(
+        user["id"],
+        "cloudiway_mapping_verified",
+        "Cloudiway mapping verified after user creation: "
+        + json.dumps(mapping, default=str)[:1200],
+    )
     return object_id
 
 
