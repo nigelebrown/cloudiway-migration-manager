@@ -461,6 +461,7 @@ def test_manual_confirmed_user_is_eligible_for_manual_start(monkeypatch):
         return 1234
 
     monkeypatch.setattr(svc, "_cloudiway_client_ready", fake_ready)
+    monkeypatch.setattr(svc, "_cloudiway_client", lambda: FakeCloud())
     monkeypatch.setattr(svc, "ensure_cloudiway_user", fake_ensure)
     monkeypatch.setattr(svc, "_cloudiway_preflight", lambda: None)
     set_setting("cloudiway_token", encrypt_secret("test-token"), True)
@@ -500,7 +501,7 @@ def test_invalid_cloudiway_refresh_token_clears_session_and_pauses(monkeypatch):
         (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
     )
 
-    with pytest.raises(RuntimeError, match="sign in to Cloudiway again"):
+    with pytest.raises(RuntimeError, match="sign in again"):
         asyncio.run(svc._cloudiway_client_ready())
 
     assert get_setting("cloudiway_token") == ""
