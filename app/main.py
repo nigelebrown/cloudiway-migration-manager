@@ -15,9 +15,10 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import settings
 from app.db import init_db, conn, set_setting, get_setting, set_runtime, get_runtime, log_event
-from app.security import encrypt_secret, decrypt_secret
+from app.security import encrypt_secret, decrypt_secret, generate_password
 from app.clients.cloudiway import CloudiwayClient
 from app.diagnostics import log_info, log_error, tail_log, redact
+from app.rackspace_template import RACKSPACE_MAILBOX_HEADERS, rackspace_row
 from app.service import (
     launch_next_batch,
     refresh_status,
@@ -25,6 +26,7 @@ from app.service import (
     _rackspace_client,
     _cloudiway_client,
     _cloudiway_client_ready,
+    start_manual_migrations,
 )
 
 app = FastAPI(title="JCF Mail Migration Console")
@@ -501,6 +503,13 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
         "lastname": "last_name",
         "first name": "first_name",
         "last name": "last_name",
+        "username": "source_email",
+        "sourceemail": "source_email",
+        "source email address": "source_email",
+        "targetemail": "target_email",
+        "destinationemail": "target_email",
+        "destination email": "target_email",
+        "destination email address": "target_email",
     }
     df.rename(columns={c: aliases.get(c, c) for c in df.columns}, inplace=True)
     if "source_email" not in df.columns:
@@ -549,6 +558,224 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
     return RedirectResponse("/dashboard", 303)
 
 
+@app.get("/manual-rackspace", response_class=HTMLResponse)
+async def manual_rackspace_page(request: Request):
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
+
+    with conn() as db:
+        rows = db.execute(
+            """SELECT id,source_email,target_email,first_name,last_name,
+                      password_reset_method,rackspace_status,migration_status,
+                      manual_password_generated_at,manual_password_confirmed_at,
+                      error_message,updated_at
+               FROM users
+               ORDER BY id DESC LIMIT 2000"""
+        ).fetchall()
+
+    return templates.TemplateResponse(
+        request=request,
+        name="manual_rackspace.html",
+        context={
+            "request": request,
+            "users": [dict(r) for r in rows],
+            "notice": request.session.pop("manual_notice", None),
+            "error": request.session.pop("manual_error", None),
+        },
+    )
+
+
+@app.post("/manual-rackspace/generate")
+async def manual_rackspace_generate(
+    request: Request,
+    user_ids: list[int] = Form(...),
+):
+    require_admin(request)
+    if not user_ids:
+        request.session["manual_error"] = "Select at least one user."
+        return RedirectResponse("/manual-rackspace", 303)
+
+    generated = []
+    with conn() as db:
+        placeholders = ",".join("?" for _ in user_ids)
+        rows = db.execute(
+            f"""SELECT * FROM users
+                WHERE id IN ({placeholders})
+                  AND migration_status NOT IN ('migrating','completed')
+                ORDER BY id""",
+            tuple(user_ids),
+        ).fetchall()
+
+        for row in rows:
+            user = dict(row)
+            password = generate_password()
+            db.execute(
+                """UPDATE users
+                   SET generated_password_enc=?,
+                       password_reset_method='manual_bulk',
+                       rackspace_status='manual_file_generated',
+                       manual_password_generated_at=CURRENT_TIMESTAMP,
+                       manual_password_confirmed_at=NULL,
+                       migration_status='waiting',
+                       cloudiway_status='not_submitted',
+                       error_message=NULL,
+                       progress_percent=NULL,
+                       batch_number=NULL,
+                       batch_started_at=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (encrypt_secret(password), user["id"]),
+            )
+            generated.append((user, password))
+
+    if not generated:
+        request.session["manual_error"] = "No eligible users were selected."
+        return RedirectResponse("/manual-rackspace", 303)
+
+    output = io.StringIO()
+    import csv as _csv
+    writer = _csv.writer(output, lineterminator="\n")
+    writer.writerow(RACKSPACE_MAILBOX_HEADERS)
+    for user, password in generated:
+        writer.writerow(rackspace_row(user, password))
+
+    payload = output.getvalue().encode("utf-8-sig")
+    filename = "rackspace-password-update-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + ".csv"
+
+    for user, _ in generated:
+        log_event(
+            user["id"],
+            "manual_password_file_generated",
+            "Password generated for Rackspace bulk update file",
+        )
+    log_info("manual_rackspace_file_generated", user_count=len(generated), filename=filename)
+
+    return StreamingResponse(
+        io.BytesIO(payload),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/manual-rackspace/confirm-upload")
+async def manual_rackspace_confirm_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    auto_start: str = Form(""),
+):
+    require_admin(request)
+    raw = await file.read()
+    try:
+        if file.filename.lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw), dtype=str).fillna("")
+        else:
+            df = pd.read_excel(io.BytesIO(raw), dtype=str).fillna("")
+    except Exception as exc:
+        request.session["manual_error"] = f"Could not read confirmation file: {exc}"
+        return RedirectResponse("/manual-rackspace", 303)
+
+    columns = {str(col).strip().lower(): col for col in df.columns}
+    username_col = columns.get("username") or columns.get("source_email") or columns.get("sourceemail")
+    password_col = columns.get("password")
+    if not username_col or not password_col:
+        request.session["manual_error"] = (
+            "Confirmation file must contain Username and Password columns."
+        )
+        return RedirectResponse("/manual-rackspace", 303)
+
+    confirmed_ids = []
+    mismatches = []
+    missing = []
+
+    with conn() as db:
+        for _, row in df.iterrows():
+            email = str(row.get(username_col, "")).strip().lower()
+            supplied_password = str(row.get(password_col, "")).strip()
+            if not email or not supplied_password:
+                continue
+
+            user = db.execute(
+                """SELECT id,source_email,generated_password_enc,password_reset_method
+                   FROM users WHERE source_email=?""",
+                (email,),
+            ).fetchone()
+
+            if not user:
+                missing.append(email)
+                continue
+            if user["password_reset_method"] != "manual_bulk" or not user["generated_password_enc"]:
+                mismatches.append(email)
+                continue
+
+            expected = decrypt_secret(user["generated_password_enc"])
+            if not secrets.compare_digest(expected, supplied_password):
+                mismatches.append(email)
+                continue
+
+            db.execute(
+                """UPDATE users
+                   SET rackspace_status='manual_confirmed',
+                       manual_password_confirmed_at=CURRENT_TIMESTAMP,
+                       migration_status='waiting',
+                       error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (user["id"],),
+            )
+            confirmed_ids.append(int(user["id"]))
+
+    if not confirmed_ids:
+        request.session["manual_error"] = (
+            f"No users were confirmed. Password mismatches/not generated: {len(mismatches)}; "
+            f"users not found: {len(missing)}."
+        )
+        return RedirectResponse("/manual-rackspace", 303)
+
+    for uid in confirmed_ids:
+        log_event(
+            uid,
+            "manual_password_confirmed",
+            "Rackspace bulk file was uploaded back and password application was confirmed",
+        )
+
+    summary = (
+        f"Confirmed {len(confirmed_ids)} user(s) as updated in Rackspace. "
+        f"Mismatches: {len(mismatches)}; not found: {len(missing)}."
+    )
+
+    if auto_start:
+        try:
+            result = await start_manual_migrations(confirmed_ids)
+            summary += (
+                f" Migration start requested: {result.get('users_started', 0)} user(s) started; "
+                f"{len(result.get('failed', []))} failed."
+            )
+        except Exception as exc:
+            request.session["manual_error"] = summary + f" Cloudiway start failed: {exc}"
+            return RedirectResponse("/manual-rackspace", 303)
+
+    request.session["manual_notice"] = summary
+    return RedirectResponse("/manual-rackspace", 303)
+
+
+@app.post("/manual-rackspace/start")
+async def manual_rackspace_start(
+    request: Request,
+    user_ids: list[int] = Form(...),
+):
+    require_admin(request)
+    try:
+        result = await start_manual_migrations(user_ids)
+        request.session["manual_notice"] = (
+            f"Migration requested for {result.get('users_started', 0)} user(s). "
+            f"Failures: {len(result.get('failed', []))}."
+        )
+    except Exception as exc:
+        request.session["manual_error"] = str(exc)
+    return RedirectResponse("/manual-rackspace", 303)
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, q: str = ""):
     redirect = _page_auth(request)
@@ -581,7 +808,8 @@ async def dashboard_data(request: Request, q: str = ""):
             values = tuple([f"%{q}%"] * 4)
             rows = db.execute(
                 """SELECT id,source_email,target_email,first_name,last_name,rackspace_status,
-                          cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at
+                          cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at,
+                          password_reset_method,manual_password_generated_at,manual_password_confirmed_at
                    FROM users WHERE source_email LIKE ? OR target_email LIKE ? OR first_name LIKE ? OR last_name LIKE ?
                    ORDER BY id DESC LIMIT 1000""",
                 values,
