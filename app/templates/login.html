@@ -1,0 +1,4 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Migration Console</title>
+<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;height:100vh;margin:0}.card{width:360px;background:#111827;padding:28px;border-radius:14px;box-shadow:0 16px 50px #0008}input,button{width:100%;box-sizing:border-box;padding:12px;margin-top:10px;border-radius:8px;border:1px solid #334155}button{background:#0ea5e9;color:white;font-weight:700}.err{color:#fca5a5}</style>
+</head><body><div class="card"><h2>JCF Migration Console</h2><p>Administrator access</p>{% if error %}<p class="err">{{error}}</p>{% endif %}
+<form method="post" action="/login"><input type="password" name="admin_password" placeholder="Administrator password" required><button>Sign in</button></form></div></body></html>
