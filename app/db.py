@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS users (
     progress_detail TEXT,
     error_message TEXT,
     batch_number INTEGER,
+    batch_started_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -58,6 +59,10 @@ def conn():
 def init_db():
     with conn() as db:
         db.executescript(SCHEMA)
+        # Lightweight forward-only schema migrations for existing deployments.
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+        if "batch_started_at" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN batch_started_at TEXT")
 
 
 def set_setting(key: str, value: str, is_secret: bool = False):
