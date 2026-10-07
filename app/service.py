@@ -1,6 +1,8 @@
 import json
+from datetime import datetime, timezone
+
 from app.config import settings
-from app.db import conn, get_setting, get_runtime, set_runtime, log_event
+from app.db import conn, get_setting, get_runtime, set_runtime, log_event, set_setting
 from app.security import decrypt_secret, encrypt_secret, generate_password
 from app.clients.rackspace import RackspaceClient
 from app.clients.cloudiway import CloudiwayClient
@@ -23,6 +25,29 @@ def _cloudiway_client() -> CloudiwayClient:
     return CloudiwayClient(token=token, project_header=project_header)
 
 
+async def _cloudiway_client_ready() -> CloudiwayClient:
+    client = _cloudiway_client()
+    expiration = get_setting("cloudiway_token_expiration")
+    refresh = decrypt_secret(get_setting("cloudiway_refresh_token"))
+    if expiration and refresh:
+        try:
+            exp = datetime.fromisoformat(expiration.replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if (exp - datetime.now(timezone.utc)).total_seconds() < 120:
+                data = await client.refresh_token(client.token, refresh)
+                if data.get("token"):
+                    set_setting("cloudiway_token", encrypt_secret(data["token"]), True)
+                    client.token = data["token"]
+                if data.get("refreshToken"):
+                    set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
+                if data.get("expiration"):
+                    set_setting("cloudiway_token_expiration", data["expiration"])
+        except Exception as exc:
+            log_event(None, "cloudiway_token_refresh_failed", str(exc))
+    return client
+
+
 def _extract_object_id(data) -> int | None:
     candidates = []
     if isinstance(data, dict):
@@ -39,7 +64,7 @@ def _extract_object_id(data) -> int | None:
 
 
 async def ensure_cloudiway_user(user: dict) -> int:
-    client = _cloudiway_client()
+    client = await _cloudiway_client_ready()
     source_pool = get_setting("cloudiway_source_pool_id")
     target_pool = get_setting("cloudiway_target_pool_id")
     if not source_pool or not target_pool:
@@ -97,13 +122,20 @@ async def prepare_user(user_id: int) -> int:
         raise RuntimeError(f"User {user_id} not found")
     user = dict(row)
 
-    password = generate_password()
-    rack = _rackspace_client()
-    cloud = _cloudiway_client()
-
     try:
+        rack = _rackspace_client()
+        cloud = await _cloudiway_client_ready()
+
         await rack.get_mailbox(user["source_email"])
+
+        # Validate/create Cloudiway record and obtain a credential token before
+        # changing the live Rackspace password.
+        object_id = await ensure_cloudiway_user(user)
+        token = await cloud.get_self_service_token(object_id)
+
+        password = generate_password()
         await rack.reset_password(user["source_email"], password)
+
         encrypted = encrypt_secret(password)
         with conn() as db:
             db.execute(
@@ -112,8 +144,6 @@ async def prepare_user(user_id: int) -> int:
             )
         log_event(user_id, "rackspace_password_reset", "Rackspace mailbox password changed")
 
-        object_id = await ensure_cloudiway_user(user)
-        token = await cloud.get_self_service_token(object_id)
         await cloud.register_source_credentials(token, user["source_email"], password)
         with conn() as db:
             db.execute(
@@ -135,6 +165,7 @@ async def prepare_user(user_id: int) -> int:
 async def run_batch(user_ids: list[int], batch_number: int):
     object_ids: list[int] = []
     failed: list[int] = []
+
     for uid in user_ids:
         try:
             oid = await prepare_user(uid)
@@ -143,13 +174,14 @@ async def run_batch(user_ids: list[int], batch_number: int):
             failed.append(uid)
 
     if object_ids:
-        cloud = _cloudiway_client()
         try:
+            cloud = await _cloudiway_client_ready()
             await cloud.start_migration(object_ids)
             with conn() as db:
                 placeholders = ",".join("?" for _ in user_ids)
                 db.execute(
-                    f"UPDATE users SET migration_status='migrating',batch_number=?,updated_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders}) AND cloudiway_object_id IS NOT NULL AND migration_status!='failed'",
+                    f"UPDATE users SET migration_status='migrating',batch_number=?,updated_at=CURRENT_TIMESTAMP "
+                    f"WHERE id IN ({placeholders}) AND cloudiway_object_id IS NOT NULL AND migration_status!='failed'",
                     (batch_number, *user_ids),
                 )
             log_event(None, "batch_started", f"Batch {batch_number} started with {len(object_ids)} users")
@@ -157,7 +189,8 @@ async def run_batch(user_ids: list[int], batch_number: int):
             with conn() as db:
                 placeholders = ",".join("?" for _ in user_ids)
                 db.execute(
-                    f"UPDATE users SET migration_status='failed',error_message=?,updated_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders}) AND migration_status!='failed'",
+                    f"UPDATE users SET migration_status='failed',error_message=?,updated_at=CURRENT_TIMESTAMP "
+                    f"WHERE id IN ({placeholders}) AND migration_status!='failed'",
                     (str(exc)[:3000], *user_ids),
                 )
             log_event(None, "batch_start_failed", str(exc))
@@ -169,10 +202,24 @@ async def run_batch(user_ids: list[int], batch_number: int):
         set_runtime("pause_reason", f"Batch {batch_number} has {len(set(failed))} failed user(s)")
 
 
+def _preflight():
+    _rackspace_client()
+    _cloudiway_client()
+    if not get_setting("cloudiway_source_pool_id") or not get_setting("cloudiway_target_pool_id"):
+        raise RuntimeError("Cloudiway source and target connector pools are not configured")
+
+
 async def launch_next_batch(force: bool = False) -> dict:
     paused = get_runtime("automation_paused", "0") == "1"
     if paused and not force:
         return {"started": False, "reason": get_runtime("pause_reason", "Automation is paused")}
+
+    try:
+        _preflight()
+    except Exception as exc:
+        set_runtime("automation_paused", "1")
+        set_runtime("pause_reason", str(exc))
+        return {"started": False, "reason": str(exc)}
 
     with conn() as db:
         active = db.execute(
@@ -188,6 +235,7 @@ async def launch_next_batch(force: bool = False) -> dict:
         ).fetchall()
         if not rows:
             return {"started": False, "reason": "No waiting users"}
+
         ids = [r["id"] for r in rows]
         batch_no = int(max_batch) + 1
         placeholders = ",".join("?" for _ in ids)
@@ -201,18 +249,20 @@ async def launch_next_batch(force: bool = False) -> dict:
 
 
 async def refresh_status() -> dict:
-    cloud = _cloudiway_client()
+    cloud = await _cloudiway_client_ready()
     with conn() as db:
         rows = db.execute(
-            "SELECT id,cloudiway_object_id,migration_status FROM users WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready')"
+            "SELECT id,cloudiway_object_id,migration_status FROM users "
+            "WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready')"
         ).fetchall()
 
-    updated = 0
-    completed = 0
-    failed = 0
+    updated = completed = failed = 0
     for row in rows:
         try:
-            data = await cloud.progress(int(row["cloudiway_object_id"]), settings.status_poll_seconds)
+            data = await cloud.progress(
+                int(row["cloudiway_object_id"]),
+                max(1, settings.progress_window_minutes),
+            )
             status, percent, detail = parse_progress(data)
             with conn() as db:
                 db.execute(
@@ -236,38 +286,38 @@ async def refresh_status() -> dict:
 
 def parse_progress(data) -> tuple[str, float | None, str]:
     detail = json.dumps(data, default=str)[:1500]
-    status_values: list[str] = []
-    failure_count = 0
+    statuses: list[str] = []
     percent = None
 
     def walk(obj):
-        nonlocal failure_count, percent
+        nonlocal percent
         if isinstance(obj, dict):
             for key, value in obj.items():
                 lk = str(key).lower()
-                if any(x in lk for x in ("status", "state", "result")) and isinstance(value, (str, int)):
-                    status_values.append(str(value).lower())
-                if any(x in lk for x in ("failed", "fatal", "errorcount", "errorscount")) and isinstance(value, (int, float)):
-                    failure_count += int(value)
+                if lk in ("status", "state", "jobstatus", "migrationstatus") and isinstance(value, (str, int)):
+                    statuses.append(str(value).strip().lower())
                 if percent is None and lk in ("percent", "percentage", "progresspercent", "progresspercentage") and isinstance(value, (int, float)):
                     percent = float(value)
-                    if percent <= 1:
-                        percent *= 100
                 walk(value)
         elif isinstance(obj, list):
             for item in obj:
                 walk(item)
 
     walk(data)
-    joined = " ".join(status_values)
-    if failure_count > 0 or any(word in joined for word in ("failed", "fatal", "error", "faulted")):
+    normalized = {s.replace("_", " ").strip() for s in statuses}
+
+    failed_words = {"failed", "fatal", "faulted", "error", "errored"}
+    completed_words = {"completed", "complete", "success", "succeeded", "finished", "done"}
+
+    if normalized & failed_words:
         status = "failed"
-    elif any(word in joined for word in ("completed", "complete", "success", "succeeded", "finished")):
+    elif normalized & completed_words:
         status = "completed"
     elif percent is not None and percent >= 100:
         status = "completed"
     else:
         status = "migrating"
+
     return status, percent, detail
 
 
@@ -277,7 +327,9 @@ def all_terminal_for_latest_batch() -> bool:
         if not latest:
             return False
         row = db.execute(
-            "SELECT COUNT(*) total, SUM(CASE WHEN migration_status IN ('completed','failed') THEN 1 ELSE 0 END) terminal FROM users WHERE batch_number=?",
+            "SELECT COUNT(*) total, "
+            "SUM(CASE WHEN migration_status IN ('completed','failed') THEN 1 ELSE 0 END) terminal "
+            "FROM users WHERE batch_number=?",
             (latest,),
         ).fetchone()
         return bool(row["total"] and row["terminal"] == row["total"])
@@ -288,23 +340,32 @@ async def rotate_user_password(user_id: int) -> str:
         row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     if not row:
         raise RuntimeError("User not found")
+
     user = dict(row)
-    password = generate_password()
     rack = _rackspace_client()
+    cloud = await _cloudiway_client_ready()
+
+    if user.get("cloudiway_object_id"):
+        token = await cloud.get_self_service_token(int(user["cloudiway_object_id"]))
+    else:
+        object_id = await ensure_cloudiway_user(user)
+        token = await cloud.get_self_service_token(object_id)
+
+    password = generate_password()
     await rack.reset_password(user["source_email"], password)
+
     with conn() as db:
         db.execute(
             "UPDATE users SET generated_password_enc=?,rackspace_status='reset_ok',updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (encrypt_secret(password), user_id),
         )
-    if user.get("cloudiway_object_id"):
-        cloud = _cloudiway_client()
-        token = await cloud.get_self_service_token(int(user["cloudiway_object_id"]))
-        await cloud.register_source_credentials(token, user["source_email"], password)
-        with conn() as db:
-            db.execute(
-                "UPDATE users SET cloudiway_status='credentials_set',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (user_id,),
-            )
+
+    await cloud.register_source_credentials(token, user["source_email"], password)
+    with conn() as db:
+        db.execute(
+            "UPDATE users SET cloudiway_status='credentials_set',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (user_id,),
+        )
+
     log_event(user_id, "password_rotated", "Administrator generated and applied a new Rackspace password")
     return password
