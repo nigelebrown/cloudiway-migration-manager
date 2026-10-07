@@ -21,6 +21,7 @@ from app.service import (
     rotate_user_password,
     _rackspace_client,
     _cloudiway_client,
+    _cloudiway_client_ready,
 )
 
 app = FastAPI(title="JCF Mail Migration Console")
@@ -70,6 +71,60 @@ def _clean_cell(value) -> str:
     if value is None or pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _normalize_cloudiway_pools(payload) -> list[dict]:
+    """Flatten Cloudiway connector-pool responses into dropdown choices."""
+    choices: dict[str, dict] = {}
+
+    def walk(value, context_name=""):
+        if isinstance(value, list):
+            for item in value:
+                walk(item, context_name)
+            return
+        if not isinstance(value, dict):
+            return
+
+        name = ""
+        for key in (
+            "poolName", "connectorPoolName", "displayName", "name",
+            "connectorName", "description", "label"
+        ):
+            v = value.get(key)
+            if isinstance(v, str) and v.strip():
+                name = v.strip()
+                break
+        if not name:
+            name = context_name
+
+        pool_id = None
+        for key in ("poolId", "connectorPoolId", "id"):
+            v = value.get(key)
+            if isinstance(v, (int, str)) and str(v).strip().isdigit():
+                pool_id = str(v).strip()
+                break
+
+        type_text = " ".join(
+            str(value.get(k) or "")
+            for k in ("type", "connectorType", "technology", "platform", "kind", "provider")
+        ).strip()
+
+        if pool_id:
+            label_parts = [p for p in (name, type_text) if p]
+            label = " - ".join(dict.fromkeys(label_parts)) or f"Pool {pool_id}"
+            choices[pool_id] = {
+                "id": pool_id,
+                "label": label,
+                "raw_name": name,
+                "type": type_text,
+            }
+
+        for key, child in value.items():
+            if isinstance(child, (dict, list)):
+                walk(child, name or context_name)
+
+    walk(payload)
+    return sorted(choices.values(), key=lambda x: x["label"].lower())
 
 
 async def status_poller():
@@ -158,6 +213,15 @@ async def settings_page(request: Request):
     redirect = _page_auth(request)
     if redirect:
         return redirect
+    pools = request.session.pop("cloudiway_pools", None)
+    if pools is None and get_setting("cloudiway_token"):
+        try:
+            client = await _cloudiway_client_ready()
+            pools = _normalize_cloudiway_pools(await client.connector_pools())
+        except Exception:
+            pools = []
+    pools = pools or []
+
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
@@ -170,6 +234,7 @@ async def settings_page(request: Request):
             "project_header": get_setting("cloudiway_project_header") or settings.cloudiway_project_header,
             "source_pool": get_setting("cloudiway_source_pool_id") or "",
             "target_pool": get_setting("cloudiway_target_pool_id") or "",
+            "cloudiway_pools": pools,
             "error": request.session.pop("settings_error", None),
             "notice": request.session.pop("settings_notice", None),
         },
@@ -221,7 +286,21 @@ async def cloudiway_login(
             set_setting("cloudiway_refresh_token", encrypt_secret(data["refreshToken"]), True)
         if data.get("expiration"):
             set_setting("cloudiway_token_expiration", data["expiration"])
-        request.session["settings_notice"] = "Cloudiway connection successful."
+
+        try:
+            pools_payload = await client.connector_pools()
+            pools = _normalize_cloudiway_pools(pools_payload)
+            request.session["cloudiway_pools"] = pools
+            request.session["settings_notice"] = (
+                f"Cloudiway connection successful. Found {len(pools)} connector pool(s). "
+                "Select the existing Rackspace/IMAP source and Microsoft 365 target below."
+            )
+        except Exception as pool_exc:
+            request.session["settings_notice"] = "Cloudiway connection successful."
+            request.session["settings_error"] = (
+                "Connected, but connector pools could not be loaded automatically: "
+                + str(pool_exc)[:350]
+            )
     except Exception as exc:
         request.session["settings_error"] = str(exc)[:500]
     return RedirectResponse("/settings", 303)
@@ -253,10 +332,25 @@ async def api_projects(request: Request):
 async def api_connectors(request: Request):
     require_admin(request)
     try:
-        client = _cloudiway_client()
-        return {"connectors": await client.connectors(), "pools": await client.connector_pools()}
+        client = await _cloudiway_client_ready()
+        raw_pools = await client.connector_pools()
+        return {
+            "connectors": await client.connectors(),
+            "pools": raw_pools,
+            "choices": _normalize_cloudiway_pools(raw_pools),
+        }
     except Exception as exc:
         return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+
+
+@app.get("/api/cloudiway/pools")
+async def api_cloudiway_pools(request: Request):
+    require_admin(request)
+    try:
+        client = await _cloudiway_client_ready()
+        return {"choices": _normalize_cloudiway_pools(await client.connector_pools())}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": str(exc), "choices": []}, status_code=400)
 
 
 @app.get("/upload", response_class=HTMLResponse)
