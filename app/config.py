@@ -19,8 +19,12 @@ class Settings(BaseSettings):
     pilot_size: int = 5
     batch_size: int = 10
     status_poll_seconds: int = 15
+    progress_window_minutes: int = 1
     auto_continue: bool = True
     pause_on_any_failure: bool = True
+    session_https_only: bool = True
+    login_max_attempts: int = 5
+    login_window_seconds: int = 300
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
