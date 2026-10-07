@@ -1,6 +1,7 @@
 from typing import Any
 import httpx
 from app.config import settings
+from app.diagnostics import log_info, log_error
 
 
 class CloudiwayClient:
@@ -142,8 +143,13 @@ class CloudiwayClient:
 
     @staticmethod
     def _raise(response: httpx.Response, prefix: str):
+        log_info("cloudiway_api_response", method=response.request.method, url=str(response.request.url), status=response.status_code)
         if response.status_code >= 400:
-            raise RuntimeError(f"{prefix} ({response.status_code}): {response.text[:1000]}")
+            log_error("cloudiway_api_failed", method=response.request.method, url=str(response.request.url), status=response.status_code, body=response.text[:700])
+            raise RuntimeError(
+                f"{prefix} ({response.status_code}) [{response.request.method} {response.request.url}]: "
+                f"{response.text[:1000]}"
+            )
 
     @staticmethod
     def _extract_token(data: Any) -> str:
