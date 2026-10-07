@@ -305,3 +305,20 @@ def test_cloudiway_project_resolution_uses_numeric_id():
     projects = _normalize_cloudiway_projects(payload)
     chosen = _resolve_cloudiway_project(projects, "JCF")
     assert chosen == {"id": "14780", "name": "JCF"}
+
+
+def test_diagnostic_redaction_hides_secrets():
+    from app.diagnostics import redact
+    text = "Authorization: Bearer abc123 password=Secret123 token=tok123 secret_key=mysecret"
+    safe = redact(text)
+    assert "abc123" not in safe
+    assert "Secret123" not in safe
+    assert "tok123" not in safe
+    assert "mysecret" not in safe
+    assert "[REDACTED]" in safe
+
+
+def test_diagnostics_download_requires_admin():
+    with TestClient(app) as client:
+        r = client.get("/diagnostics/download")
+        assert r.status_code == 401
