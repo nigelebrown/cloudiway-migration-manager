@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-LOG_DIR = Path(os.getenv("DIAGNOSTIC_LOG_DIR", "/app/data/logs"))
+LOG_DIR = Path(os.getenv("DIAGNOSTIC_LOG_DIR", "data/logs"))
 LOG_FILE = LOG_DIR / "application.log"
 
 _SECRET_PATTERNS = [
