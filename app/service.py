@@ -171,6 +171,133 @@ def _extract_object_id(data) -> int | None:
     return None
 
 
+def _extract_cloudiway_batch_id(data, expected_name: str | None = None) -> int | None:
+    """Extract a Cloudiway Mail Batch ID from create/list responses."""
+    if isinstance(data, (int, float)) and int(data) > 0:
+        return int(data)
+    if isinstance(data, str) and data.strip().isdigit():
+        return int(data.strip())
+
+    wanted = (expected_name or "").strip().lower()
+
+    def walk(value):
+        if isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+            return None
+        if not isinstance(value, dict):
+            return None
+
+        name = str(value.get("name") or "").strip()
+        bid = value.get("id")
+        if bid not in (None, ""):
+            if not wanted or (name and name.lower() == wanted):
+                try:
+                    return int(bid)
+                except Exception:
+                    pass
+
+        for key in ("responseData", "data", "items", "batches", "results"):
+            if key in value:
+                found = walk(value[key])
+                if found:
+                    return found
+
+        if not wanted:
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    found = walk(child)
+                    if found:
+                        return found
+        return None
+
+    return walk(data)
+
+
+async def ensure_upload_cloudiway_batch(upload_batch_id: int) -> int:
+    """Ensure every application upload has a corresponding Cloudiway Mail Batch."""
+    with conn() as db:
+        batch = db.execute(
+            "SELECT * FROM upload_batches WHERE id=?",
+            (upload_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise RuntimeError(f"Upload batch {upload_batch_id} was not found")
+    if batch.get("cloudiway_batch_id"):
+        return int(batch["cloudiway_batch_id"])
+
+    client = await _cloudiway_client_ready()
+    name = batch["batch_name"]
+
+    try:
+        created = await client.create_mail_batch(name)
+        batch_id = _extract_cloudiway_batch_id(created, name)
+        if not batch_id:
+            existing = await client.mail_batches()
+            batch_id = _extract_cloudiway_batch_id(existing, name)
+        if not batch_id:
+            raise RuntimeError(
+                f"Cloudiway batch '{name}' was submitted but no batch ID could be resolved"
+            )
+
+        with conn() as db:
+            db.execute(
+                """UPDATE upload_batches
+                   SET cloudiway_batch_id=?,cloudiway_batch_name=?,
+                       workflow_status=CASE
+                           WHEN workflow_status='cloudiway_batch_error' THEN 'passwords_generated'
+                           WHEN workflow_status='uploaded' THEN 'cloudiway_batch_created'
+                           ELSE workflow_status
+                       END,
+                       last_error=NULL,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (batch_id, name, upload_batch_id),
+            )
+        log_event(
+            None,
+            "cloudiway_upload_batch_created",
+            f"Upload batch {upload_batch_id} mapped to Cloudiway batch {batch_id} ({name})",
+        )
+        return batch_id
+    except Exception as exc:
+        with conn() as db:
+            db.execute(
+                """UPDATE upload_batches
+                   SET workflow_status='cloudiway_batch_error',last_error=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (str(exc)[:3000], upload_batch_id),
+            )
+        log_event(
+            None,
+            "cloudiway_upload_batch_failed",
+            f"Upload batch {upload_batch_id}: {exc}",
+        )
+        raise
+
+
+async def assign_upload_batch_members(upload_batch_id: int, object_ids: list[int]) -> int:
+    if not object_ids:
+        raise RuntimeError("No Cloudiway object IDs were supplied for batch assignment")
+    cloud_batch_id = await ensure_upload_cloudiway_batch(upload_batch_id)
+    client = await _cloudiway_client_ready()
+    await client.add_mail_batch_members(cloud_batch_id, object_ids)
+    with conn() as db:
+        db.execute(
+            """UPDATE upload_batches
+               SET workflow_status='cloudiway_members_assigned',last_error=NULL,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (upload_batch_id,),
+        )
+    log_event(
+        None,
+        "cloudiway_batch_members_assigned",
+        f"Assigned {len(object_ids)} user(s) to Cloudiway batch {cloud_batch_id}",
+    )
+    return cloud_batch_id
+
+
 async def _validate_cloudiway_user_mapping(
     client: CloudiwayClient,
     object_id: int,
@@ -583,6 +710,8 @@ async def refresh_status() -> dict:
         if not manual_result.get("started"):
             await launch_next_batch()
 
+    refresh_upload_batch_states()
+
     return {
         "updated": updated,
         "completed": completed,
@@ -831,6 +960,210 @@ async def start_manual_migrations(user_ids: list[int]) -> dict:
         "users_started": len(started_user_ids),
         "failed": failed,
     }
+
+
+async def prepare_manual_upload_batch(upload_batch_id: int) -> dict:
+    """Prepare every confirmed member of an upload batch and assign it to its Cloudiway batch."""
+    with conn() as db:
+        rows = db.execute(
+            """SELECT u.*
+               FROM upload_batch_members m
+               JOIN users u ON u.id=m.user_id
+               WHERE m.upload_batch_id=?
+               ORDER BY u.id""",
+            (upload_batch_id,),
+        ).fetchall()
+
+    if not rows:
+        return {"ready": False, "reason": "This upload batch has no users"}
+
+    unconfirmed = [
+        int(row["id"])
+        for row in rows
+        if row["password_reset_method"] == "manual_bulk"
+        and row["rackspace_status"] != "manual_confirmed"
+    ]
+    if unconfirmed:
+        return {
+            "ready": False,
+            "reason": f"{len(unconfirmed)} user(s) have not yet been confirmed as updated in Rackspace",
+            "unconfirmed": unconfirmed,
+        }
+
+    object_ids: list[int] = []
+    prepared_ids: list[int] = []
+    failed: list[dict] = []
+    for row in rows:
+        user = dict(row)
+        try:
+            if user["password_reset_method"] == "manual_bulk":
+                oid = await prepare_manual_user(int(user["id"]))
+            else:
+                oid = await prepare_user(int(user["id"]))
+            object_ids.append(int(oid))
+            prepared_ids.append(int(user["id"]))
+        except Exception as exc:
+            failed.append({"user_id": int(user["id"]), "error": str(exc)})
+
+    if failed:
+        with conn() as db:
+            db.execute(
+                """UPDATE upload_batches
+                   SET workflow_status='attention',last_error=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (f"{len(failed)} user(s) failed Cloudiway preparation"[:3000], upload_batch_id),
+            )
+        return {
+            "ready": False,
+            "reason": f"{len(failed)} user(s) failed Cloudiway preparation",
+            "failed": failed,
+        }
+
+    cloud_batch_id = await assign_upload_batch_members(upload_batch_id, object_ids)
+    with conn() as db:
+        db.execute(
+            """UPDATE upload_batches
+               SET workflow_status='ready_to_migrate',last_error=NULL,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (upload_batch_id,),
+        )
+    return {
+        "ready": True,
+        "upload_batch_id": upload_batch_id,
+        "cloudiway_batch_id": cloud_batch_id,
+        "users": len(prepared_ids),
+        "object_ids": object_ids,
+    }
+
+
+async def start_upload_batch(upload_batch_id: int) -> dict:
+    """Prepare, Cloudiway-batch, and start an entire upload as one workflow unit."""
+    prepared = await prepare_manual_upload_batch(upload_batch_id)
+    if not prepared.get("ready"):
+        return {"started": False, **prepared}
+
+    object_ids = prepared["object_ids"]
+    with conn() as db:
+        member_rows = db.execute(
+            "SELECT user_id FROM upload_batch_members WHERE upload_batch_id=?",
+            (upload_batch_id,),
+        ).fetchall()
+    user_ids = [int(r["user_id"]) for r in member_rows]
+
+    cloud = await _cloudiway_client_ready()
+    await cloud.start_migration(object_ids)
+
+    if user_ids:
+        placeholders = ",".join("?" for _ in user_ids)
+        with conn() as db:
+            db.execute(
+                f"""UPDATE users
+                    SET migration_status='migrating',batch_number=?,
+                        batch_started_at=CURRENT_TIMESTAMP,error_message=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})""",
+                (upload_batch_id, *user_ids),
+            )
+            db.execute(
+                """UPDATE upload_batches
+                   SET workflow_status='migrating',last_error=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (upload_batch_id,),
+            )
+
+    set_runtime("automation_running", "1")
+    log_event(
+        None,
+        "upload_batch_started",
+        f"Upload batch {upload_batch_id} started in Cloudiway batch {prepared['cloudiway_batch_id']} with {len(user_ids)} user(s)",
+    )
+    return {
+        "started": True,
+        "upload_batch_id": upload_batch_id,
+        "cloudiway_batch_id": prepared["cloudiway_batch_id"],
+        "users_started": len(user_ids),
+    }
+
+
+async def advance_upload_workflows() -> dict:
+    """Background workflow maintenance: create missing Cloudiway batches and auto-start confirmed batches."""
+    summary = {"cloudiway_batches_created": 0, "auto_started": 0, "errors": 0}
+
+    if not get_setting("cloudiway_token"):
+        return summary
+
+    with conn() as db:
+        pending = db.execute(
+            """SELECT id FROM upload_batches
+               WHERE cloudiway_batch_id IS NULL
+                 AND workflow_status NOT IN ('completed')
+               ORDER BY id LIMIT 20"""
+        ).fetchall()
+
+    for row in pending:
+        try:
+            await ensure_upload_cloudiway_batch(int(row["id"]))
+            summary["cloudiway_batches_created"] += 1
+        except Exception:
+            summary["errors"] += 1
+
+    with conn() as db:
+        auto_rows = db.execute(
+            """SELECT id FROM upload_batches
+               WHERE auto_start=1
+                 AND workflow_status IN ('passwords_confirmed','ready_to_migrate')
+               ORDER BY id LIMIT 5"""
+        ).fetchall()
+
+    for row in auto_rows:
+        try:
+            result = await start_upload_batch(int(row["id"]))
+            if result.get("started"):
+                summary["auto_started"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            with conn() as db:
+                db.execute(
+                    """UPDATE upload_batches SET workflow_status='attention',last_error=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (str(exc)[:3000], int(row["id"])),
+                )
+
+    return summary
+
+
+def refresh_upload_batch_states() -> None:
+    """Roll up user migration states into upload-batch workflow states."""
+    with conn() as db:
+        batches = db.execute(
+            """SELECT b.id,b.workflow_status,
+                      COUNT(m.user_id) total,
+                      SUM(u.migration_status='completed') completed,
+                      SUM(u.migration_status IN ('failed','attention','timed_out')) problems,
+                      SUM(u.migration_status='migrating') migrating
+               FROM upload_batches b
+               LEFT JOIN upload_batch_members m ON m.upload_batch_id=b.id
+               LEFT JOIN users u ON u.id=m.user_id
+               GROUP BY b.id,b.workflow_status"""
+        ).fetchall()
+
+        for row in batches:
+            total = int(row["total"] or 0)
+            completed = int(row["completed"] or 0)
+            problems = int(row["problems"] or 0)
+            migrating = int(row["migrating"] or 0)
+            new_status = None
+            if total and completed == total:
+                new_status = "completed"
+            elif problems:
+                new_status = "attention"
+            elif migrating:
+                new_status = "migrating"
+            if new_status and new_status != row["workflow_status"]:
+                db.execute(
+                    "UPDATE upload_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (new_status, int(row["id"])),
+                )
 
 
 async def rotate_user_password(user_id: int) -> str:
