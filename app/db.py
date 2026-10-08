@@ -45,6 +45,42 @@ SCHEMA = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
     """
+    CREATE TABLE IF NOT EXISTS upload_batches (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        batch_name VARCHAR(255) NOT NULL UNIQUE,
+        original_filename VARCHAR(512) NULL,
+        workflow_mode VARCHAR(32) NOT NULL DEFAULT 'manual_bulk',
+        workflow_status VARCHAR(64) NOT NULL DEFAULT 'uploaded',
+        auto_start TINYINT(1) NOT NULL DEFAULT 0,
+        cloudiway_batch_id BIGINT NULL,
+        cloudiway_batch_name VARCHAR(255) NULL,
+        total_rows INT NOT NULL DEFAULT 0,
+        imported_rows INT NOT NULL DEFAULT 0,
+        skipped_rows INT NOT NULL DEFAULT 0,
+        protected_rows INT NOT NULL DEFAULT 0,
+        last_error LONGTEXT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_upload_batches_status (workflow_status),
+        INDEX idx_upload_batches_cloudiway (cloudiway_batch_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS upload_batch_members (
+        upload_batch_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (upload_batch_id, user_id),
+        INDEX idx_upload_batch_members_user (user_id),
+        CONSTRAINT fk_upload_batch_members_batch
+            FOREIGN KEY (upload_batch_id) REFERENCES upload_batches(id)
+            ON DELETE CASCADE,
+        CONSTRAINT fk_upload_batch_members_user
+            FOREIGN KEY (user_id) REFERENCES users(id)
+            ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
     CREATE TABLE IF NOT EXISTS events (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         user_id BIGINT NULL,
@@ -164,7 +200,7 @@ def reset_test_data():
     """Clear application data while preserving the MySQL schema."""
     with conn() as db:
         db.execute("SET FOREIGN_KEY_CHECKS=0")
-        for table in ("events", "users", "settings", "runtime"):
+        for table in ("events", "upload_batch_members", "upload_batches", "users", "settings", "runtime"):
             db.execute(f"TRUNCATE TABLE {table}")
         db.execute("SET FOREIGN_KEY_CHECKS=1")
 
