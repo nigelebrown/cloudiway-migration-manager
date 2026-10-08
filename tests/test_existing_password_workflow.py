@@ -141,8 +141,11 @@ def test_existing_password_upload_needs_no_ad_profile_and_encrypts_passwords():
     assert one["rackspace_status"] == "existing_password"
     assert one["provisioning_status"] == "bypassed"
     assert one["ad_match_status"] == "bypassed"
-    assert one["generated_password_enc"] != "0012A#$"
-    assert decrypt_secret(one["generated_password_enc"]) == "0012A#$"
+    assert one["generated_password_enc"] is None
+    assert one["source_credential_username"] == "one@rack.example"
+    assert one["source_credential_origin"] == "uploaded_excel"
+    assert one["source_credential_password_enc"] != "0012A#$"
+    assert decrypt_secret(one["source_credential_password_enc"]) == "0012A#$"
 
 
 def test_existing_password_group_skips_ad_and_pushes_excel_passwords_to_cloudiway(monkeypatch):
@@ -303,3 +306,50 @@ async def test_existing_password_cloudiway_batch_retry_restores_ready_state(monk
         ).fetchone()
     assert row["workflow_status"] == "ready_for_cloudiway"
     assert row["cloudiway_batch_id"] == 99123
+
+
+def test_existing_password_credential_payload_is_exact_source_email_and_exact_excel_password(monkeypatch):
+    cloud = configure_cloudiway(monkeypatch)
+    csv_data = (
+        "source_email,target_email,password\n"
+        "Exact.User@rack.example,exact.user@jcf.gov.jm,AbC#123$xyZ\n"
+    ).encode()
+
+    with TestClient(app) as client:
+        login(client)
+        response = client.post(
+            "/upload",
+            files={"file": ("exact.csv", csv_data, "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+        with conn() as db:
+            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+
+        response = client.post(
+            f"/workflow/{upload_id}/generate",
+            data={"quantity": "1"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert len(cloud.credentials) == 1
+    _, username, password = cloud.credentials[0]
+    assert username == "exact.user@rack.example"
+    assert password == "AbC#123$xyZ"
+
+
+def test_existing_password_dedicated_credential_username_mismatch_is_rejected():
+    from app.service import _source_credentials_for_cloudiway
+
+    user = {
+        "source_email": "correct@rack.example",
+        "source_credential_username": "wrong@rack.example",
+        "source_credential_password_enc": encrypt_secret("CorrectPassword123!"),
+        "generated_password_enc": None,
+        "password_reset_method": "existing_password",
+    }
+    with pytest.raises(RuntimeError, match="does not match source email"):
+        _source_credentials_for_cloudiway(user)
