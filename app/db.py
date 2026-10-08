@@ -111,7 +111,6 @@ SCHEMA = [
         user_id BIGINT NOT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (migration_batch_id, user_id),
-        UNIQUE KEY uq_user_one_migration_batch (user_id),
         INDEX idx_migration_batch_members_user (user_id),
         CONSTRAINT fk_migration_batch_members_batch
             FOREIGN KEY (migration_batch_id) REFERENCES migration_batches(id)
@@ -248,6 +247,20 @@ def init_db():
         if "row_order" not in upload_member_columns:
             db.execute(
                 "ALTER TABLE upload_batch_members ADD COLUMN row_order INT NOT NULL DEFAULT 0 AFTER user_id"
+            )
+
+        migration_member_indexes = {
+            row["INDEX_NAME"]
+            for row in db.execute(
+                """SELECT DISTINCT INDEX_NAME
+                   FROM INFORMATION_SCHEMA.STATISTICS
+                   WHERE TABLE_SCHEMA=? AND TABLE_NAME='migration_batch_members'""",
+                (settings.db_name,),
+            ).fetchall()
+        }
+        if "uq_user_one_migration_batch" in migration_member_indexes:
+            db.execute(
+                "ALTER TABLE migration_batch_members DROP INDEX uq_user_one_migration_batch"
             )
 
 
