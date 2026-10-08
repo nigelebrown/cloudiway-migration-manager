@@ -260,3 +260,46 @@ def test_existing_password_mode_requires_password_column():
 
     assert response.status_code == 400
     assert "password" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_existing_password_cloudiway_batch_retry_restores_ready_state(monkeypatch):
+    from app import service
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
+               ) VALUES(?,?,?,?,?)""",
+            ("JCF-TEST-U00001", "existing_password", "partially_batched", 1, 1),
+        )
+        upload_id = up.lastrowid
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,selected_count
+               ) VALUES(?,?,?,?,?)""",
+            (upload_id, 1, "JCF-TEST-U00001-B001", "cloudiway_batch_error", 1),
+        )
+        migration_batch_id = mb.lastrowid
+
+    class RetryCloud:
+        async def create_mail_batch(self, name):
+            return {"id": 99123, "name": name}
+
+        async def mail_batches(self):
+            return []
+
+    async def ready():
+        return RetryCloud()
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+    cloud_id = await service.ensure_migration_cloudiway_batch(migration_batch_id)
+    assert cloud_id == 99123
+
+    with conn() as db:
+        row = db.execute(
+            "SELECT workflow_status,cloudiway_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    assert row["workflow_status"] == "ready_for_cloudiway"
+    assert row["cloudiway_batch_id"] == 99123
