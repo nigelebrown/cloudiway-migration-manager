@@ -55,6 +55,39 @@ class CloudiwayClient:
     async def mail_users(self):
         return await self._get("/Mail", "Could not retrieve Cloudiway mail users")
 
+    async def mail_batches(self):
+        return await self._get("/Mail/Batch", "Could not retrieve Cloudiway mail batches")
+
+    async def create_mail_batch(self, name: str):
+        from datetime import datetime, timezone
+
+        project_id = 0
+        try:
+            project_id = int(self.project_header or 0)
+        except Exception:
+            project_id = 0
+        payload = {
+            "id": 0,
+            "name": name,
+            "timeStamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "projectId": project_id,
+            "jobStatus": 0,
+            "jobType": 0,
+        }
+        return await self._post("/Mail/Batch", payload, "Could not create Cloudiway mail batch")
+
+    async def add_mail_batch_members(self, batch_id: int, object_ids: list[int]):
+        payload = {
+            "objectIds": [int(x) for x in object_ids],
+            "isAllSelected": False,
+            "batchIds": [int(batch_id)],
+        }
+        return await self._post(
+            f"/Mail/Batch/{int(batch_id)}/members",
+            payload,
+            "Could not assign users to Cloudiway mail batch",
+        )
+
     async def get_mail_user(self, object_id: int):
         return await self._get(f"/Mail/{object_id}", "Could not retrieve Cloudiway mail user")
 
