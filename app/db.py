@@ -44,6 +44,9 @@ SCHEMA = [
         provisioning_error LONGTEXT NULL,
         provisioning_updated_at DATETIME NULL,
         generated_password_enc LONGTEXT NULL,
+        source_credential_username VARCHAR(320) NULL,
+        source_credential_password_enc LONGTEXT NULL,
+        source_credential_origin VARCHAR(32) NULL,
         password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic',
         manual_password_generated_at DATETIME NULL,
         manual_password_confirmed_at DATETIME NULL,
@@ -298,6 +301,9 @@ def init_db():
                 "ALTER TABLE users ADD COLUMN computer_number VARCHAR(64) NULL AFTER last_name"
             )
         user_additions = [
+            ("source_credential_username", "VARCHAR(320) NULL AFTER generated_password_enc"),
+            ("source_credential_password_enc", "LONGTEXT NULL AFTER source_credential_username"),
+            ("source_credential_origin", "VARCHAR(32) NULL AFTER source_credential_password_enc"),
             ("middle_name", "VARCHAR(255) NULL AFTER first_name"),
             ("provisioning_profile_id", "BIGINT NULL AFTER computer_number"),
             ("provisioning_status", "VARCHAR(64) NOT NULL DEFAULT 'not_checked' AFTER provisioning_profile_id"),
