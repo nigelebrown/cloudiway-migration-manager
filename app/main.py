@@ -28,6 +28,10 @@ from app.service import (
     _cloudiway_client_ready,
     start_manual_migrations,
     launch_next_confirmed_manual_batch,
+    ensure_upload_cloudiway_batch,
+    prepare_manual_upload_batch,
+    start_upload_batch,
+    advance_upload_workflows,
 )
 
 app = FastAPI(title="JCF Mail Migration Console")
@@ -99,6 +103,84 @@ def _clean_cell(value) -> str:
     if value is None or pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _build_rackspace_password_package(batch_id: int) -> tuple[io.BytesIO, str]:
+    import csv as _csv
+
+    with conn() as db:
+        batch = db.execute(
+            "SELECT id,batch_name FROM upload_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        rows = db.execute(
+            """SELECT u.*
+               FROM upload_batch_members m
+               JOIN users u ON u.id=m.user_id
+               WHERE m.upload_batch_id=?
+               ORDER BY u.id""",
+            (batch_id,),
+        ).fetchall()
+
+    if not batch:
+        raise RuntimeError("Upload batch not found")
+    if not rows:
+        raise RuntimeError("Upload batch has no users")
+
+    generated = []
+    for row in rows:
+        user = dict(row)
+        if not user.get("generated_password_enc"):
+            raise RuntimeError(
+                f"No generated password exists for {user['source_email']}; regenerate/repair this batch first."
+            )
+        generated.append((user, decrypt_secret(user["generated_password_enc"])))
+
+    rackspace_output = io.StringIO()
+    writer = _csv.writer(rackspace_output, lineterminator="\n")
+    writer.writerow(RACKSPACE_MAILBOX_HEADERS)
+    for user, password in generated:
+        writer.writerow(rackspace_row(user, password))
+    rackspace_payload = rackspace_output.getvalue().encode("utf-8")
+
+    rackspace_df = pd.DataFrame(
+        [rackspace_row(user, password) for user, password in generated],
+        columns=RACKSPACE_MAILBOX_HEADERS,
+    )
+    rackspace_xlsx = io.BytesIO()
+    with pd.ExcelWriter(rackspace_xlsx, engine="openpyxl") as rack_writer:
+        rackspace_df.to_excel(rack_writer, index=False, sheet_name="Mailboxes")
+    rackspace_xlsx.seek(0)
+
+    admin_rows = []
+    for user, password in generated:
+        admin_rows.append(
+            {
+                "email": user["source_email"],
+                "password": password,
+                "source_email": user["source_email"],
+                "target_email": user["target_email"],
+                "first_name": user.get("first_name") or "",
+                "last_name": user.get("last_name") or "",
+                "computer_number": user.get("computer_number") or "",
+                "upload_batch": batch["batch_name"],
+            }
+        )
+    admin_df = pd.DataFrame(admin_rows)
+    workbook = io.BytesIO()
+    with pd.ExcelWriter(workbook, engine="openpyxl") as writer_xlsx:
+        admin_df.to_excel(writer_xlsx, index=False, sheet_name="Password Map")
+    workbook.seek(0)
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", batch["batch_name"]).strip("-") or f"batch-{batch_id}"
+    archive_name = f"{safe_name}-rackspace-password-package.zip"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{safe_name}-rackspace-password-update.csv", rackspace_payload)
+        zf.writestr(f"{safe_name}-rackspace-password-update.xlsx", rackspace_xlsx.getvalue())
+        zf.writestr(f"{safe_name}-migration-password-map.xlsx", workbook.getvalue())
+    archive.seek(0)
+    return archive, archive_name
 
 
 def _normalize_cloudiway_projects(payload) -> list[dict]:
@@ -205,6 +287,9 @@ async def status_poller():
             # administrator login session.
             if token_present and keep_connected:
                 await _cloudiway_client_ready()
+
+            if token_present:
+                await advance_upload_workflows()
 
             if get_runtime("automation_running", "0") == "1" and token_present:
                 await refresh_status()
@@ -520,8 +605,28 @@ async def upload_page(request: Request):
 
 
 @app.post("/upload")
-async def upload_users(request: Request, file: UploadFile = File(...)):
+async def upload_users(
+    request: Request,
+    file: UploadFile = File(...),
+    workflow_mode: str = Form("manual_bulk"),
+    auto_start: str = Form(""),
+):
     require_admin(request)
+
+    if workflow_mode not in ("manual_bulk", "automatic"):
+        workflow_mode = "manual_bulk"
+
+    if not get_setting("cloudiway_token"):
+        return templates.TemplateResponse(
+            request=request,
+            name="upload.html",
+            context={
+                "request": request,
+                "error": "Connect Cloudiway before uploading. Every upload must receive a Cloudiway batch number.",
+            },
+            status_code=400,
+        )
+
     raw = await file.read()
     try:
         if file.filename.lower().endswith(".csv"):
@@ -529,9 +634,14 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
         else:
             df = pd.read_excel(io.BytesIO(raw))
     except Exception as exc:
-        return templates.TemplateResponse(request=request, name="upload.html", context={"request": request, "error": f"Could not read file: {exc}"}, status_code=400)
+        return templates.TemplateResponse(
+            request=request,
+            name="upload.html",
+            context={"request": request, "error": f"Could not read file: {exc}"},
+            status_code=400,
+        )
 
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    df.columns = [str(col).strip().lower() for col in df.columns]
     aliases = {
         "email": "source_email",
         "source email": "source_email",
@@ -552,12 +662,42 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
         "computer_no": "computer_number",
         "computer no": "computer_number",
     }
-    df.rename(columns={c: aliases.get(c, c) for c in df.columns}, inplace=True)
+    df.rename(columns={col: aliases.get(col, col) for col in df.columns}, inplace=True)
     if "source_email" not in df.columns:
-        return templates.TemplateResponse(request=request, name="upload.html", context={"request": request, "error": "The file must include source_email (or Email)."}, status_code=400)
+        return templates.TemplateResponse(
+            request=request,
+            name="upload.html",
+            context={"request": request, "error": "The file must include source_email (or Email)."},
+            status_code=400,
+        )
 
-    imported = skipped = protected = 0
+    total_rows = len(df.index)
+    skipped = protected = imported = 0
+    member_ids: list[int] = []
+
     with conn() as db:
+        pending_name = "PENDING-" + time.strftime("%Y%m%d%H%M%S", time.gmtime()) + "-" + secrets.token_hex(3)
+        cursor = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,original_filename,workflow_mode,workflow_status,
+                   auto_start,total_rows
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                pending_name,
+                file.filename,
+                workflow_mode,
+                "uploaded",
+                1 if auto_start else 0,
+                total_rows,
+            ),
+        )
+        upload_batch_id = int(cursor.lastrowid)
+        batch_name = f"JCF-{time.strftime('%Y%m%d', time.gmtime())}-B{upload_batch_id:05d}"
+        db.execute(
+            "UPDATE upload_batches SET batch_name=?,cloudiway_batch_name=? WHERE id=?",
+            (batch_name, batch_name, upload_batch_id),
+        )
+
         for _, row in df.iterrows():
             src = _clean_cell(row.get("source_email")).lower()
             tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
@@ -566,39 +706,129 @@ async def upload_users(request: Request, file: UploadFile = File(...)):
             if not EMAIL_RE.fullmatch(src) or not EMAIL_RE.fullmatch(tgt):
                 skipped += 1
                 continue
+
             first = _clean_cell(row.get("first_name"))
             last = _clean_cell(row.get("last_name"))
             computer_number = _clean_cell(row.get("computer_number"))
 
             existing = db.execute(
-                "SELECT migration_status FROM users WHERE source_email=?", (src,)
+                "SELECT id,migration_status FROM users WHERE source_email=?",
+                (src,),
             ).fetchone()
             if existing and existing["migration_status"] in ("preparing", "ready", "migrating", "completed"):
                 protected += 1
                 continue
 
             db.execute(
-                """INSERT INTO users(source_email,target_email,first_name,last_name,computer_number)
-                   VALUES(?,?,?,?,?)
+                """INSERT INTO users(
+                       source_email,target_email,first_name,last_name,computer_number,
+                       password_reset_method
+                   )
+                   VALUES(?,?,?,?,?,?)
                    ON DUPLICATE KEY UPDATE
                      target_email=VALUES(target_email),
                      first_name=VALUES(first_name),
                      last_name=VALUES(last_name),
-                     computer_number=VALUES(computer_number)""",
-                (src, tgt, first, last, computer_number),
+                     computer_number=VALUES(computer_number),
+                     password_reset_method=VALUES(password_reset_method)""",
+                (src, tgt, first, last, computer_number, workflow_mode),
             )
+            user_row = db.execute(
+                "SELECT id FROM users WHERE source_email=?",
+                (src,),
+            ).fetchone()
+            user_id = int(user_row["id"])
+            db.execute(
+                """INSERT IGNORE INTO upload_batch_members(upload_batch_id,user_id)
+                   VALUES(?,?)""",
+                (upload_batch_id, user_id),
+            )
+
+            if workflow_mode == "manual_bulk":
+                password = generate_password()
+                db.execute(
+                    """UPDATE users
+                       SET generated_password_enc=?,
+                           password_reset_method='manual_bulk',
+                           rackspace_status='manual_file_generated',
+                           manual_password_generated_at=CURRENT_TIMESTAMP,
+                           manual_password_confirmed_at=NULL,
+                           migration_status='waiting',
+                           cloudiway_status='not_submitted',
+                           error_message=NULL,
+                           progress_percent=NULL,
+                           batch_number=?,
+                           batch_started_at=NULL,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (encrypt_secret(password), upload_batch_id, user_id),
+                )
+            else:
+                db.execute(
+                    """UPDATE users
+                       SET password_reset_method='automatic',
+                           rackspace_status='pending',
+                           migration_status='waiting',
+                           cloudiway_status='not_submitted',
+                           error_message=NULL,
+                           progress_percent=NULL,
+                           batch_number=?,
+                           batch_started_at=NULL,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (upload_batch_id, user_id),
+                )
+
+            member_ids.append(user_id)
             imported += 1
+
+        if not member_ids:
+            db.execute("DELETE FROM upload_batches WHERE id=?", (upload_batch_id,))
+            return templates.TemplateResponse(
+                request=request,
+                name="upload.html",
+                context={
+                    "request": request,
+                    "error": f"No eligible users were imported. Invalid: {skipped}; active/completed protected: {protected}.",
+                },
+                status_code=400,
+            )
+
+        initial_status = "passwords_generated" if workflow_mode == "manual_bulk" else "ready_for_automatic"
+        db.execute(
+            """UPDATE upload_batches
+               SET imported_rows=?,skipped_rows=?,protected_rows=?,workflow_status=?
+               WHERE id=?""",
+            (imported, skipped, protected, initial_status, upload_batch_id),
+        )
+
+    cloud_batch_error = None
+    try:
+        cloud_batch_id = await ensure_upload_cloudiway_batch(upload_batch_id)
+    except Exception as exc:
+        cloud_batch_id = None
+        cloud_batch_error = str(exc)
 
     log_event(
         None,
         "file_upload",
-        f"Imported/updated {imported}; skipped invalid {skipped}; protected active/completed {protected}; file={file.filename}",
+        f"Upload batch {upload_batch_id} ({batch_name}): imported {imported}; invalid {skipped}; protected {protected}; Cloudiway batch={cloud_batch_id}; file={file.filename}",
     )
-    request.session["upload_notice"] = (
-        f"Upload complete: {imported} imported/updated, {skipped} invalid skipped, "
-        f"{protected} active/completed users left unchanged."
+
+    if workflow_mode == "automatic" and auto_start and cloud_batch_id:
+        try:
+            await start_upload_batch(upload_batch_id)
+        except Exception as exc:
+            cloud_batch_error = str(exc)
+
+    request.session["workflow_notice"] = (
+        f"Upload batch {batch_name} created with {imported} user(s). "
+        + (f"Cloudiway batch ID {cloud_batch_id} created." if cloud_batch_id else "Cloudiway batch creation needs attention.")
     )
-    return RedirectResponse("/dashboard", 303)
+    if cloud_batch_error:
+        request.session["workflow_error"] = cloud_batch_error[:1000]
+
+    return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
 
 @app.get("/manual-rackspace", response_class=HTMLResponse)
