@@ -5,47 +5,42 @@
 <title>Migration Workflow</title>
 <style>
 :root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}
-body{margin:0;background:#07111f;color:#e5e7eb}
-.wrap{max-width:1550px;margin:0 auto;padding:24px}
+body{margin:0;background:#07111f;color:#e5e7eb}.wrap{max-width:1600px;margin:0 auto;padding:24px}
 a{color:#38bdf8;text-decoration:none}.top{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.top h1{margin-right:auto}
 .notice{padding:12px 14px;border-radius:9px;margin:12px 0}.ok{background:#064e3b;color:#d1fae5}.err{background:#451a1a;color:#fecaca}.warn{background:#422006;color:#fde68a}
-.layout{display:grid;grid-template-columns:320px 1fr;gap:16px}.card{background:#101a2b;border:1px solid #22324a;border-radius:14px;padding:18px}
-.batchlist{max-height:760px;overflow:auto}.batchitem{display:block;padding:12px;border-bottom:1px solid #22324a;color:#e5e7eb}.batchitem:hover{background:#172236}.active{background:#172236}
+.layout{display:grid;grid-template-columns:300px 1fr;gap:16px}.card{background:#101a2b;border:1px solid #22324a;border-radius:14px;padding:18px}
+.batchlist{max-height:820px;overflow:auto}.batchitem{display:block;padding:12px;border-bottom:1px solid #22324a;color:#e5e7eb}.batchitem:hover,.active{background:#172236}
 .muted{color:#94a3b8}.small{font-size:12px}.strong{font-weight:850}
-.flow{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin:16px 0}
-.step{border:1px solid #334155;border-radius:11px;padding:12px;min-height:85px;background:#0b1220}.step.done{border-color:#166534}.step.current{border-color:#0284c7}.step.blocked{border-color:#b45309}
-.stepnum{font-size:11px;color:#94a3b8}.stepname{font-weight:850;margin-top:4px}.stepstate{font-size:12px;margin-top:7px;color:#cbd5e1}
 .metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin:14px 0}.metric{background:#0b1220;border:1px solid #22324a;border-radius:10px;padding:12px}.n{font-size:25px;font-weight:900}.label{font-size:11px;color:#94a3b8}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}button,.btn{padding:9px 13px;border:0;border-radius:8px;background:#0284c7;color:#fff;font-weight:800;cursor:pointer;display:inline-block}.secondary{background:#334155}.success{background:#047857}.danger{background:#b91c1c}
-input[type=file]{padding:9px;background:#0b1220;border:1px solid #334155;border-radius:8px;color:#fff}
-.tablewrap{overflow:auto;border:1px solid #22324a;border-radius:10px;margin-top:12px}table{width:100%;border-collapse:collapse;min-width:1100px}th,td{padding:8px;border-bottom:1px solid #1f2937;text-align:left;font-size:12px}th{background:#0f172a;position:sticky;top:0}
-.good{color:#86efac}.bad{color:#fca5a5}.waiting{color:#fde68a}
-.code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
-@media(max-width:1050px){.layout{grid-template-columns:1fr}.flow{grid-template-columns:repeat(2,1fr)}.metrics{grid-template-columns:repeat(3,1fr)}}
+.flow{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:16px 0}.step{border:1px solid #334155;border-radius:11px;padding:12px;min-height:78px;background:#0b1220}.step.done{border-color:#166534}.step.current{border-color:#0284c7}.stepname{font-weight:850}.stepstate{font-size:12px;margin-top:7px;color:#cbd5e1}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0}button,.btn{padding:9px 13px;border:0;border-radius:8px;background:#0284c7;color:#fff;font-weight:800;cursor:pointer;display:inline-block}.secondary{background:#334155}.success{background:#047857}.danger{background:#b91c1c}
+input[type=file],input[type=number],input[type=text]{padding:9px;background:#0b1220;border:1px solid #334155;border-radius:8px;color:#fff}
+input[type=number]{width:110px}.tablewrap{overflow:auto;border:1px solid #22324a;border-radius:10px;margin-top:12px;max-height:520px}
+table{width:100%;border-collapse:collapse;min-width:1150px}th,td{padding:8px;border-bottom:1px solid #1f2937;text-align:left;font-size:12px}th{background:#0f172a;position:sticky;top:0;z-index:1}
+.good{color:#86efac}.bad{color:#fca5a5}.waiting{color:#fde68a}.code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.mbatch{border:1px solid #334155;border-radius:12px;padding:14px;margin:10px 0;background:#0b1220}.mbhead{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.mbhead h4{margin:0;margin-right:auto}
+.searchbox{width:280px}
+@media(max-width:1050px){.layout{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,1fr)}.flow{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body><div class="wrap">
 <div class="top">
 <h1>Migration Workflow</h1>
-<a href="/upload">New Upload</a>
-<a href="/dashboard">Live Dashboard</a>
-<a href="/logs">Logs & Issues</a>
-<a href="/settings">Connections</a>
+<a href="/upload">New Upload</a><a href="/dashboard">Live Dashboard</a><a href="/logs">Logs & Issues</a><a href="/settings">Connections</a>
 </div>
 {% if notice %}<div class="notice ok">{{notice}}</div>{% endif %}
 {% if error %}<div class="notice err">{{error}}</div>{% endif %}
 
 <div class="layout">
 <div class="card batchlist">
-<h3>Upload Batches</h3>
+<h3>Uploaded Lists</h3>
 {% if not batches %}<p class="muted">No uploads yet.</p>{% endif %}
 {% for b in batches %}
 <a class="batchitem {% if batch and batch.id==b.id %}active{% endif %}" href="/workflow/{{b.id}}">
 <div class="strong">{{b.batch_name}}</div>
 <div class="small muted">{{b.original_filename or ''}}</div>
-<div class="small">Cloudiway: {% if b.cloudiway_batch_id %}#{{b.cloudiway_batch_id}}{% else %}pending{% endif %}</div>
+<div class="small">{{b.member_count or 0}} loaded · {{b.assigned_count or 0}} batched · {{b.available_count or 0}} available</div>
 <div class="small">State: {{b.workflow_status}}</div>
-<div class="small">{{b.member_count or 0}} user(s) · {{b.created_at}}</div>
 </a>
 {% endfor %}
 </div>
@@ -54,84 +49,131 @@ input[type=file]{padding:9px;background:#0b1220;border:1px solid #334155;border-
 {% if batch %}
 <div class="card">
 <h2>{{batch.batch_name}}</h2>
-<p class="muted">Each uploaded file is one workflow batch and is mapped to one Cloudiway Mail Batch.</p>
+<p class="muted">This is the master uploaded list. You control how many users move forward at a time. A 1,000-user upload can be released as 5, 10, 20, 50, or any other quantity. Each released group gets its own Cloudiway batch number.</p>
 
 <div class="metrics">
-<div class="metric"><div class="n">{{batch.member_count or 0}}</div><div class="label">USERS</div></div>
-<div class="metric"><div class="n">{{batch.confirmed_count or 0}}</div><div class="label">RACKSPACE CONFIRMED</div></div>
+<div class="metric"><div class="n">{{batch.member_count or 0}}</div><div class="label">UPLOADED</div></div>
+<div class="metric"><div class="n">{{batch.available_count or 0}}</div><div class="label">AVAILABLE</div></div>
+<div class="metric"><div class="n">{{batch.assigned_count or 0}}</div><div class="label">ALREADY BATCHED</div></div>
 <div class="metric"><div class="n">{{batch.migrating_count or 0}}</div><div class="label">MIGRATING</div></div>
 <div class="metric"><div class="n">{{batch.completed_count or 0}}</div><div class="label">COMPLETED</div></div>
 <div class="metric"><div class="n">{{batch.problem_count or 0}}</div><div class="label">ISSUES</div></div>
-<div class="metric"><div class="n">{% if batch.cloudiway_batch_id %}{{batch.cloudiway_batch_id}}{% else %}—{% endif %}</div><div class="label">CLOUDIWAY BATCH ID</div></div>
 </div>
 
 <div class="flow">
-<div class="step done"><div class="stepnum">STEP 1</div><div class="stepname">Upload & Validate</div><div class="stepstate">{{batch.imported_rows}} imported · {{batch.skipped_rows}} invalid · {{batch.protected_rows}} protected</div></div>
-<div class="step {% if batch.cloudiway_batch_id %}done{% else %}blocked{% endif %}"><div class="stepnum">STEP 2</div><div class="stepname">Cloudiway Batch</div><div class="stepstate">{% if batch.cloudiway_batch_id %}Created as #{{batch.cloudiway_batch_id}}{% else %}Waiting / needs retry{% endif %}</div></div>
-<div class="step {% if batch.workflow_mode=='automatic' or batch.workflow_status not in ['uploaded','cloudiway_batch_error'] %}done{% else %}current{% endif %}"><div class="stepnum">STEP 3</div><div class="stepname">{% if batch.workflow_mode=='manual_bulk' %}Passwords & Rackspace File{% else %}Rackspace API Reset{% endif %}</div><div class="stepstate">{% if batch.workflow_mode=='manual_bulk' %}Passwords generated automatically{% else %}Runs when batch starts{% endif %}</div></div>
-<div class="step {% if batch.workflow_mode=='automatic' %}done{% elif (batch.confirmed_count or 0)==(batch.member_count or 0) and (batch.member_count or 0)>0 %}done{% else %}current{% endif %}"><div class="stepnum">STEP 4</div><div class="stepname">Rackspace Confirm</div><div class="stepstate">{% if batch.workflow_mode=='automatic' %}Automatic API path{% else %}{{batch.confirmed_count or 0}} / {{batch.member_count or 0}} confirmed{% endif %}</div></div>
-<div class="step {% if batch.workflow_status in ['ready_to_migrate','migrating','completed'] %}done{% elif batch.workflow_status=='attention' %}blocked{% else %}current{% endif %}"><div class="stepnum">STEP 5</div><div class="stepname">Cloudiway Prepare</div><div class="stepstate">Create/reuse users, credentials, target mapping, assign batch members</div></div>
-<div class="step {% if batch.workflow_status=='completed' %}done{% elif batch.workflow_status=='migrating' %}current{% elif batch.workflow_status=='attention' %}blocked{% endif %}"><div class="stepnum">STEP 6</div><div class="stepname">Migrate & Monitor</div><div class="stepstate">{{batch.workflow_status}}</div></div>
+<div class="step done"><div class="stepname">1. Upload Master List</div><div class="stepstate">{{batch.imported_rows}} valid users staged. No passwords generated yet.</div></div>
+<div class="step current"><div class="stepname">2. Choose Quantity / Users</div><div class="stepstate">Choose the next N users or tick exact users.</div></div>
+<div class="step"><div class="stepname">3. Generate & Download</div><div class="stepstate">Passwords generated only for that group; Cloudiway batch created.</div></div>
+<div class="step"><div class="stepname">4. Upload Back</div><div class="stepstate">Returned Rackspace file confirms the password changes.</div></div>
+<div class="step"><div class="stepname">5. Migrate & Monitor</div><div class="stepstate">Prepare credentials, assign Cloudiway batch, start and monitor.</div></div>
 </div>
 
-{% if batch.last_error %}<div class="notice err"><b>Batch issue:</b> {{batch.last_error}}</div>{% endif %}
+{% if (batch.available_count or 0) > 0 %}
+<h3>Create the Next Migration Batch</h3>
+<form method="post" action="/workflow/{{batch.id}}/generate" id="generateForm">
+<div class="actions">
+<label><b>Next quantity:</b> <input type="number" min="1" max="{{batch.available_count or 1}}" name="quantity" value="20"></label>
+<label><input type="checkbox" name="auto_start" value="1"> Start automatically after the returned Rackspace file is confirmed</label>
+<button class="success">Generate Passwords, Create Cloudiway Batch & Download</button>
+</div>
+<p class="small muted">If you tick individual users below, those selected users are used instead of the quantity. If nothing is ticked, the next N available users are selected in upload order.</p>
 
 <div class="actions">
-{% if not batch.cloudiway_batch_id %}
-<form method="post" action="/workflow/{{batch.id}}/retry-cloudiway"><button>Retry Cloudiway Batch Creation</button></form>
-{% endif %}
+<input id="memberSearch" class="searchbox" type="text" placeholder="Filter available users..." oninput="filterMembers()">
+<button type="button" class="secondary" onclick="setVisibleChecks(true)">Select visible</button>
+<button type="button" class="secondary" onclick="setVisibleChecks(false)">Clear visible</button>
+<span class="small muted" id="selectedCount">0 selected</span>
+</div>
 
+<div class="tablewrap"><table>
+<thead><tr><th></th><th>#</th><th>Computer No.</th><th>Source</th><th>Target</th><th>Name</th></tr></thead>
+<tbody id="availableRows">
+{% for u in available_members %}
+<tr data-search="{{(u.source_email ~ ' ' ~ u.target_email ~ ' ' ~ (u.first_name or '') ~ ' ' ~ (u.last_name or '') ~ ' ' ~ (u.computer_number or ''))|lower}}">
+<td><input class="usercheck" type="checkbox" name="user_ids" value="{{u.id}}" onchange="updateSelectedCount()"></td>
+<td>{{u.row_order}}</td><td>{{u.computer_number or ''}}</td><td><b>{{u.source_email}}</b></td><td>{{u.target_email}}</td><td>{{(u.first_name or '')}} {{(u.last_name or '')}}</td>
+</tr>
+{% endfor %}
+</tbody></table></div>
+</form>
+{% else %}
+<div class="notice ok">All users from this uploaded list have been assigned to migration batches.</div>
+{% endif %}
+</div>
+
+<div class="card" style="margin-top:16px">
+<h3>Migration Batches from This Upload</h3>
+{% if not migration_batches %}<p class="muted">No migration batch has been generated yet.</p>{% endif %}
+{% for mb in migration_batches %}
+<div class="mbatch">
+<div class="mbhead">
+<h4>{{mb.batch_name}}</h4>
+<span class="small">Users: <b>{{mb.member_count or mb.selected_count or 0}}</b></span>
+<span class="small">Cloudiway Batch: <b>{% if mb.cloudiway_batch_id %}#{{mb.cloudiway_batch_id}}{% else %}pending{% endif %}</b></span>
+<span class="small">State: <b>{{mb.workflow_status}}</b></span>
+</div>
+{% if mb.last_error %}<div class="notice err"><b>Issue:</b> {{mb.last_error}}</div>{% endif %}
+<div class="actions">
 {% if batch.workflow_mode=='manual_bulk' %}
-<a class="btn" href="/workflow/{{batch.id}}/download">Download Rackspace Password Package</a>
+<a class="btn" href="/migration-batch/{{mb.id}}/download">Download Password Package</a>
 {% endif %}
-
-{% if batch.workflow_mode=='manual_bulk' and (batch.confirmed_count or 0) < (batch.member_count or 0) %}
-<form method="post" action="/workflow/{{batch.id}}/confirm" enctype="multipart/form-data">
+{% if not mb.cloudiway_batch_id %}
+<form method="post" action="/migration-batch/{{mb.id}}/retry-cloudiway"><button>Retry Cloudiway Batch</button></form>
+{% endif %}
+{% if batch.workflow_mode=='manual_bulk' and (mb.confirmed_count or 0) < (mb.member_count or mb.selected_count or 0) %}
+<form method="post" action="/migration-batch/{{mb.id}}/confirm" enctype="multipart/form-data">
 <input type="file" name="file" accept=".csv,.xlsx,.xls" required>
 <button class="success">Upload Rackspace File Back & Continue</button>
 </form>
 {% endif %}
-
-{% if batch.workflow_status in ['passwords_confirmed','confirmation_partial','attention','cloudiway_members_assigned'] %}
-<form method="post" action="/workflow/{{batch.id}}/prepare"><button class="secondary">Retry Preparation</button></form>
+{% if mb.workflow_status in ['passwords_confirmed','confirmation_partial','attention','cloudiway_members_assigned'] %}
+<form method="post" action="/migration-batch/{{mb.id}}/prepare"><button class="secondary">Retry Preparation</button></form>
 {% endif %}
-
-{% if batch.workflow_status in ['ready_to_migrate','ready_for_automatic'] %}
-<form method="post" action="/workflow/{{batch.id}}/start"><button class="success">Start This Batch</button></form>
+{% if mb.workflow_status in ['ready_to_migrate','ready_for_automatic'] %}
+<form method="post" action="/migration-batch/{{mb.id}}/start"><button class="success">Start This Batch</button></form>
 {% endif %}
 </div>
-
-<p class="small muted">
-Workflow mode: <span class="code">{{batch.workflow_mode}}</span> ·
-Auto-start: <span class="code">{{'yes' if batch.auto_start else 'no'}}</span> ·
-Cloudiway name: <span class="code">{{batch.cloudiway_batch_name or batch.batch_name}}</span>
-</p>
+<div class="small muted">Rackspace confirmed: {{mb.confirmed_count or 0}} / {{mb.member_count or mb.selected_count or 0}} · Migrating: {{mb.migrating_count or 0}} · Completed: {{mb.completed_count or 0}} · Issues: {{mb.problem_count or 0}}</div>
+</div>
+{% endfor %}
 </div>
 
 <div class="card" style="margin-top:16px">
-<h3>Batch Members</h3>
+<h3>All Users in Uploaded List</h3>
 <div class="tablewrap"><table>
-<thead><tr><th>Computer No.</th><th>Source</th><th>Target</th><th>Rackspace</th><th>Cloudiway</th><th>Migration</th><th>Progress</th><th>Last Update</th><th>Error</th></tr></thead>
+<thead><tr><th>#</th><th>Computer No.</th><th>Source</th><th>Target</th><th>Migration Batch</th><th>Cloudiway Batch</th><th>Rackspace</th><th>Migration</th><th>Progress</th><th>Error</th></tr></thead>
 <tbody>
 {% for u in members %}
 <tr>
-<td>{{u.computer_number or ''}}</td>
-<td><b>{{u.source_email}}</b><br><span class="muted">{{(u.first_name or '')}} {{(u.last_name or '')}}</span></td>
-<td>{{u.target_email}}</td>
+<td>{{u.row_order}}</td><td>{{u.computer_number or ''}}</td><td><b>{{u.source_email}}</b></td><td>{{u.target_email}}</td>
+<td>{{u.migration_batch_name or 'Not batched'}}</td><td>{{u.cloudiway_batch_id or ''}}</td>
 <td class="{{'good' if u.rackspace_status in ['manual_confirmed','reset_ok'] else 'waiting'}}">{{u.rackspace_status}}</td>
-<td>{{u.cloudiway_status}}</td>
 <td class="{{'good' if u.migration_status=='completed' else ('bad' if u.migration_status in ['failed','attention','timed_out'] else 'waiting')}}">{{u.migration_status}}</td>
-<td>{{u.progress_percent if u.progress_percent is not none else ''}}</td>
-<td>{{u.updated_at or ''}}</td>
-<td class="bad">{{u.error_message or ''}}</td>
+<td>{{u.progress_percent if u.progress_percent is not none else ''}}</td><td class="bad">{{u.error_message or ''}}</td>
 </tr>
 {% endfor %}
-</tbody>
-</table></div>
+</tbody></table></div>
 </div>
 {% else %}
-<div class="card"><h2>No batch selected</h2><p>Upload a migration file to start a guided workflow.</p><a class="btn" href="/upload">New Upload</a></div>
+<div class="card"><h2>No upload selected</h2><p>Upload a migration list to begin.</p><a class="btn" href="/upload">New Upload</a></div>
 {% endif %}
 </div>
 </div>
-</div></body></html>
+</div>
+<script>
+function filterMembers(){
+  const q=(document.getElementById('memberSearch')?.value||'').toLowerCase();
+  document.querySelectorAll('#availableRows tr').forEach(r=>{r.style.display=(r.dataset.search||'').includes(q)?'':'none'});
+}
+function setVisibleChecks(state){
+  document.querySelectorAll('#availableRows tr').forEach(r=>{
+    if(r.style.display!=='none'){const c=r.querySelector('.usercheck');if(c)c.checked=state}
+  });
+  updateSelectedCount();
+}
+function updateSelectedCount(){
+  const n=document.querySelectorAll('.usercheck:checked').length;
+  const el=document.getElementById('selectedCount');if(el)el.textContent=n+' selected';
+}
+</script>
+</body></html>
