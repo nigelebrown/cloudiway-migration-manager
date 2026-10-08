@@ -17,7 +17,9 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 <body><div class="wrap">
 <div class="top"><h1>Migration Workflow</h1><a href="/upload">New Upload</a><a href="/dashboard">Live Dashboard</a><a href="/logs">Logs & Issues</a><a href="/settings">Connections</a><a href="/settings/provisioning">AD / M365 Settings</a></div>
 {% if notice %}<div class="notice ok">{{notice}}</div>{% endif %}{% if error %}<div class="notice err">{{error}}</div>{% endif %}
-{% if active_profile %}
+{% if batch and batch.workflow_mode=='existing_password' %}
+<div class="notice info"><b>Cloudiway-only existing-password mode.</b> AD identity validation, AD writes, provisioning, Microsoft 365 readiness checks, and Rackspace password reset are bypassed by design. The target Microsoft 365 mailbox must already exist. Supplied source passwords are stored encrypted and sent only to Cloudiway for selected users.</div>
+{% elif active_profile %}
 <div class="notice {{'err' if active_profile.environment_type=='PRODUCTION' else 'info'}}"><b>Active environment:</b> {{active_profile.name}} ({{active_profile.environment_type}}) · Directory writes {{'ENABLED' if active_profile.writes_enabled else 'DISABLED'}} · Emergency Stop {{'ACTIVE' if active_profile.emergency_stop else 'clear'}} · Computer Number attribute: {{active_profile.ad_computer_number_attribute or 'not configured'}}</div>
 {% else %}<div class="notice err"><b>No AD/M365 environment profile is active.</b> Configure TEST first before releasing a migration group.</div>{% endif %}
 
@@ -34,7 +36,11 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 <div>
 {% if batch %}
 <div class="card"><h2>{{batch.batch_name}}</h2>
+{% if batch.workflow_mode=='existing_password' %}
+<p class="muted">Upload source and target email addresses with the existing source mailbox password. Choose the next quantity or exact users; the app creates a Cloudiway batch, registers the supplied password with Cloudiway, and makes the batch ready to migrate. No AD or Rackspace password change is performed.</p>
+{% else %}
 <p class="muted">Upload once, then release controlled groups. A released group first performs an AD identity dry-run; it cannot reach Rackspace or Cloudiway migration until Microsoft 365 mailbox readiness is confirmed.</p>
+{% endif %}
 <div class="metrics">
 <div class="metric"><div class="n">{{batch.member_count or 0}}</div><div class="label">UPLOADED</div></div>
 <div class="metric"><div class="n">{{batch.available_count or 0}}</div><div class="label">AVAILABLE</div></div>
@@ -44,6 +50,14 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 <div class="metric"><div class="n">{{batch.problem_count or 0}}</div><div class="label">MIGRATION ISSUES</div></div>
 </div>
 
+{% if batch.workflow_mode=='existing_password' %}
+<div class="flow">
+<div class="step"><div class="stepname">1. Upload Existing Credentials</div><div class="stepstate">Source email, target email and existing source password are staged encrypted.</div></div>
+<div class="step"><div class="stepname">2. Select Group</div><div class="stepstate">Choose next N or exact users; create a Cloudiway Mail Batch.</div></div>
+<div class="step"><div class="stepname">3. Push to Cloudiway</div><div class="stepstate">Create/reuse Cloudiway users and register the supplied source password.</div></div>
+<div class="step"><div class="stepname">4. Start & Monitor</div><div class="stepstate">Start the Cloudiway migration and monitor status/logs.</div></div>
+</div>
+{% else %}
 <div class="flow">
 <div class="step"><div class="stepname">1. Master Upload</div><div class="stepstate">Computer Number, source/target email and name staged.</div></div>
 <div class="step"><div class="stepname">2. Select Group</div><div class="stepstate">Choose next N or exact users; create Cloudiway batch.</div></div>
@@ -53,6 +67,7 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 <div class="step"><div class="stepname">6. Rackspace</div><div class="stepstate">Only now generate/download the Rackspace password package.</div></div>
 <div class="step"><div class="stepname">7. Cloudiway</div><div class="stepstate">Confirm returned file, prepare credentials, migrate and monitor.</div></div>
 </div>
+{% endif %}
 
 {% if (batch.available_count or 0) > 0 %}
 <h3>Create the Next Controlled Group</h3>
@@ -60,10 +75,10 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 <div class="actions">
 <label><b>Quantity:</b> <input id="qty" type="number" min="1" max="{{batch.available_count or 1}}" name="quantity" value="{{20 if (batch.available_count or 0)>=20 else (batch.available_count or 1)}}"></label>
 <button type="button" class="secondary" onclick="setQty(5)">5</button><button type="button" class="secondary" onclick="setQty(10)">10</button><button type="button" class="secondary" onclick="setQty(20)">20</button><button type="button" class="secondary" onclick="setQty(50)">50</button><button type="button" class="secondary" onclick="setQty(100)">100</button><button type="button" class="secondary" onclick="setQty({{batch.available_count or 1}})">All remaining</button>
-<label><input type="checkbox" name="auto_start" value="1"> Auto-start Cloudiway only after every prerequisite and Rackspace confirmation passes</label>
-<button class="success">Create Group & Run AD Dry-Run</button>
+<label><input type="checkbox" name="auto_start" value="1"> {% if batch.workflow_mode=='existing_password' %}Auto-start Cloudiway after credentials are registered{% else %}Auto-start Cloudiway only after every prerequisite and Rackspace confirmation passes{% endif %}</label>
+<button class="success">{% if batch.workflow_mode=='existing_password' %}Create Group & Push Existing Passwords to Cloudiway{% else %}Create Group & Run AD Dry-Run{% endif %}</button>
 </div>
-<p class="small muted">Tick exact users below to override the quantity. This step makes no AD changes and generates no passwords.</p>
+<p class="small muted">Tick exact users below to override the quantity. {% if batch.workflow_mode=='existing_password' %}This step bypasses AD/Rackspace changes and uses the encrypted passwords already supplied in the upload.{% else %}This step makes no AD changes and generates no passwords.{% endif %}</p>
 <div class="actions"><input id="memberSearch" class="searchbox" type="text" placeholder="Filter available users..." oninput="filterMembers()"><button type="button" class="secondary" onclick="setVisibleChecks(true)">Select visible</button><button type="button" class="secondary" onclick="setVisibleChecks(false)">Clear visible</button><span class="small muted" id="selectedCount">0 selected</span></div>
 <div class="tablewrap"><table><thead><tr><th></th><th>#</th><th>Computer No.</th><th>Source</th><th>Target</th><th>Name</th></tr></thead><tbody id="availableRows">
 {% for u in available_members %}
@@ -78,15 +93,21 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 {% if not migration_batches %}<p class="muted">No controlled group has been created yet.</p>{% endif %}
 {% for mb in migration_batches %}
 <div class="mbatch"><div class="mbhead"><h4>{{mb.batch_name}}</h4><span class="pill">{{mb.member_count or mb.selected_count or 0}} users</span><span class="pill">Cloudiway #{% if mb.cloudiway_batch_id %}{{mb.cloudiway_batch_id}}{% else %}pending{% endif %}</span><span class="pill">{{mb.workflow_status}}</span></div>
+{% if batch.workflow_mode=='existing_password' %}
+<div class="small muted">Cloudiway-only · Existing source passwords supplied · AD/Rackspace reset bypassed · Migrating: {{mb.migrating_count or 0}} · Completed: {{mb.completed_count or 0}} · Issues: {{mb.problem_count or 0}}</div>
+{% else %}
 <div class="small muted">AD review: {{mb.manual_review_count or 0}} · M365 ready: {{mb.m365_ready_count or 0}} / {{mb.member_count or mb.selected_count or 0}} · Provisioning errors: {{mb.provisioning_error_count or 0}} · Rackspace confirmed: {{mb.confirmed_count or 0}}</div>
+{% endif %}
 {% if mb.last_error %}<div class="notice err"><b>Issue:</b> {{mb.last_error}}</div>{% endif %}
 <div class="actions">
+{% if batch.workflow_mode!='existing_password' %}
 <form method="post" action="/migration-batch/{{mb.id}}/assess"><button class="secondary">Re-run AD Dry-Run</button></form>
 {% if mb.workflow_status in ['provisioning_assessed','provisioning_review','provisioning_attention','identity_pending','cloudiway_batch_error'] %}
 <form method="post" action="/migration-batch/{{mb.id}}/provision"><button class="success">Approve & Provision Ready Users</button></form>
 {% endif %}
 {% if mb.workflow_status in ['sync_pending','m365_waiting','provisioning_review','provisioning_attention'] %}
 <form method="post" action="/migration-batch/{{mb.id}}/refresh-m365"><button>Refresh M365 Readiness</button></form>
+{% endif %}
 {% endif %}
 {% if not mb.cloudiway_batch_id %}<form method="post" action="/migration-batch/{{mb.id}}/retry-cloudiway"><button>Retry Cloudiway Batch</button></form>{% endif %}
 {% if mb.workflow_status=='m365_ready' and batch.workflow_mode=='manual_bulk' %}
@@ -98,13 +119,13 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 {% if batch.workflow_mode=='manual_bulk' and mb.workflow_status in ['passwords_generated','confirmation_partial'] %}
 <form method="post" action="/migration-batch/{{mb.id}}/confirm" enctype="multipart/form-data"><input type="file" name="file" accept=".csv,.xlsx,.xls" required><button class="success">Upload Rackspace File Back & Continue</button></form>
 {% endif %}
-{% if mb.workflow_status in ['passwords_confirmed','attention','cloudiway_members_assigned'] %}<form method="post" action="/migration-batch/{{mb.id}}/prepare"><button class="secondary">Retry Cloudiway Preparation</button></form>{% endif %}
+{% if mb.workflow_status in ['passwords_confirmed','attention','cloudiway_members_assigned','ready_for_cloudiway'] %}<form method="post" action="/migration-batch/{{mb.id}}/prepare"><button class="secondary">Retry Cloudiway Preparation</button></form>{% endif %}
 {% if mb.workflow_status=='ready_to_migrate' %}<form method="post" action="/migration-batch/{{mb.id}}/start"><button class="success">Start Cloudiway Migration</button></form>{% endif %}
 </div></div>
 {% endfor %}
 </div>
 
-<div class="card" style="margin-top:16px"><h3>Users / Identity & Provisioning Status</h3>
+<div class="card" style="margin-top:16px"><h3>{% if batch.workflow_mode=='existing_password' %}Users / Cloudiway Credential Status{% else %}Users / Identity & Provisioning Status{% endif %}</h3>
 <div class="tablewrap"><table><thead><tr><th>#</th><th>Computer No.</th><th>User</th><th>Group</th><th>AD Identity</th><th>AD Group</th><th>Entra</th><th>Licence</th><th>Mailbox</th><th>Rackspace</th><th>Migration</th><th>Action / Issue</th></tr></thead><tbody>
 {% for u in members %}
 <tr><td>{{u.row_order}}</td><td><b>{{u.computer_number or ''}}</b></td>
