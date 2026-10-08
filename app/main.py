@@ -1683,19 +1683,25 @@ async def dashboard_data(request: Request, q: str = ""):
         if q:
             values = tuple([f"%{q}%"] * 4)
             rows = db.execute(
-                """SELECT id,source_email,target_email,first_name,last_name,rackspace_status,
-                          cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at,
-                          password_reset_method,manual_password_generated_at,manual_password_confirmed_at,computer_number
-                   FROM users WHERE source_email LIKE ? OR target_email LIKE ? OR first_name LIKE ? OR last_name LIKE ?
-                   ORDER BY id DESC LIMIT 1000""",
+                """SELECT u.id,u.source_email,u.target_email,u.first_name,u.last_name,u.rackspace_status,
+                          u.cloudiway_status,u.migration_status,u.progress_percent,u.error_message,u.batch_number,u.updated_at,
+                          u.password_reset_method,u.manual_password_generated_at,u.manual_password_confirmed_at,u.computer_number,
+                          mb.batch_name AS migration_batch_name,mb.cloudiway_batch_id
+                   FROM users u
+                   LEFT JOIN migration_batches mb ON mb.id=u.batch_number
+                   WHERE u.source_email LIKE ? OR u.target_email LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?
+                   ORDER BY u.id DESC LIMIT 1000""",
                 values,
             ).fetchall()
         else:
             rows = db.execute(
-                """SELECT id,source_email,target_email,first_name,last_name,rackspace_status,
-                          cloudiway_status,migration_status,progress_percent,error_message,batch_number,updated_at,
-                          password_reset_method,manual_password_generated_at,manual_password_confirmed_at,computer_number
-                   FROM users ORDER BY id DESC LIMIT 1000"""
+                """SELECT u.id,u.source_email,u.target_email,u.first_name,u.last_name,u.rackspace_status,
+                          u.cloudiway_status,u.migration_status,u.progress_percent,u.error_message,u.batch_number,u.updated_at,
+                          u.password_reset_method,u.manual_password_generated_at,u.manual_password_confirmed_at,u.computer_number,
+                          mb.batch_name AS migration_batch_name,mb.cloudiway_batch_id
+                   FROM users u
+                   LEFT JOIN migration_batches mb ON mb.id=u.batch_number
+                   ORDER BY u.id DESC LIMIT 1000"""
             ).fetchall()
     return {
         "counts": counts,
@@ -1710,27 +1716,19 @@ async def automation_start(request: Request):
     require_admin(request)
     set_runtime("automation_paused", "0")
     set_runtime("pause_reason", "")
-    set_runtime("automation_running", "1")
 
-    # Prefer manually-confirmed users when they are waiting. This path does not
-    # require Rackspace API credentials because the administrator has already
-    # applied the generated password in Rackspace and uploaded the file back.
     with conn() as db:
-        manual_waiting = db.execute(
-            """SELECT COUNT(*) c FROM users
-               WHERE migration_status='waiting'
-                 AND password_reset_method='manual_bulk'
-                 AND rackspace_status='manual_confirmed'"""
-        ).fetchone()["c"]
-
-    if manual_waiting:
-        result = await launch_next_confirmed_manual_batch()
-        if result.get("started"):
-            return JSONResponse(result)
-        if result.get("reason") not in ("No manually confirmed users are waiting",):
-            return JSONResponse(result)
-
-    return JSONResponse(await launch_next_batch(force=True))
+        row = db.execute(
+            """SELECT id FROM migration_batches
+               WHERE workflow_status IN ('ready_to_migrate','ready_for_automatic')
+               ORDER BY id LIMIT 1"""
+        ).fetchone()
+    if not row:
+        return JSONResponse({
+            "started": False,
+            "reason": "No prepared migration batch is ready. Use Migration Workflow to select the next quantity/users first."
+        })
+    return JSONResponse(await start_migration_batch(int(row["id"])))
 
 
 @app.post("/automation/pause")
@@ -1748,21 +1746,17 @@ async def automation_continue(request: Request):
     set_runtime("pause_reason", "")
 
     with conn() as db:
-        manual_waiting = db.execute(
-            """SELECT COUNT(*) c FROM users
-               WHERE migration_status='waiting'
-                 AND password_reset_method='manual_bulk'
-                 AND rackspace_status='manual_confirmed'"""
-        ).fetchone()["c"]
-
-    if manual_waiting:
-        result = await launch_next_confirmed_manual_batch()
-        if result.get("started"):
-            return result
-        if result.get("reason") not in ("No manually confirmed users are waiting",):
-            return result
-
-    return await launch_next_batch(force=True)
+        row = db.execute(
+            """SELECT id FROM migration_batches
+               WHERE workflow_status IN ('ready_to_migrate','ready_for_automatic')
+               ORDER BY id LIMIT 1"""
+        ).fetchone()
+    if not row:
+        return {
+            "started": False,
+            "reason": "No prepared migration batch is ready. Use Migration Workflow to create or prepare the next batch."
+        }
+    return await start_migration_batch(int(row["id"]))
 
 
 @app.post("/status/refresh")
