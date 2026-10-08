@@ -21,8 +21,28 @@ SCHEMA = [
         source_email VARCHAR(320) NOT NULL UNIQUE,
         target_email VARCHAR(320) NOT NULL,
         first_name VARCHAR(255) NULL,
+        middle_name VARCHAR(255) NULL,
         last_name VARCHAR(255) NULL,
         computer_number VARCHAR(64) NULL,
+        provisioning_profile_id BIGINT NULL,
+        provisioning_status VARCHAR(64) NOT NULL DEFAULT 'not_checked',
+        ad_match_status VARCHAR(64) NOT NULL DEFAULT 'not_checked',
+        ad_object_guid VARCHAR(64) NULL,
+        ad_distinguished_name VARCHAR(1024) NULL,
+        ad_candidate_json LONGTEXT NULL,
+        ad_conflict_reason LONGTEXT NULL,
+        ad_created_by_app TINYINT(1) NOT NULL DEFAULT 0,
+        ad_enabled_status VARCHAR(32) NULL,
+        ad_group_status VARCHAR(64) NULL,
+        ad_manual_override TINYINT(1) NOT NULL DEFAULT 0,
+        ad_resolution_note LONGTEXT NULL,
+        ad_resolved_at DATETIME NULL,
+        entra_status VARCHAR(64) NOT NULL DEFAULT 'not_checked',
+        entra_object_id VARCHAR(128) NULL,
+        license_status VARCHAR(64) NOT NULL DEFAULT 'not_checked',
+        mailbox_status VARCHAR(64) NOT NULL DEFAULT 'not_checked',
+        provisioning_error LONGTEXT NULL,
+        provisioning_updated_at DATETIME NULL,
         generated_password_enc LONGTEXT NULL,
         password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic',
         manual_password_generated_at DATETIME NULL,
@@ -45,12 +65,62 @@ SCHEMA = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
     """
+    CREATE TABLE IF NOT EXISTS environment_profiles (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        name VARCHAR(128) NOT NULL UNIQUE,
+        environment_type VARCHAR(32) NOT NULL DEFAULT 'TEST',
+        is_active TINYINT(1) NOT NULL DEFAULT 0,
+        writes_enabled TINYINT(1) NOT NULL DEFAULT 0,
+        emergency_stop TINYINT(1) NOT NULL DEFAULT 0,
+        production_max_batch INT NOT NULL DEFAULT 100,
+
+        ad_host VARCHAR(255) NULL,
+        ad_port INT NOT NULL DEFAULT 636,
+        ad_use_ssl TINYINT(1) NOT NULL DEFAULT 1,
+        ad_base_dn VARCHAR(1024) NULL,
+        ad_bind_username VARCHAR(512) NULL,
+        ad_bind_password_enc LONGTEXT NULL,
+        ad_target_ou VARCHAR(1024) NULL,
+        ad_license_group_dn VARCHAR(1024) NULL,
+        ad_computer_number_attribute VARCHAR(128) NULL,
+        ad_upn_suffix VARCHAR(255) NULL,
+        ad_default_password_enc LONGTEXT NULL,
+        ad_force_password_change TINYINT(1) NOT NULL DEFAULT 1,
+        ad_allow_user_creation TINYINT(1) NOT NULL DEFAULT 0,
+        ad_allow_group_changes TINYINT(1) NOT NULL DEFAULT 0,
+
+        graph_tenant_id VARCHAR(128) NULL,
+        graph_client_id VARCHAR(128) NULL,
+        graph_client_secret_enc LONGTEXT NULL,
+        graph_required_sku VARCHAR(128) NULL,
+
+        sync_agent_url VARCHAR(1024) NULL,
+        sync_agent_token_enc LONGTEXT NULL,
+
+        sql_host VARCHAR(255) NULL,
+        sql_port INT NOT NULL DEFAULT 1433,
+        sql_database VARCHAR(255) NULL,
+        sql_username VARCHAR(255) NULL,
+        sql_password_enc LONGTEXT NULL,
+        sql_source_view VARCHAR(512) NULL,
+
+        vpn_profile_name VARCHAR(255) NULL,
+        network_notes LONGTEXT NULL,
+
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_environment_profiles_active (is_active),
+        INDEX idx_environment_profiles_type (environment_type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
     CREATE TABLE IF NOT EXISTS upload_batches (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         batch_name VARCHAR(255) NOT NULL UNIQUE,
         original_filename VARCHAR(512) NULL,
         workflow_mode VARCHAR(32) NOT NULL DEFAULT 'manual_bulk',
         workflow_status VARCHAR(64) NOT NULL DEFAULT 'uploaded',
+        provisioning_profile_id BIGINT NULL,
         auto_start TINYINT(1) NOT NULL DEFAULT 0,
         cloudiway_batch_id BIGINT NULL,
         cloudiway_batch_name VARCHAR(255) NULL,
@@ -88,6 +158,9 @@ SCHEMA = [
         sequence_number INT NOT NULL,
         batch_name VARCHAR(255) NOT NULL UNIQUE,
         workflow_status VARCHAR(64) NOT NULL DEFAULT 'selected',
+        provisioning_profile_id BIGINT NULL,
+        sync_requested_at DATETIME NULL,
+        m365_ready_at DATETIME NULL,
         auto_start TINYINT(1) NOT NULL DEFAULT 0,
         cloudiway_batch_id BIGINT NULL,
         cloudiway_batch_name VARCHAR(255) NULL,
@@ -222,6 +295,31 @@ def init_db():
             db.execute(
                 "ALTER TABLE users ADD COLUMN computer_number VARCHAR(64) NULL AFTER last_name"
             )
+        user_additions = [
+            ("middle_name", "VARCHAR(255) NULL AFTER first_name"),
+            ("provisioning_profile_id", "BIGINT NULL AFTER computer_number"),
+            ("provisioning_status", "VARCHAR(64) NOT NULL DEFAULT 'not_checked' AFTER provisioning_profile_id"),
+            ("ad_match_status", "VARCHAR(64) NOT NULL DEFAULT 'not_checked' AFTER provisioning_status"),
+            ("ad_object_guid", "VARCHAR(64) NULL AFTER ad_match_status"),
+            ("ad_distinguished_name", "VARCHAR(1024) NULL AFTER ad_object_guid"),
+            ("ad_candidate_json", "LONGTEXT NULL AFTER ad_distinguished_name"),
+            ("ad_conflict_reason", "LONGTEXT NULL AFTER ad_candidate_json"),
+            ("ad_created_by_app", "TINYINT(1) NOT NULL DEFAULT 0 AFTER ad_conflict_reason"),
+            ("ad_enabled_status", "VARCHAR(32) NULL AFTER ad_created_by_app"),
+            ("ad_group_status", "VARCHAR(64) NULL AFTER ad_enabled_status"),
+            ("ad_manual_override", "TINYINT(1) NOT NULL DEFAULT 0 AFTER ad_group_status"),
+            ("ad_resolution_note", "LONGTEXT NULL AFTER ad_manual_override"),
+            ("ad_resolved_at", "DATETIME NULL AFTER ad_resolution_note"),
+            ("entra_status", "VARCHAR(64) NOT NULL DEFAULT 'not_checked' AFTER ad_resolved_at"),
+            ("entra_object_id", "VARCHAR(128) NULL AFTER entra_status"),
+            ("license_status", "VARCHAR(64) NOT NULL DEFAULT 'not_checked' AFTER entra_object_id"),
+            ("mailbox_status", "VARCHAR(64) NOT NULL DEFAULT 'not_checked' AFTER license_status"),
+            ("provisioning_error", "LONGTEXT NULL AFTER mailbox_status"),
+            ("provisioning_updated_at", "DATETIME NULL AFTER provisioning_error"),
+        ]
+        for column_name, definition in user_additions:
+            if column_name not in columns:
+                db.execute(f"ALTER TABLE users ADD COLUMN {column_name} {definition}")
         if "password_reset_method" not in columns:
             db.execute(
                 "ALTER TABLE users ADD COLUMN password_reset_method VARCHAR(32) NOT NULL DEFAULT 'automatic' AFTER generated_password_enc"
@@ -249,6 +347,37 @@ def init_db():
                 "ALTER TABLE upload_batch_members ADD COLUMN row_order INT NOT NULL DEFAULT 0 AFTER user_id"
             )
 
+        upload_batch_columns = {
+            row["COLUMN_NAME"]
+            for row in db.execute(
+                """SELECT COLUMN_NAME
+                   FROM INFORMATION_SCHEMA.COLUMNS
+                   WHERE TABLE_SCHEMA=? AND TABLE_NAME='upload_batches'""",
+                (settings.db_name,),
+            ).fetchall()
+        }
+        if "provisioning_profile_id" not in upload_batch_columns:
+            db.execute(
+                "ALTER TABLE upload_batches ADD COLUMN provisioning_profile_id BIGINT NULL AFTER workflow_status"
+            )
+
+        migration_batch_columns = {
+            row["COLUMN_NAME"]
+            for row in db.execute(
+                """SELECT COLUMN_NAME
+                   FROM INFORMATION_SCHEMA.COLUMNS
+                   WHERE TABLE_SCHEMA=? AND TABLE_NAME='migration_batches'""",
+                (settings.db_name,),
+            ).fetchall()
+        }
+        for column_name, definition in [
+            ("provisioning_profile_id", "BIGINT NULL AFTER workflow_status"),
+            ("sync_requested_at", "DATETIME NULL AFTER provisioning_profile_id"),
+            ("m365_ready_at", "DATETIME NULL AFTER sync_requested_at"),
+        ]:
+            if column_name not in migration_batch_columns:
+                db.execute(f"ALTER TABLE migration_batches ADD COLUMN {column_name} {definition}")
+
         migration_member_indexes = {
             row["INDEX_NAME"]
             for row in db.execute(
@@ -268,7 +397,7 @@ def reset_test_data():
     """Clear application data while preserving the MySQL schema."""
     with conn() as db:
         db.execute("SET FOREIGN_KEY_CHECKS=0")
-        for table in ("events", "migration_batch_members", "migration_batches", "upload_batch_members", "upload_batches", "users", "settings", "runtime"):
+        for table in ("events", "migration_batch_members", "migration_batches", "upload_batch_members", "upload_batches", "users", "environment_profiles", "settings", "runtime"):
             db.execute(f"TRUNCATE TABLE {table}")
         db.execute("SET FOREIGN_KEY_CHECKS=1")
 
