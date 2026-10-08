@@ -106,9 +106,17 @@ GET /ap1/Mail/MailProgress/{objectId}
 
 ## Tests
 
-Run: pytest -q
+Run the full local validation suite with:
 
-The automated tests cover password generation/encryption, Rackspace signature construction, Cloudiway headers/token parsing, progress parsing, administrator login, CSV import and dashboard state. Automated tests do not call production Rackspace or Cloudiway. Use the in-app connection tests and 5-user pilot before mass migration.
+```bash
+bash scripts/full-test.sh
+```
+
+The full test script runs dependency checks, Python compilation, installer/update shell syntax checks, and the complete pytest suite.
+
+The automated tests cover password generation/encryption, Rackspace signature construction, Cloudiway authentication/token handling, Cloudiway batch creation, progress/error parsing, administrator login, CSV/XLSX import, the 1,000-user staged workflow, selecting the next N users, exact-user selection, generating only selected passwords, Rackspace package download/re-upload confirmation, Cloudiway batch assignment, migration start, dashboard batch visibility, and duplicate-preparation protection.
+
+Tests mock external Rackspace and Cloudiway operations; they do not perform destructive calls against production services.
 
 
 ## Migration safety controls
