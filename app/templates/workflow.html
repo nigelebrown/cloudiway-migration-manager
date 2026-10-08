@@ -72,7 +72,7 @@ table{width:100%;border-collapse:collapse;min-width:1150px}th,td{padding:8px;bor
 <h3>Create the Next Migration Batch</h3>
 <form method="post" action="/workflow/{{batch.id}}/generate" id="generateForm">
 <div class="actions">
-<label><b>Next quantity:</b> <input type="number" min="1" max="{{batch.available_count or 1}}" name="quantity" value="20"></label>
+<label><b>Next quantity:</b> <input type="number" min="1" max="{{batch.available_count or 1}}" name="quantity" value="{{20 if (batch.available_count or 0) >= 20 else (batch.available_count or 1)}}"></label>
 <label><input type="checkbox" name="auto_start" value="1"> Start automatically after the returned Rackspace file is confirmed</label>
 <button class="success">Generate Passwords, Create Cloudiway Batch & Download</button>
 </div>
