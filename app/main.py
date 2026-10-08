@@ -1239,10 +1239,16 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
             if upload:
                 members = [
                     dict(r) for r in db.execute(
-                        """SELECT u.id,u.source_email,u.target_email,u.first_name,u.last_name,
+                        """SELECT u.id,u.source_email,u.target_email,u.first_name,u.middle_name,u.last_name,
                                   u.computer_number,u.rackspace_status,u.cloudiway_status,
                                   u.migration_status,u.progress_percent,u.error_message,
                                   u.cloudiway_object_id,u.updated_at,ubm.row_order,
+                                  u.provisioning_status,u.ad_match_status,u.ad_object_guid,
+                                  u.ad_distinguished_name,u.ad_candidate_json,u.ad_conflict_reason,
+                                  u.ad_created_by_app,u.ad_enabled_status,u.ad_group_status,
+                                  u.ad_manual_override,u.ad_resolution_note,u.entra_status,
+                                  u.entra_object_id,u.license_status,u.mailbox_status,
+                                  u.provisioning_error,u.provisioning_updated_at,
                                   mb.id AS migration_batch_id,mb.batch_name AS migration_batch_name,
                                   mb.cloudiway_batch_id
                            FROM upload_batch_members ubm
@@ -1271,6 +1277,9 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                         """SELECT mb.*,
                                   COUNT(mbm.user_id) AS member_count,
                                   SUM(u.rackspace_status='manual_confirmed') AS confirmed_count,
+                                  SUM(u.provisioning_status='manual_review') AS manual_review_count,
+                                  SUM(u.provisioning_status='m365_ready') AS m365_ready_count,
+                                  SUM(u.provisioning_status IN ('assessment_error','provisioning_error')) AS provisioning_error_count,
                                   SUM(u.migration_status='migrating') AS migrating_count,
                                   SUM(u.migration_status='completed') AS completed_count,
                                   SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -1284,12 +1293,19 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                     ).fetchall()
                 ]
 
+    for member in members:
+        try:
+            member["ad_candidates"] = json.loads(member.get("ad_candidate_json") or "[]")
+        except Exception:
+            member["ad_candidates"] = []
+
     return {
         "batches": uploads,
         "batch": upload,
         "members": members,
         "available_members": available_members,
         "migration_batches": migration_batches,
+        "active_profile": get_active_profile(),
     }
 
 
