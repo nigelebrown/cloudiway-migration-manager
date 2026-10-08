@@ -805,62 +805,108 @@ async def upload_users(
     return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
 
-def _workflow_context(batch_id: int | None = None) -> dict:
+def _workflow_context(upload_batch_id: int | None = None) -> dict:
     with conn() as db:
-        batches = [
+        uploads = [
             dict(r) for r in db.execute(
-                """SELECT b.*,
-                          COUNT(m.user_id) AS member_count,
-                          SUM(u.rackspace_status='manual_confirmed') AS confirmed_count,
+                """SELECT ub.*,
+                          COUNT(ubm.user_id) AS member_count,
+                          SUM(mbm.user_id IS NOT NULL) AS assigned_count,
+                          SUM(mbm.user_id IS NULL) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
-                   FROM upload_batches b
-                   LEFT JOIN upload_batch_members m ON m.upload_batch_id=b.id
-                   LEFT JOIN users u ON u.id=m.user_id
-                   GROUP BY b.id
-                   ORDER BY b.id DESC
+                   FROM upload_batches ub
+                   LEFT JOIN upload_batch_members ubm ON ubm.upload_batch_id=ub.id
+                   LEFT JOIN users u ON u.id=ubm.user_id
+                   LEFT JOIN migration_batch_members mbm
+                          ON mbm.user_id=u.id
+                         AND mbm.migration_batch_id IN (
+                             SELECT id FROM migration_batches WHERE upload_batch_id=ub.id
+                         )
+                   GROUP BY ub.id
+                   ORDER BY ub.id DESC
                    LIMIT 100"""
             ).fetchall()
         ]
 
-        if batch_id is None and batches:
-            batch_id = int(batches[0]["id"])
+        if upload_batch_id is None and uploads:
+            upload_batch_id = int(uploads[0]["id"])
 
-        selected = None
+        upload = None
         members = []
-        if batch_id is not None:
+        available_members = []
+        migration_batches = []
+
+        if upload_batch_id is not None:
             row = db.execute(
-                """SELECT b.*,
-                          COUNT(m.user_id) AS member_count,
-                          SUM(u.rackspace_status='manual_confirmed') AS confirmed_count,
+                """SELECT ub.*,
+                          COUNT(ubm.user_id) AS member_count,
+                          SUM(mbm.user_id IS NOT NULL) AS assigned_count,
+                          SUM(mbm.user_id IS NULL) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
-                   FROM upload_batches b
-                   LEFT JOIN upload_batch_members m ON m.upload_batch_id=b.id
-                   LEFT JOIN users u ON u.id=m.user_id
-                   WHERE b.id=?
-                   GROUP BY b.id""",
-                (batch_id,),
+                   FROM upload_batches ub
+                   LEFT JOIN upload_batch_members ubm ON ubm.upload_batch_id=ub.id
+                   LEFT JOIN users u ON u.id=ubm.user_id
+                   LEFT JOIN migration_batch_members mbm
+                          ON mbm.user_id=u.id
+                         AND mbm.migration_batch_id IN (
+                             SELECT id FROM migration_batches WHERE upload_batch_id=ub.id
+                         )
+                   WHERE ub.id=?
+                   GROUP BY ub.id""",
+                (upload_batch_id,),
             ).fetchone()
-            selected = dict(row) if row else None
-            if selected:
+            upload = dict(row) if row else None
+
+            if upload:
                 members = [
                     dict(r) for r in db.execute(
                         """SELECT u.id,u.source_email,u.target_email,u.first_name,u.last_name,
                                   u.computer_number,u.rackspace_status,u.cloudiway_status,
                                   u.migration_status,u.progress_percent,u.error_message,
-                                  u.cloudiway_object_id,u.updated_at
-                           FROM upload_batch_members m
-                           JOIN users u ON u.id=m.user_id
-                           WHERE m.upload_batch_id=?
-                           ORDER BY u.id""",
-                        (batch_id,),
+                                  u.cloudiway_object_id,u.updated_at,ubm.row_order,
+                                  mb.id AS migration_batch_id,mb.batch_name AS migration_batch_name,
+                                  mb.cloudiway_batch_id
+                           FROM upload_batch_members ubm
+                           JOIN users u ON u.id=ubm.user_id
+                           LEFT JOIN migration_batch_members mbm2 ON mbm2.user_id=u.id
+                           LEFT JOIN migration_batches mb
+                                  ON mb.id=mbm2.migration_batch_id
+                                 AND mb.upload_batch_id=ubm.upload_batch_id
+                           WHERE ubm.upload_batch_id=?
+                           ORDER BY ubm.row_order,u.id""",
+                        (upload_batch_id,),
+                    ).fetchall()
+                ]
+                available_members = [m for m in members if not m.get("migration_batch_id")]
+                migration_batches = [
+                    dict(r) for r in db.execute(
+                        """SELECT mb.*,
+                                  COUNT(mbm.user_id) AS member_count,
+                                  SUM(u.rackspace_status='manual_confirmed') AS confirmed_count,
+                                  SUM(u.migration_status='migrating') AS migrating_count,
+                                  SUM(u.migration_status='completed') AS completed_count,
+                                  SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
+                           FROM migration_batches mb
+                           LEFT JOIN migration_batch_members mbm ON mbm.migration_batch_id=mb.id
+                           LEFT JOIN users u ON u.id=mbm.user_id
+                           WHERE mb.upload_batch_id=?
+                           GROUP BY mb.id
+                           ORDER BY mb.sequence_number DESC""",
+                        (upload_batch_id,),
                     ).fetchall()
                 ]
 
-    return {"batches": batches, "batch": selected, "members": members}
+    return {
+        "batches": uploads,
+        "batch": upload,
+        "members": members,
+        "available_members": available_members,
+        "migration_batches": migration_batches,
+    }
 
 
 @app.get("/workflow", response_class=HTMLResponse)
@@ -879,12 +925,12 @@ async def workflow_page(request: Request):
     return templates.TemplateResponse(request=request, name="workflow.html", context=context)
 
 
-@app.get("/workflow/{batch_id}", response_class=HTMLResponse)
-async def workflow_batch_page(request: Request, batch_id: int):
+@app.get("/workflow/{upload_batch_id}", response_class=HTMLResponse)
+async def workflow_batch_page(request: Request, upload_batch_id: int):
     redirect = _page_auth(request)
     if redirect:
         return redirect
-    context = _workflow_context(batch_id)
+    context = _workflow_context(upload_batch_id)
     if not context["batch"]:
         raise HTTPException(status_code=404, detail="Upload batch not found")
     context.update(
@@ -897,16 +943,196 @@ async def workflow_batch_page(request: Request, batch_id: int):
     return templates.TemplateResponse(request=request, name="workflow.html", context=context)
 
 
-@app.get("/workflow/{batch_id}/download")
-async def workflow_download_package(request: Request, batch_id: int):
+@app.post("/workflow/{upload_batch_id}/generate")
+async def workflow_generate_batch(
+    request: Request,
+    upload_batch_id: int,
+    quantity: int = Form(0),
+    user_ids: list[int] = Form(default=[]),
+    auto_start: str = Form(""),
+):
+    require_admin(request)
+
+    if not get_setting("cloudiway_token"):
+        request.session["workflow_error"] = (
+            "Connect Cloudiway first. Every generated migration batch must receive a Cloudiway batch number."
+        )
+        return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+
+    with conn() as db:
+        upload = db.execute(
+            "SELECT * FROM upload_batches WHERE id=?",
+            (upload_batch_id,),
+        ).fetchone()
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload batch not found")
+
+        available = db.execute(
+            """SELECT u.id,u.source_email
+               FROM upload_batch_members ubm
+               JOIN users u ON u.id=ubm.user_id
+               WHERE ubm.upload_batch_id=?
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM migration_batch_members mbm
+                     JOIN migration_batches mb ON mb.id=mbm.migration_batch_id
+                     WHERE mb.upload_batch_id=? AND mbm.user_id=u.id
+                 )
+               ORDER BY ubm.row_order,u.id""",
+            (upload_batch_id, upload_batch_id),
+        ).fetchall()
+
+        available_ids = [int(r["id"]) for r in available]
+        available_set = set(available_ids)
+
+        if user_ids:
+            selected_ids = []
+            seen = set()
+            for uid in user_ids:
+                uid = int(uid)
+                if uid in available_set and uid not in seen:
+                    selected_ids.append(uid)
+                    seen.add(uid)
+            if not selected_ids:
+                request.session["workflow_error"] = "None of the selected users are available for a new migration batch."
+                return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+        else:
+            if quantity <= 0:
+                request.session["workflow_error"] = "Enter a quantity greater than zero or select individual users."
+                return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+            if quantity > len(available_ids):
+                request.session["workflow_error"] = (
+                    f"Only {len(available_ids)} user(s) remain available in this upload."
+                )
+                return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+            selected_ids = available_ids[:quantity]
+
+        seq = int(
+            db.execute(
+                "SELECT COALESCE(MAX(sequence_number),0) n FROM migration_batches WHERE upload_batch_id=?",
+                (upload_batch_id,),
+            ).fetchone()["n"]
+            or 0
+        ) + 1
+        batch_name = f"{upload['batch_name']}-B{seq:03d}"
+
+        cursor = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   auto_start,cloudiway_batch_name,selected_count
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                upload_batch_id,
+                seq,
+                batch_name,
+                "selected",
+                1 if auto_start else 0,
+                batch_name,
+                len(selected_ids),
+            ),
+        )
+        migration_batch_id = int(cursor.lastrowid)
+
+        for uid in selected_ids:
+            db.execute(
+                """INSERT INTO migration_batch_members(migration_batch_id,user_id)
+                   VALUES(?,?)""",
+                (migration_batch_id, uid),
+            )
+
+        if upload["workflow_mode"] == "manual_bulk":
+            for uid in selected_ids:
+                password = generate_password()
+                db.execute(
+                    """UPDATE users
+                       SET generated_password_enc=?,
+                           password_reset_method='manual_bulk',
+                           rackspace_status='manual_file_generated',
+                           manual_password_generated_at=CURRENT_TIMESTAMP,
+                           manual_password_confirmed_at=NULL,
+                           cloudiway_status='not_submitted',
+                           migration_status='waiting',
+                           progress_percent=NULL,
+                           progress_detail=NULL,
+                           error_message=NULL,
+                           batch_number=?,
+                           batch_started_at=NULL,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (encrypt_secret(password), migration_batch_id, uid),
+                )
+            db.execute(
+                "UPDATE migration_batches SET workflow_status='passwords_generated' WHERE id=?",
+                (migration_batch_id,),
+            )
+        else:
+            for uid in selected_ids:
+                db.execute(
+                    """UPDATE users
+                       SET password_reset_method='automatic',
+                           rackspace_status='pending',
+                           cloudiway_status='not_submitted',
+                           migration_status='waiting',
+                           error_message=NULL,
+                           batch_number=?,
+                           batch_started_at=NULL,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (migration_batch_id, uid),
+                )
+            db.execute(
+                "UPDATE migration_batches SET workflow_status='ready_for_automatic' WHERE id=?",
+                (migration_batch_id,),
+            )
+
+    try:
+        cloud_batch_id = await ensure_migration_cloudiway_batch(migration_batch_id)
+    except Exception as exc:
+        request.session["workflow_error"] = (
+            f"Local batch {batch_name} was created, but Cloudiway batch creation failed: {exc}. "
+            "Use Retry Cloudiway Batch on the workflow page."
+        )
+        return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+
+    log_event(
+        None,
+        "migration_batch_generated",
+        f"{batch_name}: selected {len(selected_ids)} user(s); Cloudiway batch {cloud_batch_id}",
+    )
+
+    if upload["workflow_mode"] == "manual_bulk":
+        archive, archive_name = _build_rackspace_password_package(migration_batch_id)
+        return StreamingResponse(
+            archive,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{archive_name}"'},
+        )
+
+    if auto_start:
+        try:
+            await start_migration_batch(migration_batch_id)
+        except Exception as exc:
+            request.session["workflow_error"] = str(exc)
+    else:
+        request.session["workflow_notice"] = (
+            f"{batch_name} created with {len(selected_ids)} user(s). "
+            f"Cloudiway batch ID {cloud_batch_id} is ready."
+        )
+    return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+
+
+@app.get("/migration-batch/{migration_batch_id}/download")
+async def migration_batch_download(request: Request, migration_batch_id: int):
     require_admin(request)
     try:
-        archive, archive_name = _build_rackspace_password_package(batch_id)
+        archive, archive_name = _build_rackspace_password_package(migration_batch_id)
     except Exception as exc:
-        request.session["workflow_error"] = str(exc)
-        return RedirectResponse(f"/workflow/{batch_id}", 303)
-
-    log_event(None, "workflow_package_downloaded", f"Upload batch {batch_id}: {archive_name}")
+        raise HTTPException(status_code=400, detail=str(exc))
+    log_event(
+        None,
+        "migration_batch_package_downloaded",
+        f"Migration batch {migration_batch_id}: {archive_name}",
+    )
     return StreamingResponse(
         archive,
         media_type="application/zip",
@@ -914,37 +1140,45 @@ async def workflow_download_package(request: Request, batch_id: int):
     )
 
 
-@app.post("/workflow/{batch_id}/retry-cloudiway")
-async def workflow_retry_cloudiway(request: Request, batch_id: int):
+@app.post("/migration-batch/{migration_batch_id}/retry-cloudiway")
+async def migration_batch_retry_cloudiway(request: Request, migration_batch_id: int):
     require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            "SELECT upload_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
     try:
-        cloud_batch_id = await ensure_upload_cloudiway_batch(batch_id)
-        request.session["workflow_notice"] = (
-            f"Cloudiway batch is ready. Cloudiway batch ID: {cloud_batch_id}."
-        )
+        cloud_batch_id = await ensure_migration_cloudiway_batch(migration_batch_id)
+        request.session["workflow_notice"] = f"Cloudiway batch ID {cloud_batch_id} is ready."
     except Exception as exc:
         request.session["workflow_error"] = str(exc)
-    return RedirectResponse(f"/workflow/{batch_id}", 303)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
 
-@app.post("/workflow/{batch_id}/confirm")
-async def workflow_confirm_rackspace(
+@app.post("/migration-batch/{migration_batch_id}/confirm")
+async def migration_batch_confirm(
     request: Request,
-    batch_id: int,
+    migration_batch_id: int,
     file: UploadFile = File(...),
 ):
     require_admin(request)
 
     with conn() as db:
         batch = db.execute(
-            "SELECT * FROM upload_batches WHERE id=?",
-            (batch_id,),
+            """SELECT mb.*,ub.workflow_mode
+               FROM migration_batches mb
+               JOIN upload_batches ub ON ub.id=mb.upload_batch_id
+               WHERE mb.id=?""",
+            (migration_batch_id,),
         ).fetchone()
     if not batch:
-        raise HTTPException(status_code=404, detail="Upload batch not found")
+        raise HTTPException(status_code=404, detail="Migration batch not found")
     if batch["workflow_mode"] != "manual_bulk":
-        request.session["workflow_error"] = "Rackspace confirmation upload only applies to manual bulk batches."
-        return RedirectResponse(f"/workflow/{batch_id}", 303)
+        request.session["workflow_error"] = "Confirmation upload is only required for manual Rackspace batches."
+        return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
     raw = await file.read()
     try:
@@ -954,7 +1188,7 @@ async def workflow_confirm_rackspace(
             df = pd.read_excel(io.BytesIO(raw), dtype=str).fillna("")
     except Exception as exc:
         request.session["workflow_error"] = f"Could not read confirmation file: {exc}"
-        return RedirectResponse(f"/workflow/{batch_id}", 303)
+        return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
     columns = {str(col).strip().lower(): col for col in df.columns}
     username_col = (
@@ -966,15 +1200,15 @@ async def workflow_confirm_rackspace(
     password_col = columns.get("password")
     if not username_col or not password_col:
         request.session["workflow_error"] = "Confirmation file must contain Username/Email and Password columns."
-        return RedirectResponse(f"/workflow/{batch_id}", 303)
+        return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
     with conn() as db:
         member_rows = db.execute(
             """SELECT u.id,u.source_email,u.generated_password_enc,u.password_reset_method
-               FROM upload_batch_members m
-               JOIN users u ON u.id=m.user_id
-               WHERE m.upload_batch_id=?""",
-            (batch_id,),
+               FROM migration_batch_members mbm
+               JOIN users u ON u.id=mbm.user_id
+               WHERE mbm.migration_batch_id=?""",
+            (migration_batch_id,),
         ).fetchall()
 
     by_full = {str(r["source_email"]).lower(): r for r in member_rows}
@@ -1027,32 +1261,29 @@ async def workflow_confirm_rackspace(
             )
 
     member_count = len(member_rows)
+    confirmed_total = 0
     with conn() as db:
         confirmed_total = int(
             db.execute(
                 """SELECT COUNT(*) c
-                   FROM upload_batch_members m
-                   JOIN users u ON u.id=m.user_id
-                   WHERE m.upload_batch_id=? AND u.rackspace_status='manual_confirmed'""",
-                (batch_id,),
+                   FROM migration_batch_members mbm
+                   JOIN users u ON u.id=mbm.user_id
+                   WHERE mbm.migration_batch_id=? AND u.rackspace_status='manual_confirmed'""",
+                (migration_batch_id,),
             ).fetchone()["c"]
         )
-
-    all_confirmed = member_count > 0 and confirmed_total == member_count
-    with conn() as db:
+        all_confirmed = member_count > 0 and confirmed_total == member_count
         db.execute(
-            """UPDATE upload_batches
-               SET workflow_status=?,last_error=?,updated_at=CURRENT_TIMESTAMP
+            """UPDATE migration_batches
+               SET confirmed_count=?,workflow_status=?,last_error=?,updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
             (
+                confirmed_total,
                 "passwords_confirmed" if all_confirmed else "confirmation_partial",
                 None if all_confirmed else f"{confirmed_total}/{member_count} users confirmed",
-                batch_id,
+                migration_batch_id,
             ),
         )
-
-    for uid in confirmed_ids:
-        log_event(uid, "manual_password_confirmed", f"Confirmed through upload batch {batch_id}")
 
     message = (
         f"Confirmed {confirmed_total}/{member_count} user(s). "
@@ -1061,14 +1292,14 @@ async def workflow_confirm_rackspace(
 
     if all_confirmed:
         try:
-            prepared = await prepare_manual_upload_batch(batch_id)
+            prepared = await prepare_migration_batch(migration_batch_id)
             if prepared.get("ready"):
                 message += (
-                    f" Cloudiway preparation complete; {prepared.get('users', 0)} user(s) "
-                    f"assigned to Cloudiway batch {prepared.get('cloudiway_batch_id')}."
+                    f" Cloudiway preparation complete; {prepared.get('users', 0)} user(s) assigned "
+                    f"to Cloudiway batch {prepared.get('cloudiway_batch_id')}."
                 )
                 if int(batch["auto_start"] or 0) == 1:
-                    started = await start_upload_batch(batch_id)
+                    started = await start_migration_batch(migration_batch_id)
                     if started.get("started"):
                         message += " Migration started automatically."
                     else:
@@ -1077,34 +1308,48 @@ async def workflow_confirm_rackspace(
                 message += " Cloudiway preparation is waiting: " + str(prepared.get("reason") or "review required")
         except Exception as exc:
             request.session["workflow_error"] = message + " Preparation failed: " + str(exc)
-            return RedirectResponse(f"/workflow/{batch_id}", 303)
+            return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
     request.session["workflow_notice"] = message
-    return RedirectResponse(f"/workflow/{batch_id}", 303)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
 
-@app.post("/workflow/{batch_id}/prepare")
-async def workflow_prepare(request: Request, batch_id: int):
+@app.post("/migration-batch/{migration_batch_id}/prepare")
+async def migration_batch_prepare(request: Request, migration_batch_id: int):
     require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            "SELECT upload_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
     try:
-        result = await prepare_manual_upload_batch(batch_id)
+        result = await prepare_migration_batch(migration_batch_id)
         if result.get("ready"):
             request.session["workflow_notice"] = (
-                f"Cloudiway preparation complete. {result.get('users', 0)} user(s) assigned "
-                f"to Cloudiway batch {result.get('cloudiway_batch_id')}."
+                f"Cloudiway preparation complete for {result.get('users', 0)} user(s); "
+                f"batch ID {result.get('cloudiway_batch_id')}."
             )
         else:
             request.session["workflow_error"] = str(result.get("reason") or "Batch is not ready")
     except Exception as exc:
         request.session["workflow_error"] = str(exc)
-    return RedirectResponse(f"/workflow/{batch_id}", 303)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
 
-@app.post("/workflow/{batch_id}/start")
-async def workflow_start(request: Request, batch_id: int):
+@app.post("/migration-batch/{migration_batch_id}/start")
+async def migration_batch_start(request: Request, migration_batch_id: int):
     require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            "SELECT upload_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
     try:
-        result = await start_upload_batch(batch_id)
+        result = await start_migration_batch(migration_batch_id)
         if result.get("started"):
             request.session["workflow_notice"] = (
                 f"Migration started for {result.get('users_started', 0)} user(s) in "
@@ -1114,7 +1359,7 @@ async def workflow_start(request: Request, batch_id: int):
             request.session["workflow_error"] = str(result.get("reason") or "Batch could not be started")
     except Exception as exc:
         request.session["workflow_error"] = str(exc)
-    return RedirectResponse(f"/workflow/{batch_id}", 303)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
 
 
 @app.get("/manual-rackspace", response_class=HTMLResponse)
