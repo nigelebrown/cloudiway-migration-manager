@@ -32,6 +32,7 @@
 <div class="section"><h3>Active Directory (LDAPS)</h3><div class="fields">
 <div class="field"><label>Domain controller / host</label><input name="ad_host" value="{{profile.ad_host if profile else ''}}" placeholder="dc01.example.local"></div>
 <div class="field"><label>LDAPS port</label><input type="number" name="ad_port" value="{{profile.ad_port if profile else 636}}"></div>
+<div class="field"><label>Internal CA certificate path (optional)</label><input name="ad_ca_cert_path" value="{{profile.ad_ca_cert_path if profile else ''}}" placeholder="/etc/ssl/certs/jcf-root-ca.pem"></div>
 <div class="field"><label>Base DN</label><input name="ad_base_dn" value="{{profile.ad_base_dn if profile else ''}}" placeholder="DC=example,DC=local"></div>
 <div class="field"><label>Delegated service account</label><input name="ad_bind_username" value="{{profile.ad_bind_username if profile else ''}}" placeholder="DOMAIN\svc_m365_migration"></div>
 <div class="field"><label>Service account password</label><input type="password" name="ad_bind_password" placeholder="{{'Leave blank to keep saved password' if profile else 'Required'}}"></div>
@@ -43,6 +44,7 @@
 </div>
 <div class="checks">
 <label><input type="checkbox" name="ad_use_ssl" value="1" {% if not profile or profile.ad_use_ssl %}checked{% endif %}> Use LDAPS</label>
+<label><input type="checkbox" name="ad_tls_validate" value="1" {% if not profile or profile.ad_tls_validate %}checked{% endif %}> Validate AD TLS certificate</label>
 <label><input type="checkbox" name="ad_force_password_change" value="1" {% if not profile or profile.ad_force_password_change %}checked{% endif %}> User must change password at next logon</label>
 <label><input type="checkbox" name="ad_allow_user_creation" value="1" {% if profile and profile.ad_allow_user_creation %}checked{% endif %}> Permit creation of missing users</label>
 <label><input type="checkbox" name="ad_allow_group_changes" value="1" {% if profile and profile.ad_allow_group_changes %}checked{% endif %}> Permit licensing-group membership changes</label>
