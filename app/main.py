@@ -1199,10 +1199,13 @@ async def upload_users(
                 (upload_batch_id, user_id, row_order),
             )
 
-            # Normal/manual workflows stage users without passwords. In
-            # existing-password mode, the supplied source password is encrypted
-            # immediately and is never written to logs or rendered in the UI.
-            stored_password = encrypt_secret(supplied_password) if workflow_mode == "existing_password" else None
+            # Keep Cloudiway source credentials in dedicated fields so an
+            # uploaded existing password can never be confused with a password
+            # generated/reset by the application.
+            source_credential_username = src if workflow_mode == "existing_password" else None
+            source_credential_password_enc = (
+                encrypt_secret(supplied_password) if workflow_mode == "existing_password" else None
+            )
             rackspace_state = (
                 "existing_password"
                 if workflow_mode == "existing_password"
@@ -1211,7 +1214,10 @@ async def upload_users(
             provisioning_state = "bypassed" if workflow_mode == "existing_password" else "not_checked"
             db.execute(
                 """UPDATE users
-                   SET generated_password_enc=?,
+                   SET generated_password_enc=NULL,
+                       source_credential_username=?,
+                       source_credential_password_enc=?,
+                       source_credential_origin=?,
                        password_reset_method=?,
                        manual_password_generated_at=NULL,
                        manual_password_confirmed_at=NULL,
@@ -1231,7 +1237,9 @@ async def upload_users(
                        updated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
                 (
-                    stored_password,
+                    source_credential_username,
+                    source_credential_password_enc,
+                    "uploaded_excel" if workflow_mode == "existing_password" else None,
                     workflow_mode,
                     rackspace_state,
                     provisioning_state,
