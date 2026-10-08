@@ -747,6 +747,13 @@ def classify_cloudiway_issue(progress_data, logs_data=None) -> tuple[str | None,
             "has access to it.",
         )
 
+    if "cannot connect imap client" in combined:
+        return (
+            "failed",
+            "source_imap_connection_failed",
+            "Cloudiway could not connect to the source IMAP mailbox. Verify the source mailbox credentials and the IMAP connector host, port, and TLS settings before retrying.",
+        )
+
     if "unable to connect to mailbox in the source" in combined:
         return (
             "failed",
