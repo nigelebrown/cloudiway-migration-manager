@@ -220,7 +220,7 @@ async def ensure_migration_cloudiway_batch(migration_batch_id: int) -> int:
     """Ensure one incremental migration batch has its own Cloudiway Mail Batch."""
     with conn() as db:
         batch = db.execute(
-            """SELECT mb.*,ub.batch_name AS upload_name
+            """SELECT mb.*,ub.batch_name AS upload_name,ub.workflow_mode
                FROM migration_batches mb
                JOIN upload_batches ub ON ub.id=mb.upload_batch_id
                WHERE mb.id=?""",
@@ -249,9 +249,14 @@ async def ensure_migration_cloudiway_batch(migration_batch_id: int) -> int:
             db.execute(
                 """UPDATE migration_batches
                    SET cloudiway_batch_id=?,cloudiway_batch_name=?,
+                       workflow_status=CASE
+                           WHEN workflow_status='cloudiway_batch_error' AND ?='existing_password' THEN 'ready_for_cloudiway'
+                           WHEN workflow_status='cloudiway_batch_error' THEN 'identity_pending'
+                           ELSE workflow_status
+                       END,
                        last_error=NULL,updated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
-                (cloud_batch_id, name, migration_batch_id),
+                (cloud_batch_id, name, batch.get("workflow_mode") or "", migration_batch_id),
             )
         log_event(
             None,
