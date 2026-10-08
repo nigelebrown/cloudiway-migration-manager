@@ -325,7 +325,7 @@ def provision_user(user_id: int) -> dict:
     client = ad_client_for_profile(profile)
 
     status = user.get("ad_match_status")
-    if status in ("confirmed", "manual_resolved"):
+    if status in ("confirmed", "manual_resolved", "created"):
         if user.get("ad_enabled_status") != "enabled":
             raise RuntimeError("Existing AD account is not enabled; manual correction is required")
         user_dn = user.get("ad_distinguished_name")
@@ -361,12 +361,19 @@ def provision_user(user_id: int) -> dict:
     with conn() as db:
         db.execute(
             """UPDATE users
-               SET ad_created_by_app=?,ad_distinguished_name=?,ad_object_guid=?,
+               SET ad_created_by_app=?,ad_match_status=?,
+                   ad_enabled_status='enabled',ad_distinguished_name=?,ad_object_guid=?,
                    ad_group_status='member',provisioning_status='sync_pending',
                    entra_status='pending',license_status='pending',mailbox_status='pending',
                    provisioning_error=NULL,provisioning_updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
-            (1 if created else int(user.get("ad_created_by_app") or 0), user_dn, object_guid, user_id),
+            (
+                1 if created else int(user.get("ad_created_by_app") or 0),
+                "created" if created else status,
+                user_dn,
+                object_guid,
+                user_id,
+            ),
         )
     log_event(
         user_id,
