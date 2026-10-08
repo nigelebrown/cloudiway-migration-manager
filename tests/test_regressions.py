@@ -21,6 +21,16 @@ def isolated_db():
     yield
 
 
+def _enable_upload_batch_mock(monkeypatch, cloud_batch_id=77):
+    from app import main as main_module
+
+    async def fake_cloud_batch(upload_batch_id):
+        return cloud_batch_id
+
+    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
+    monkeypatch.setattr(main_module, "ensure_upload_cloudiway_batch", fake_cloud_batch)
+
+
 def test_progress_one_percent_is_not_complete():
     status, pct, _ = service.parse_progress({"status": "Running", "percentage": 1})
     assert status == "migrating"
@@ -94,7 +104,8 @@ def test_login_rate_limit():
         assert 429 in codes
 
 
-def test_reupload_does_not_change_inflight_target():
+def test_reupload_does_not_change_inflight_target(monkeypatch):
+    _enable_upload_batch_mock(monkeypatch)
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         with conn() as db:
@@ -109,7 +120,7 @@ def test_reupload_does_not_change_inflight_target():
             files={"file": ("users.csv", csv, "text/csv")},
             follow_redirects=False,
         )
-        assert r.status_code == 303
+        assert r.status_code == 400
         with conn() as db:
             target = db.execute(
                 "SELECT target_email FROM users WHERE source_email=?",
@@ -118,7 +129,8 @@ def test_reupload_does_not_change_inflight_target():
         assert target == "u1@jcf.gov.jm"
 
 
-def test_blank_target_and_spaced_name_headers_are_normalized():
+def test_blank_target_and_spaced_name_headers_are_normalized(monkeypatch):
+    _enable_upload_batch_mock(monkeypatch)
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         csv = (
@@ -141,7 +153,8 @@ def test_blank_target_and_spaced_name_headers_are_normalized():
         assert row["last_name"] == "Lee"
 
 
-def test_blank_names_do_not_become_nan():
+def test_blank_names_do_not_become_nan(monkeypatch):
+    _enable_upload_batch_mock(monkeypatch)
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         csv = b"source_email,target_email,first_name,last_name\na@x.com,a@y.com,,\n"
@@ -324,7 +337,8 @@ def test_diagnostics_download_requires_admin():
         assert r.status_code == 401
 
 
-def test_upload_accepts_rackspace_template_with_target_email():
+def test_upload_accepts_rackspace_template_with_target_email(monkeypatch):
+    _enable_upload_batch_mock(monkeypatch)
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         csv_data = (
