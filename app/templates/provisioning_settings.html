@@ -1,0 +1,99 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Provisioning Environments</title>
+<style>
+:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}body{margin:0;background:#07111f;color:#e5e7eb}.wrap{max-width:1450px;margin:0 auto;padding:24px}a{color:#38bdf8;text-decoration:none}
+.top{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.top h1{margin-right:auto}.grid{display:grid;grid-template-columns:300px 1fr;gap:16px}.card{background:#101a2b;border:1px solid #22324a;border-radius:14px;padding:18px}.profile{display:block;padding:12px;border-bottom:1px solid #22324a;color:#e5e7eb}.profile.active{background:#17324b}.badge{display:inline-block;padding:3px 7px;border-radius:999px;font-size:11px;font-weight:800}.test{background:#164e63}.prod{background:#7f1d1d}.ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fde68a}.notice{padding:11px 14px;border-radius:8px;margin:12px 0}.okbox{background:#064e3b}.errbox{background:#451a1a}.warning{background:#422006}.fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin:5px 0}label{display:block;font-size:13px;color:#cbd5e1;margin-bottom:5px}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#fff}textarea{min-height:80px}.checks{display:flex;gap:18px;flex-wrap:wrap;margin:12px 0}.checks label{display:flex;gap:7px;align-items:center}.checks input{width:auto}button,.btn{padding:10px 13px;border:0;border-radius:8px;background:#0284c7;color:#fff;font-weight:800;cursor:pointer}.secondary{background:#334155}.danger{background:#b91c1c}.success{background:#047857}.section{border-top:1px solid #334155;margin-top:18px;padding-top:14px}pre{white-space:pre-wrap;background:#020617;padding:12px;border-radius:8px;max-height:330px;overflow:auto}.hint{color:#94a3b8;font-size:12px}@media(max-width:900px){.grid,.fields{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<div class="top"><h1>AD / Microsoft 365 Provisioning Environments</h1><a href="/settings">Connections</a><a href="/workflow">Migration Workflow</a><a href="/dashboard">Dashboard</a></div>
+{% if notice %}<div class="notice okbox">{{notice}}</div>{% endif %}{% if error %}<div class="notice errbox">{{error}}</div>{% endif %}
+<div class="grid">
+<div class="card"><h3>Profiles</h3>
+<a class="profile" href="/settings/provisioning"><b>+ New profile</b></a>
+{% for p in profiles %}
+<a class="profile {% if profile and profile.id==p.id %}active{% endif %}" href="/settings/provisioning?profile_id={{p.id}}">
+<div><b>{{p.name}}</b> <span class="badge {{'prod' if p.environment_type=='PRODUCTION' else 'test'}}">{{p.environment_type}}</span></div>
+<div class="hint">{{'ACTIVE' if p.is_active else 'inactive'}} · writes {{'ON' if p.writes_enabled else 'off'}} · stop {{'ACTIVE' if p.emergency_stop else 'clear'}}</div>
+</a>
+{% endfor %}
+</div>
+
+<div class="card">
+<h2>{{profile.name if profile else 'New Environment Profile'}}</h2>
+{% if profile and profile.environment_type=='PRODUCTION' %}<div class="notice warning"><b>PRODUCTION profile.</b> Activation and write enablement require explicit confirmations. Keep delegated permissions limited to the configured OU and licensing group.</div>{% endif %}
+<form method="post" action="/settings/provisioning/save">
+<input type="hidden" name="profile_id" value="{{profile.id if profile else 0}}">
+<div class="fields">
+<div class="field"><label>Profile name</label><input name="name" value="{{profile.name if profile else 'JCF TEST'}}" required></div>
+<div class="field"><label>Environment type</label><select name="environment_type"><option value="TEST" {% if not profile or profile.environment_type=='TEST' %}selected{% endif %}>TEST</option><option value="PRODUCTION" {% if profile and profile.environment_type=='PRODUCTION' %}selected{% endif %}>PRODUCTION</option></select></div>
+<div class="field"><label>Maximum provisioning batch</label><input type="number" min="1" max="5000" name="production_max_batch" value="{{profile.production_max_batch if profile else 100}}"></div>
+<div class="field"><label>VPN / network profile name</label><input name="vpn_profile_name" value="{{profile.vpn_profile_name if profile else ''}}" placeholder="Reference only, e.g. JCF-ICT-VPN"></div>
+</div>
+
+<div class="section"><h3>Active Directory (LDAPS)</h3><div class="fields">
+<div class="field"><label>Domain controller / host</label><input name="ad_host" value="{{profile.ad_host if profile else ''}}" placeholder="dc01.example.local"></div>
+<div class="field"><label>LDAPS port</label><input type="number" name="ad_port" value="{{profile.ad_port if profile else 636}}"></div>
+<div class="field"><label>Base DN</label><input name="ad_base_dn" value="{{profile.ad_base_dn if profile else ''}}" placeholder="DC=example,DC=local"></div>
+<div class="field"><label>Delegated service account</label><input name="ad_bind_username" value="{{profile.ad_bind_username if profile else ''}}" placeholder="DOMAIN\svc_m365_migration"></div>
+<div class="field"><label>Service account password</label><input type="password" name="ad_bind_password" placeholder="{{'Leave blank to keep saved password' if profile else 'Required'}}"></div>
+<div class="field"><label>Provisioning OU</label><input name="ad_target_ou" value="{{profile.ad_target_ou if profile else ''}}" placeholder="OU=M365-Migration,OU=Users,DC=example,DC=local"></div>
+<div class="field"><label>M365 licensing AD group DN</label><input name="ad_license_group_dn" value="{{profile.ad_license_group_dn if profile else ''}}" placeholder="CN=M365-E3,OU=Groups,DC=example,DC=local"></div>
+<div class="field"><label>Computer Number AD attribute</label><input name="ad_computer_number_attribute" value="{{profile.ad_computer_number_attribute if profile else ''}}" placeholder="extensionAttribute7"></div>
+<div class="field"><label>UPN suffix</label><input name="ad_upn_suffix" value="{{profile.ad_upn_suffix if profile else ''}}" placeholder="jcf.gov.jm"></div>
+<div class="field"><label>Temporary password for newly created AD users only</label><input type="password" name="ad_default_password" placeholder="{{'Leave blank to keep saved password' if profile else 'Required before creation is enabled'}}"></div>
+</div>
+<div class="checks">
+<label><input type="checkbox" name="ad_use_ssl" value="1" {% if not profile or profile.ad_use_ssl %}checked{% endif %}> Use LDAPS</label>
+<label><input type="checkbox" name="ad_force_password_change" value="1" {% if not profile or profile.ad_force_password_change %}checked{% endif %}> User must change password at next logon</label>
+<label><input type="checkbox" name="ad_allow_user_creation" value="1" {% if profile and profile.ad_allow_user_creation %}checked{% endif %}> Permit creation of missing users</label>
+<label><input type="checkbox" name="ad_allow_group_changes" value="1" {% if profile and profile.ad_allow_group_changes %}checked{% endif %}> Permit licensing-group membership changes</label>
+</div></div>
+
+<div class="section"><h3>Microsoft Entra / Microsoft 365</h3><div class="fields">
+<div class="field"><label>Tenant ID</label><input name="graph_tenant_id" value="{{profile.graph_tenant_id if profile else ''}}"></div>
+<div class="field"><label>Application / Client ID</label><input name="graph_client_id" value="{{profile.graph_client_id if profile else ''}}"></div>
+<div class="field"><label>Client secret</label><input type="password" name="graph_client_secret" placeholder="{{'Leave blank to keep saved secret' if profile else ''}}"></div>
+<div class="field"><label>Required licence SKU part number</label><input name="graph_required_sku" value="{{profile.graph_required_sku if profile else ''}}" placeholder="e.g. SPE_E3 or ENTERPRISEPACK"></div>
+</div><p class="hint">The app waits for the Entra user, required licence and Exchange mailbox before unlocking the Rackspace/Cloudiway migration stage.</p></div>
+
+<div class="section"><h3>Entra Connect Sync Agent (optional)</h3><div class="fields">
+<div class="field"><label>Sync agent URL</label><input name="sync_agent_url" value="{{profile.sync_agent_url if profile else ''}}" placeholder="https://syncagent.example.local:9443"></div>
+<div class="field"><label>Sync agent token</label><input type="password" name="sync_agent_token" placeholder="{{'Leave blank to keep saved token' if profile else ''}}"></div>
+</div><p class="hint">If not configured, the app waits for the normal Entra Connect synchronization schedule.</p></div>
+
+<div class="section"><h3>Authoritative SQL Source (saved for lookup/validation)</h3><div class="fields">
+<div class="field"><label>SQL Server</label><input name="sql_host" value="{{profile.sql_host if profile else ''}}"></div>
+<div class="field"><label>Port</label><input type="number" name="sql_port" value="{{profile.sql_port if profile else 1433}}"></div>
+<div class="field"><label>Database</label><input name="sql_database" value="{{profile.sql_database if profile else ''}}"></div>
+<div class="field"><label>Read-only username</label><input name="sql_username" value="{{profile.sql_username if profile else ''}}"></div>
+<div class="field"><label>Password</label><input type="password" name="sql_password" placeholder="{{'Leave blank to keep saved password' if profile else ''}}"></div>
+<div class="field"><label>Approved source view / object</label><input name="sql_source_view" value="{{profile.sql_source_view if profile else ''}}" placeholder="dbo.vw_M365MigrationIdentity"></div>
+</div></div>
+
+<div class="section"><div class="field"><label>Network / VPN notes</label><textarea name="network_notes">{{profile.network_notes if profile else ''}}</textarea></div></div>
+<button>Save Environment Profile</button>
+</form>
+
+{% if profile %}
+<div class="section"><h3>Safety & Activation</h3>
+<p>Status: <b>{{'ACTIVE' if profile.is_active else 'inactive'}}</b> · Directory writes: <b class="{{'ok' if profile.writes_enabled else 'warn'}}">{{'ENABLED' if profile.writes_enabled else 'DISABLED'}}</b> · Emergency Stop: <b class="{{'bad' if profile.emergency_stop else 'ok'}}">{{'ACTIVE' if profile.emergency_stop else 'CLEAR'}}</b></p>
+<div class="checks">
+<form method="post" action="/settings/provisioning/{{profile.id}}/activate"><input name="confirmation" placeholder="{{'Type PRODUCTION' if profile.environment_type=='PRODUCTION' else 'No confirmation required for TEST'}}"><button>Activate Profile</button></form>
+{% if not profile.writes_enabled %}
+<form method="post" action="/settings/provisioning/{{profile.id}}/writes"><input type="hidden" name="enable" value="1"><input name="confirmation" placeholder="Type {{'ENABLE PRODUCTION WRITES' if profile.environment_type=='PRODUCTION' else 'ENABLE TEST WRITES'}}"><button class="success">Enable Directory Writes</button></form>
+{% else %}
+<form method="post" action="/settings/provisioning/{{profile.id}}/writes"><input type="hidden" name="enable" value="0"><button class="secondary">Disable Directory Writes</button></form>
+{% endif %}
+{% if not profile.emergency_stop %}
+<form method="post" action="/settings/provisioning/{{profile.id}}/emergency-stop"><button class="danger">EMERGENCY STOP</button></form>
+{% else %}
+<form method="post" action="/settings/provisioning/{{profile.id}}/clear-stop"><input name="confirmation" placeholder="Type CLEAR STOP"><button class="secondary">Clear Emergency Stop</button></form>
+{% endif %}
+</div>
+<p><button type="button" class="secondary" onclick="testProfile({{profile.id}})">Test AD / Graph / SQL / Sync Connectivity</button></p>
+<pre id="testOut">No connectivity test run yet.</pre>
+</div>
+{% endif %}
+</div></div></div>
+<script>
+async function testProfile(id){const out=document.getElementById('testOut');out.textContent='Testing environment...';const r=await fetch('/settings/provisioning/'+id+'/test',{method:'POST'});let d;try{d=await r.json()}catch(e){d={ok:false,message:'Unexpected response '+r.status}}out.textContent=JSON.stringify(d,null,2)}
+</script></body></html>
