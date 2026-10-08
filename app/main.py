@@ -1616,9 +1616,14 @@ async def provisioning_user_resolve(
     try:
         resolve_manual_review(user_id, candidate_dn, resolution_note)
         provision_result = provision_user(user_id)
+        batch_result = await provision_migration_batch(int(row["migration_batch_id"]))
         request.session["workflow_notice"] = (
             "Manual identity review resolved for this user and provisioning continued. "
-            + ("A new account was created." if provision_result.get("created") else "The verified existing AD account was used.")
+            + ("A new account was created. " if provision_result.get("created") else "The verified existing AD account was used. ")
+            + (
+                batch_result.get("sync_note")
+                or f"{batch_result.get('manual_review', 0)} user(s) still require review."
+            )
         )
     except Exception as exc:
         request.session["workflow_error"] = str(exc)
