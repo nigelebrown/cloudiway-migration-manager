@@ -2496,12 +2496,40 @@ async def reveal_password(request: Request, user_id: int):
     require_admin(request)
     with conn() as db:
         row = db.execute(
-            "SELECT source_email,generated_password_enc FROM users WHERE id=?", (user_id,)
+            """SELECT source_email,password_reset_method,generated_password_enc,
+                      source_credential_username,source_credential_password_enc,
+                      source_credential_origin
+               FROM users WHERE id=?""",
+            (user_id,),
         ).fetchone()
-    if not row or not row["generated_password_enc"]:
-        raise HTTPException(status_code=404, detail="No generated password is stored for this user")
-    log_event(user_id, "password_revealed", "Administrator revealed the stored temporary password")
-    return {"source_email": row["source_email"], "password": decrypt_secret(row["generated_password_enc"])}
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if row["password_reset_method"] == "existing_password":
+        encrypted = row["source_credential_password_enc"] or row["generated_password_enc"]
+        if not encrypted:
+            raise HTTPException(status_code=404, detail="No uploaded source password is stored for this user")
+        username = row["source_credential_username"] or row["source_email"]
+        password = decrypt_secret(encrypted)
+        origin = row["source_credential_origin"] or "legacy_uploaded_excel"
+    else:
+        if not row["generated_password_enc"]:
+            raise HTTPException(status_code=404, detail="No generated password is stored for this user")
+        username = row["source_email"]
+        password = decrypt_secret(row["generated_password_enc"])
+        origin = "generated_or_reset"
+
+    log_event(
+        user_id,
+        "password_revealed",
+        f"Administrator revealed stored source credential; username={username}; source={origin}",
+    )
+    return {
+        "source_email": row["source_email"],
+        "username_sent_to_cloudiway": username,
+        "password": password,
+        "password_source": origin,
+    }
 
 
 @app.get("/users/{user_id}/cloudiway-logs")
