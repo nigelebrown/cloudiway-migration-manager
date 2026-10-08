@@ -464,3 +464,82 @@ def test_dashboard_exposes_migration_batch_name_and_cloudiway_batch(monkeypatch)
         assert len(batched) == 5
         assert all(u["cloudiway_batch_id"] for u in batched)
         assert all("-B001" in u["migration_batch_name"] for u in batched)
+
+
+@pytest.mark.asyncio
+async def test_start_ready_batch_does_not_repeat_preparation(monkeypatch):
+    from app import service
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
+               ) VALUES(?,?,?,?,?)""",
+            ("JCF-TEST-U00002", "manual_bulk", "partially_batched", 1, 1),
+        )
+        upload_id = up.lastrowid
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,password_reset_method,rackspace_status,
+                   cloudiway_status,cloudiway_object_id,migration_status
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                "ready@jcf.gov.jm",
+                "ready@jcf.gov.jm",
+                "manual_bulk",
+                "manual_confirmed",
+                "credentials_set",
+                99001,
+                "ready",
+            ),
+        )
+        uid = db.execute(
+            "SELECT id FROM users WHERE source_email='ready@jcf.gov.jm'"
+        ).fetchone()["id"]
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   cloudiway_batch_id,selected_count,confirmed_count
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (upload_id, 1, "JCF-TEST-U00002-B001", "ready_to_migrate", 88100, 1, 1),
+        )
+        migration_batch_id = mb.lastrowid
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (migration_batch_id, uid),
+        )
+
+    calls = {"prepare": 0, "start": 0}
+
+    async def should_not_prepare(_):
+        calls["prepare"] += 1
+        raise AssertionError("ready batch should not be prepared twice")
+
+    class FakeCloud:
+        async def start_migration(self, object_ids):
+            calls["start"] += 1
+            assert object_ids == [99001]
+            return {"ok": True}
+
+    async def fake_ready():
+        return FakeCloud()
+
+    monkeypatch.setattr(service, "prepare_migration_batch", should_not_prepare)
+    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
+
+    result = await service.start_migration_batch(migration_batch_id)
+    assert result["started"] is True
+    assert calls["prepare"] == 0
+    assert calls["start"] == 1
+
+    with conn() as db:
+        user_state = db.execute(
+            "SELECT migration_status FROM users WHERE id=?",
+            (uid,),
+        ).fetchone()["migration_status"]
+        batch_state = db.execute(
+            "SELECT workflow_status FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()["workflow_status"]
+    assert user_state == "migrating"
+    assert batch_state == "migrating"
