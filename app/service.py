@@ -962,6 +962,54 @@ async def prepare_manual_user(user_id: int) -> int:
     return object_id
 
 
+async def prepare_existing_password_user(user_id: int) -> int:
+    """Register an administrator-supplied existing source password with Cloudiway.
+
+    This path intentionally performs no Active Directory changes and no Rackspace
+    password reset. The password must have been supplied in the upload and is
+    stored encrypted at rest.
+    """
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row:
+        raise RuntimeError(f"User {user_id} not found")
+    user = dict(row)
+
+    if user.get("password_reset_method") != "existing_password":
+        raise RuntimeError("User is not assigned to the existing-password Cloudiway-only workflow")
+    if not user.get("generated_password_enc"):
+        raise RuntimeError("No supplied source password is stored for this user")
+
+    password = decrypt_secret(user["generated_password_enc"])
+    cloud = await _cloudiway_client_ready()
+    object_id = await ensure_cloudiway_user(user)
+    token = await cloud.get_self_service_token(object_id)
+    await cloud.register_source_credentials(token, user["source_email"], password)
+
+    with conn() as db:
+        db.execute(
+            """UPDATE users
+               SET cloudiway_status='credentials_set',
+                   rackspace_status='existing_password',
+                   provisioning_status='bypassed',
+                   ad_match_status='bypassed',
+                   entra_status='bypassed',
+                   license_status='bypassed',
+                   mailbox_status='bypassed',
+                   migration_status='ready',
+                   error_message=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (user_id,),
+        )
+    log_event(
+        user_id,
+        "existing_password_cloudiway_credentials",
+        "Administrator-supplied existing source password registered with Cloudiway; AD and Rackspace reset bypassed",
+    )
+    return object_id
+
+
 async def start_manual_migrations(user_ids: list[int]) -> dict:
     """Start Cloudiway migrations without using the Rackspace administration API."""
     if not user_ids:
@@ -1073,16 +1121,17 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
     if not rows:
         return {"ready": False, "reason": "Migration batch has no users"}
 
-    not_m365_ready = [
-        int(row["id"]) for row in rows
-        if row.get("provisioning_status") != "m365_ready"
-    ]
-    if not_m365_ready:
-        return {
-            "ready": False,
-            "reason": f"{len(not_m365_ready)} selected user(s) are not yet Microsoft 365 mailbox-ready",
-            "not_m365_ready": not_m365_ready,
-        }
+    if batch["workflow_mode"] != "existing_password":
+        not_m365_ready = [
+            int(row["id"]) for row in rows
+            if row.get("provisioning_status") != "m365_ready"
+        ]
+        if not_m365_ready:
+            return {
+                "ready": False,
+                "reason": f"{len(not_m365_ready)} selected user(s) are not yet Microsoft 365 mailbox-ready",
+                "not_m365_ready": not_m365_ready,
+            }
 
     if batch["workflow_mode"] == "manual_bulk":
         unconfirmed = [
@@ -1103,6 +1152,8 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
         try:
             if batch["workflow_mode"] == "manual_bulk":
                 oid = await prepare_manual_user(int(user["id"]))
+            elif batch["workflow_mode"] == "existing_password":
+                oid = await prepare_existing_password_user(int(user["id"]))
             else:
                 oid = await prepare_user(int(user["id"]))
             object_ids.append(int(oid))
@@ -1267,6 +1318,8 @@ async def prepare_manual_upload_batch(upload_batch_id: int) -> dict:
         try:
             if user["password_reset_method"] == "manual_bulk":
                 oid = await prepare_manual_user(int(user["id"]))
+            elif user["password_reset_method"] == "existing_password":
+                oid = await prepare_existing_password_user(int(user["id"]))
             else:
                 oid = await prepare_user(int(user["id"]))
             object_ids.append(int(oid))
