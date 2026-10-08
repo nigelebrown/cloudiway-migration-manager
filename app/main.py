@@ -476,6 +476,8 @@ async def save_provisioning_profile(
     ad_host: str = Form(""),
     ad_port: int = Form(636),
     ad_use_ssl: str = Form(""),
+    ad_tls_validate: str = Form(""),
+    ad_ca_cert_path: str = Form(""),
     ad_base_dn: str = Form(""),
     ad_bind_username: str = Form(""),
     ad_bind_password: str = Form(""),
