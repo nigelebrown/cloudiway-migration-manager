@@ -72,7 +72,13 @@ table{width:100%;border-collapse:collapse;min-width:1150px}th,td{padding:8px;bor
 <h3>Create the Next Migration Batch</h3>
 <form method="post" action="/workflow/{{batch.id}}/generate" id="generateForm">
 <div class="actions">
-<label><b>Next quantity:</b> <input type="number" min="1" max="{{batch.available_count or 1}}" name="quantity" value="{{20 if (batch.available_count or 0) >= 20 else (batch.available_count or 1)}}"></label>
+<label><b>Next quantity:</b> <input id="qty" type="number" min="1" max="{{batch.available_count or 1}}" name="quantity" value="{{20 if (batch.available_count or 0) >= 20 else (batch.available_count or 1)}}"></label>
+<button type="button" class="secondary" onclick="setQty(5)">5</button>
+<button type="button" class="secondary" onclick="setQty(10)">10</button>
+<button type="button" class="secondary" onclick="setQty(20)">20</button>
+<button type="button" class="secondary" onclick="setQty(50)">50</button>
+<button type="button" class="secondary" onclick="setQty(100)">100</button>
+<button type="button" class="secondary" onclick="setQty({{batch.available_count or 1}})">All remaining</button>
 <label><input type="checkbox" name="auto_start" value="1"> Start automatically after the returned Rackspace file is confirmed</label>
 <button class="success">Generate Passwords, Create Cloudiway Batch & Download</button>
 </div>
@@ -161,6 +167,12 @@ table{width:100%;border-collapse:collapse;min-width:1150px}th,td{padding:8px;bor
 </div>
 </div>
 <script>
+function setQty(n){
+  const q=document.getElementById('qty');
+  if(!q)return;
+  const max=Number(q.max||n);
+  q.value=Math.max(1,Math.min(Number(n),max));
+}
 function filterMembers(){
   const q=(document.getElementById('memberSearch')?.value||'').toLowerCase();
   document.querySelectorAll('#availableRows tr').forEach(r=>{r.style.display=(r.dataset.search||'').includes(q)?'':'none'});
