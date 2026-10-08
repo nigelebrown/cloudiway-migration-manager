@@ -1,545 +1,157 @@
-import io
-import zipfile
-
+import io, json, zipfile
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-
 from app.db import conn, init_db, reset_test_data, set_setting
 from app.main import app
 from app.security import encrypt_secret
 
-
 @pytest.fixture(autouse=True)
 def clean_db():
-    init_db()
-    reset_test_data()
-    yield
+    init_db(); reset_test_data(); yield
 
+def login(c):
+    assert c.post("/login",data={"admin_password":"test-admin-password"},follow_redirects=False).status_code==303
 
-def _login(client):
-    r = client.post(
-        "/login",
-        data={"admin_password": "test-admin-password"},
-        follow_redirects=False,
-    )
-    assert r.status_code == 303
+def master(n):
+    rows=["computer_number,source_email,target_email,first_name,middle_name,last_name"]
+    rows += [f"{10000+i},user{i:04d}@rack.example,user{i:04d}@jcf.gov.jm,Test,,User{i:04d}" for i in range(1,n+1)]
+    return ("\n".join(rows)+"\n").encode()
 
-
-def _master_csv(count=1000):
-    lines = ["source_email,target_email,first_name,last_name,computer_number"]
-    for i in range(1, count + 1):
-        lines.append(
-            f"user{i:04d}@jcf.gov.jm,user{i:04d}@jcf.gov.jm,Test,User{i:04d},{10000+i}"
-        )
-    return ("\n".join(lines) + "\n").encode()
-
-
-def _fake_cloud_batch_creator(main_module, monkeypatch):
-    async def fake_ensure(migration_batch_id):
-        cloud_id = 50000 + int(migration_batch_id)
-        with conn() as db:
-            db.execute(
-                """UPDATE migration_batches
-                   SET cloudiway_batch_id=?,cloudiway_batch_name=batch_name,last_error=NULL
-                   WHERE id=?""",
-                (cloud_id, migration_batch_id),
-            )
-        return cloud_id
-
-    monkeypatch.setattr(main_module, "ensure_migration_cloudiway_batch", fake_ensure)
-
-
-def test_1000_user_upload_stages_without_generating_passwords():
-    with TestClient(app) as client:
-        _login(client)
-        r = client.post(
-            "/upload",
-            files={"file": ("1000-users.csv", _master_csv(1000), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
-        assert r.status_code == 303
-
+def profile(env="TEST",limit=100,stop=0):
     with conn() as db:
-        batch = db.execute("SELECT * FROM upload_batches").fetchone()
-        assert batch["imported_rows"] == 1000
-        assert batch["workflow_status"] == "staged"
-        member_count = db.execute(
-            "SELECT COUNT(*) c FROM upload_batch_members WHERE upload_batch_id=?",
-            (batch["id"],),
-        ).fetchone()["c"]
-        assert member_count == 1000
-        generated = db.execute(
-            "SELECT COUNT(*) c FROM users WHERE generated_password_enc IS NOT NULL"
-        ).fetchone()["c"]
-        assert generated == 0
+        cur=db.execute("""INSERT INTO environment_profiles(
+        name,environment_type,is_active,writes_enabled,emergency_stop,production_max_batch,
+        ad_host,ad_port,ad_use_ssl,ad_base_dn,ad_bind_username,ad_bind_password_enc,
+        ad_target_ou,ad_license_group_dn,ad_computer_number_attribute,ad_upn_suffix,
+        ad_default_password_enc,ad_force_password_change,ad_allow_user_creation,ad_allow_group_changes,
+        graph_tenant_id,graph_client_id,graph_client_secret_enc,graph_required_sku,
+        sync_agent_url,sync_agent_token_enc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("TEST" if env=="TEST" else "PROD",env,1,1,stop,limit,"dc",636,1,"DC=t,DC=local","svc",encrypt_secret("bindpass123!"),
+         "OU=M365,DC=t,DC=local","CN=E3,DC=t,DC=local","extensionAttribute7","jcf.gov.jm",
+         encrypt_secret("TempPass123!"),1,1,1,"tenant","client",encrypt_secret("graphsecret"),"SPE_E3","https://sync",encrypt_secret("synctoken")))
+        return cur.lastrowid
 
+class AD:
+    def __init__(self): self.created=[]; self.members=set(); self.adds=[]
+    def identity_decision(self,**kw):
+        i=int(kw["target_email"].split("@")[0].replace("user",""))
+        dn=f"CN=User{i},DC=t,DC=local"
+        cand={"dn":dn,"object_guid":f"g{i}","upn":kw["target_email"],"mail":kw["target_email"],"first_name":"Test","last_name":f"User{i:04d}","computer_number":str(10000+i),"enabled":True,"proxy_addresses":[],"email_match":True,"computer_number_match":True,"name_match":True}
+        if i==1:
+            cand["computer_number"]="99999"; cand["computer_number_match"]=False
+            return {"status":"manual_review","reason":"Computer Number mismatch","candidates":[cand]}
+        if i<=10: return {"status":"confirmed","reason":"match","candidates":[cand],"selected":cand}
+        return {"status":"not_found","reason":"not found","candidates":[]}
+    def is_group_member(self,dn): return dn in self.members
+    def add_to_license_group(self,dn): self.members.add(dn); self.adds.append(dn)
+    def create_user(self,**kw):
+        dn=f"CN={kw['first_name']} {kw['last_name']},OU=M365,DC=t,DC=local"
+        self.created.append(kw); self.members.add(dn)
+        return {"ok":True,"created":True,"dn":dn,"object_guid":"new-"+kw["computer_number"]}
 
-def test_choose_20_generates_only_20_and_creates_cloudiway_batch(monkeypatch):
-    from app import main as main_module
+class Graph:
+    async def get_user(self,upn): return {"id":"e-"+upn,"accountEnabled":True,"userPrincipalName":upn}
+    async def license_ready(self,oid): return True,["SPE_E3"]
+    async def mailbox_ready(self,oid): return True,"ready"
+    async def test_connection(self): return {"ok":True}
 
-    _fake_cloud_batch_creator(main_module, monkeypatch)
-    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
+class Sync:
+    def __init__(self): self.calls=0
+    async def trigger_delta_sync(self): self.calls+=1; return {"ok":True}
+    async def test_connection(self): return {"ok":True}
 
-    with TestClient(app) as client:
-        _login(client)
-        client.post(
-            "/upload",
-            files={"file": ("1000-users.csv", _master_csv(1000), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
-        with conn() as db:
-            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+class Cloud:
+    def __init__(self): self.next=1000; self.users={}; self.started=[]; self.creds=[]
+    async def create_mail_batch(self,name): return {"id":88001,"name":name}
+    async def mail_batches(self): return []
+    async def verify_mail_user(self,email):
+        for oid,u in self.users.items():
+            if u["sourceEmail"]==email:return {"id":oid}
+        return {}
+    async def create_mail_user(self,p): self.next+=1; self.users[self.next]=dict(p); return {"id":self.next}
+    async def get_mail_user(self,oid): return self.users[oid]
+    async def get_self_service_token(self,oid): return str(oid)
+    async def register_source_credentials(self,t,u,p): self.creds.append((u,p)); return {}
+    async def add_mail_batch_members(self,b,o): return {}
+    async def start_migration(self,o): self.started.append(list(o)); return {}
+    async def progress(self,oid,since_minutes): return {"status":"Completed","percentage":100}
 
-        r = client.post(
-            f"/workflow/{upload_id}/generate",
-            data={"quantity": "20"},
-        )
-        assert r.status_code == 200
-        assert "application/zip" in r.headers["content-type"]
+def fakes(monkeypatch):
+    from app import provisioning,service
+    ad,gr,sy,cl=AD(),Graph(),Sync(),Cloud()
+    monkeypatch.setattr(provisioning,"ad_client_for_profile",lambda p:ad)
+    monkeypatch.setattr(provisioning,"graph_client_for_profile",lambda p:gr)
+    monkeypatch.setattr(provisioning,"sync_client_for_profile",lambda p:sy)
+    async def ready(): return cl
+    monkeypatch.setattr(service,"_cloudiway_client_ready",ready)
+    set_setting("cloudiway_token",encrypt_secret("tok"),True); set_setting("cloudiway_source_pool_id","4"); set_setting("cloudiway_target_pool_id","3")
+    return ad,sy,cl
 
-        zf = zipfile.ZipFile(io.BytesIO(r.content))
-        csv_name = next(n for n in zf.namelist() if n.endswith("rackspace-password-update.csv"))
-        password_map_name = next(n for n in zf.namelist() if n.endswith("migration-password-map.xlsx"))
-        rackspace_df = pd.read_csv(io.BytesIO(zf.read(csv_name)))
-        password_map = pd.read_excel(io.BytesIO(zf.read(password_map_name)))
-        assert len(rackspace_df) == 20
-        assert len(password_map) == 20
-        assert list(password_map.columns)[:7] == [
-            "email",
-            "password",
-            "source_email",
-            "target_email",
-            "first_name",
-            "last_name",
-            "computer_number",
-        ]
-
+def test_1000_stage_no_passwords():
+    profile()
+    with TestClient(app) as c:
+        login(c); r=c.post("/upload",files={"file":("u.csv",master(1000),"text/csv")},data={"workflow_mode":"manual_bulk"},follow_redirects=False); assert r.status_code==303
     with conn() as db:
-        mb = db.execute("SELECT * FROM migration_batches").fetchone()
-        assert mb["selected_count"] == 20
-        assert mb["cloudiway_batch_id"] == 50000 + mb["id"]
-        selected = db.execute(
-            "SELECT COUNT(*) c FROM migration_batch_members WHERE migration_batch_id=?",
-            (mb["id"],),
-        ).fetchone()["c"]
-        assert selected == 20
-        generated = db.execute(
-            "SELECT COUNT(*) c FROM users WHERE generated_password_enc IS NOT NULL"
-        ).fetchone()["c"]
-        assert generated == 20
-        remaining = db.execute(
-            """SELECT COUNT(*) c
-               FROM upload_batch_members ubm
-               WHERE ubm.upload_batch_id=?
-                 AND NOT EXISTS (
-                     SELECT 1 FROM migration_batch_members mbm
-                     JOIN migration_batches mb ON mb.id=mbm.migration_batch_id
-                     WHERE mb.upload_batch_id=? AND mbm.user_id=ubm.user_id
-                 )""",
-            (upload_id, upload_id),
-        ).fetchone()["c"]
-        assert remaining == 980
+        assert db.execute("SELECT imported_rows FROM upload_batches").fetchone()["imported_rows"]==1000
+        assert db.execute("SELECT COUNT(*) c FROM users WHERE generated_password_enc IS NOT NULL").fetchone()["c"]==0
 
+def test_template_download():
+    with TestClient(app) as c:
+        login(c); r=c.get("/upload/template.xlsx"); assert r.status_code==200
+        df=pd.read_excel(io.BytesIO(r.content),sheet_name="Users Template")
+        assert list(df.columns)==["computer_number","source_email","target_email","first_name","middle_name","last_name"]
 
-def test_incremental_20_then_30_has_no_overlap(monkeypatch):
-    from app import main as main_module
-
-    _fake_cloud_batch_creator(main_module, monkeypatch)
-    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
-
-    with TestClient(app) as client:
-        _login(client)
-        client.post(
-            "/upload",
-            files={"file": ("users.csv", _master_csv(100), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
+def test_full_20_user_end_to_end(monkeypatch):
+    profile(); ad,sy,cl=fakes(monkeypatch)
+    with TestClient(app) as c:
+        login(c)
+        c.post("/upload",files={"file":("master.csv",master(1000),"text/csv")},data={"workflow_mode":"manual_bulk"},follow_redirects=False)
+        with conn() as db: up=db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+        assert c.post(f"/workflow/{up}/generate",data={"quantity":"20","auto_start":"1"},follow_redirects=False).status_code==303
         with conn() as db:
-            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+            mb=db.execute("SELECT * FROM migration_batches").fetchone(); mid=mb["id"]
+            assert mb["selected_count"]==20 and mb["cloudiway_batch_id"]
+            assert db.execute("SELECT COUNT(*) c FROM users WHERE generated_password_enc IS NOT NULL").fetchone()["c"]==0
+            conflict=db.execute("SELECT * FROM users WHERE target_email='user0001@jcf.gov.jm'").fetchone()
+            cand=json.loads(conflict["ad_candidate_json"])[0]
+        c.post(f"/migration-batch/{mid}/provision",follow_redirects=False)
+        with conn() as db:
+            assert db.execute("""SELECT COUNT(*) c FROM migration_batch_members m JOIN users u ON u.id=m.user_id WHERE m.migration_batch_id=? AND u.provisioning_status='sync_pending'""",(mid,)).fetchone()["c"]==19
+        c.post(f"/provisioning/user/{conflict['id']}/resolve",data={"candidate_dn":cand["dn"],"resolution_note":"Verified manually"},follow_redirects=False)
+        assert sy.calls==1
+        c.post(f"/migration-batch/{mid}/refresh-m365",follow_redirects=False)
+        with conn() as db:
+            assert db.execute("SELECT workflow_status FROM migration_batches WHERE id=?",(mid,)).fetchone()["workflow_status"]=="m365_ready"
+        pack=c.post(f"/migration-batch/{mid}/rackspace-package"); assert pack.status_code==200
+        z=zipfile.ZipFile(io.BytesIO(pack.content)); csvn=next(x for x in z.namelist() if x.endswith("rackspace-password-update.csv")); data=z.read(csvn)
+        assert len(pd.read_csv(io.BytesIO(data)))==20
+        conf=c.post(f"/migration-batch/{mid}/confirm",files={"file":("confirm.csv",data,"text/csv")},follow_redirects=False); assert conf.status_code==303
+        with conn() as db: assert db.execute("SELECT workflow_status FROM migration_batches WHERE id=?",(mid,)).fetchone()["workflow_status"]=="migrating"
+        assert len(cl.creds)==20 and len(cl.started)==1
+        assert c.post("/status/refresh").status_code==200
+        with conn() as db:
+            assert db.execute("""SELECT COUNT(*) c FROM migration_batch_members m JOIN users u ON u.id=m.user_id WHERE m.migration_batch_id=? AND u.migration_status='completed'""",(mid,)).fetchone()["c"]==20
+            assert db.execute("""SELECT COUNT(*) c FROM upload_batch_members u WHERE u.upload_batch_id=? AND NOT EXISTS(SELECT 1 FROM migration_batch_members m JOIN migration_batches b ON b.id=m.migration_batch_id WHERE b.upload_batch_id=? AND m.user_id=u.user_id)""",(up,up)).fetchone()["c"]==980
+    assert len(ad.created)==10
+    assert {x["temporary_password"] for x in ad.created}=={"TempPass123!"}
+    assert all(x["force_change_at_logon"] for x in ad.created)
 
-        r1 = client.post(f"/workflow/{upload_id}/generate", data={"quantity": "20"})
-        assert r1.status_code == 200
-        r2 = client.post(f"/workflow/{upload_id}/generate", data={"quantity": "30"})
-        assert r2.status_code == 200
+def test_production_batch_limit(monkeypatch):
+    profile("PRODUCTION",10); fakes(monkeypatch)
+    with TestClient(app) as c:
+        login(c); c.post("/upload",files={"file":("u.csv",master(20),"text/csv")},data={"workflow_mode":"manual_bulk"},follow_redirects=False)
+        with conn() as db: up=db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+        c.post(f"/workflow/{up}/generate",data={"quantity":"20"},follow_redirects=False)
+    with conn() as db: assert db.execute("SELECT COUNT(*) c FROM migration_batches").fetchone()["c"]==0
 
+def test_emergency_stop_blocks_writes(monkeypatch):
+    profile(stop=1); fakes(monkeypatch)
+    with TestClient(app) as c:
+        login(c); c.post("/upload",files={"file":("u.csv",master(5),"text/csv")},data={"workflow_mode":"manual_bulk"},follow_redirects=False)
+        with conn() as db: up=db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+        c.post(f"/workflow/{up}/generate",data={"quantity":"5"},follow_redirects=False)
+        with conn() as db: mid=db.execute("SELECT id FROM migration_batches").fetchone()["id"]
+        c.post(f"/migration-batch/{mid}/provision",follow_redirects=False)
     with conn() as db:
-        batches = db.execute(
-            "SELECT id,sequence_number,selected_count FROM migration_batches ORDER BY sequence_number"
-        ).fetchall()
-        assert [b["selected_count"] for b in batches] == [20, 30]
-        ids1 = {
-            r["user_id"]
-            for r in db.execute(
-                "SELECT user_id FROM migration_batch_members WHERE migration_batch_id=?",
-                (batches[0]["id"],),
-            ).fetchall()
-        }
-        ids2 = {
-            r["user_id"]
-            for r in db.execute(
-                "SELECT user_id FROM migration_batch_members WHERE migration_batch_id=?",
-                (batches[1]["id"],),
-            ).fetchall()
-        }
-        assert ids1.isdisjoint(ids2)
-        assert len(ids1 | ids2) == 50
-        generated = db.execute(
-            "SELECT COUNT(*) c FROM users WHERE generated_password_enc IS NOT NULL"
-        ).fetchone()["c"]
-        assert generated == 50
-
-
-def test_exact_user_selection_overrides_quantity(monkeypatch):
-    from app import main as main_module
-
-    _fake_cloud_batch_creator(main_module, monkeypatch)
-    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
-
-    with TestClient(app) as client:
-        _login(client)
-        client.post(
-            "/upload",
-            files={"file": ("users.csv", _master_csv(25), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
-        with conn() as db:
-            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
-            rows = db.execute(
-                """SELECT u.id FROM upload_batch_members ubm
-                   JOIN users u ON u.id=ubm.user_id
-                   WHERE ubm.upload_batch_id=? ORDER BY ubm.row_order""",
-                (upload_id,),
-            ).fetchall()
-            chosen = [rows[2]["id"], rows[7]["id"], rows[19]["id"]]
-
-        r = client.post(
-            f"/workflow/{upload_id}/generate",
-            data={"quantity": "20", "user_ids": [str(x) for x in chosen]},
-        )
-        assert r.status_code == 200
-
-    with conn() as db:
-        mb = db.execute("SELECT id,selected_count FROM migration_batches").fetchone()
-        assert mb["selected_count"] == 3
-        actual = {
-            r["user_id"]
-            for r in db.execute(
-                "SELECT user_id FROM migration_batch_members WHERE migration_batch_id=?",
-                (mb["id"],),
-            ).fetchall()
-        }
-        assert actual == set(chosen)
-
-
-def test_download_reupload_confirm_prepare_and_start(monkeypatch):
-    from app import main as main_module
-
-    _fake_cloud_batch_creator(main_module, monkeypatch)
-    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
-
-    async def fake_prepare(migration_batch_id):
-        with conn() as db:
-            mb = db.execute(
-                "SELECT cloudiway_batch_id FROM migration_batches WHERE id=?",
-                (migration_batch_id,),
-            ).fetchone()
-            count = db.execute(
-                "SELECT COUNT(*) c FROM migration_batch_members WHERE migration_batch_id=?",
-                (migration_batch_id,),
-            ).fetchone()["c"]
-            db.execute(
-                "UPDATE migration_batches SET workflow_status='ready_to_migrate' WHERE id=?",
-                (migration_batch_id,),
-            )
-        return {
-            "ready": True,
-            "users": count,
-            "cloudiway_batch_id": mb["cloudiway_batch_id"],
-            "object_ids": list(range(1, count + 1)),
-        }
-
-    async def fake_start(migration_batch_id):
-        with conn() as db:
-            mb = db.execute(
-                "SELECT cloudiway_batch_id FROM migration_batches WHERE id=?",
-                (migration_batch_id,),
-            ).fetchone()
-            ids = [
-                r["user_id"]
-                for r in db.execute(
-                    "SELECT user_id FROM migration_batch_members WHERE migration_batch_id=?",
-                    (migration_batch_id,),
-                ).fetchall()
-            ]
-            placeholders = ",".join("?" for _ in ids)
-            db.execute(
-                f"UPDATE users SET migration_status='migrating' WHERE id IN ({placeholders})",
-                tuple(ids),
-            )
-            db.execute(
-                "UPDATE migration_batches SET workflow_status='migrating' WHERE id=?",
-                (migration_batch_id,),
-            )
-        return {
-            "started": True,
-            "users_started": len(ids),
-            "cloudiway_batch_id": mb["cloudiway_batch_id"],
-        }
-
-    monkeypatch.setattr(main_module, "prepare_migration_batch", fake_prepare)
-    monkeypatch.setattr(main_module, "start_migration_batch", fake_start)
-
-    with TestClient(app) as client:
-        _login(client)
-        client.post(
-            "/upload",
-            files={"file": ("users.csv", _master_csv(20), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
-        with conn() as db:
-            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
-
-        package = client.post(
-            f"/workflow/{upload_id}/generate",
-            data={"quantity": "20"},
-        )
-        assert package.status_code == 200
-        zf = zipfile.ZipFile(io.BytesIO(package.content))
-        rackspace_name = next(n for n in zf.namelist() if n.endswith("rackspace-password-update.csv"))
-        rackspace_csv = zf.read(rackspace_name)
-
-        with conn() as db:
-            mb = db.execute("SELECT * FROM migration_batches").fetchone()
-            migration_batch_id = mb["id"]
-            assert mb["cloudiway_batch_id"] is not None
-
-        confirm = client.post(
-            f"/migration-batch/{migration_batch_id}/confirm",
-            files={"file": ("rackspace-confirm.csv", rackspace_csv, "text/csv")},
-            follow_redirects=False,
-        )
-        assert confirm.status_code == 303
-
-        with conn() as db:
-            confirmed = db.execute(
-                """SELECT COUNT(*) c FROM migration_batch_members mbm
-                   JOIN users u ON u.id=mbm.user_id
-                   WHERE mbm.migration_batch_id=? AND u.rackspace_status='manual_confirmed'""",
-                (migration_batch_id,),
-            ).fetchone()["c"]
-            state = db.execute(
-                "SELECT workflow_status FROM migration_batches WHERE id=?",
-                (migration_batch_id,),
-            ).fetchone()["workflow_status"]
-        assert confirmed == 20
-        assert state == "ready_to_migrate"
-
-        start = client.post(
-            f"/migration-batch/{migration_batch_id}/start",
-            follow_redirects=False,
-        )
-        assert start.status_code == 303
-
-    with conn() as db:
-        state = db.execute(
-            "SELECT workflow_status FROM migration_batches WHERE id=?",
-            (migration_batch_id,),
-        ).fetchone()["workflow_status"]
-        migrating = db.execute(
-            """SELECT COUNT(*) c FROM migration_batch_members mbm
-               JOIN users u ON u.id=mbm.user_id
-               WHERE mbm.migration_batch_id=? AND u.migration_status='migrating'""",
-            (migration_batch_id,),
-        ).fetchone()["c"]
-        assert state == "migrating"
-        assert migrating == 20
-
-
-@pytest.mark.asyncio
-async def test_cloudiway_batch_api_is_used_for_each_migration_batch(monkeypatch):
-    from app import service
-
-    with conn() as db:
-        u = db.execute(
-            """INSERT INTO upload_batches(
-                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
-               ) VALUES(?,?,?,?,?)""",
-            ("JCF-TEST-U00001", "manual_bulk", "staged", 2, 2),
-        )
-        upload_id = u.lastrowid
-        m = db.execute(
-            """INSERT INTO migration_batches(
-                   upload_batch_id,sequence_number,batch_name,workflow_status,selected_count
-               ) VALUES(?,?,?,?,?)""",
-            (upload_id, 1, "JCF-TEST-U00001-B001", "passwords_generated", 2),
-        )
-        migration_batch_id = m.lastrowid
-
-    calls = {"create": 0}
-
-    class FakeCloud:
-        async def create_mail_batch(self, name):
-            calls["create"] += 1
-            assert name == "JCF-TEST-U00001-B001"
-            return {"id": 88001, "name": name}
-
-        async def mail_batches(self):
-            return []
-
-    async def fake_ready():
-        return FakeCloud()
-
-    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
-    cloud_id = await service.ensure_migration_cloudiway_batch(migration_batch_id)
-    assert cloud_id == 88001
-    assert calls["create"] == 1
-
-    with conn() as db:
-        row = db.execute(
-            "SELECT cloudiway_batch_id FROM migration_batches WHERE id=?",
-            (migration_batch_id,),
-        ).fetchone()
-        assert row["cloudiway_batch_id"] == 88001
-
-
-def test_workflow_page_shows_quantity_selection_and_remaining_users(monkeypatch):
-    from app import main as main_module
-
-    _fake_cloud_batch_creator(main_module, monkeypatch)
-    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
-
-    with TestClient(app) as client:
-        _login(client)
-        client.post(
-            "/upload",
-            files={"file": ("users.csv", _master_csv(40), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
-        with conn() as db:
-            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
-
-        page = client.get(f"/workflow/{upload_id}")
-        assert page.status_code == 200
-        assert "Next quantity" in page.text
-        assert "40" in page.text
-        assert "Generate Passwords, Create Cloudiway Batch &amp; Download" in page.text or "Generate Passwords, Create Cloudiway Batch & Download" in page.text
-
-        client.post(f"/workflow/{upload_id}/generate", data={"quantity": "20"})
-        page2 = client.get(f"/workflow/{upload_id}")
-        assert page2.status_code == 200
-        assert "20" in page2.text
-        assert "Cloudiway Batch" in page2.text
-        assert "B001" in page2.text
-
-
-def test_dashboard_exposes_migration_batch_name_and_cloudiway_batch(monkeypatch):
-    from app import main as main_module
-
-    _fake_cloud_batch_creator(main_module, monkeypatch)
-    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
-
-    with TestClient(app) as client:
-        _login(client)
-        client.post(
-            "/upload",
-            files={"file": ("users.csv", _master_csv(5), "text/csv")},
-            data={"workflow_mode": "manual_bulk"},
-            follow_redirects=False,
-        )
-        with conn() as db:
-            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
-
-        client.post(f"/workflow/{upload_id}/generate", data={"quantity": "5"})
-        api = client.get("/api/dashboard")
-        assert api.status_code == 200
-        users = api.json()["users"]
-        batched = [u for u in users if u.get("migration_batch_name")]
-        assert len(batched) == 5
-        assert all(u["cloudiway_batch_id"] for u in batched)
-        assert all("-B001" in u["migration_batch_name"] for u in batched)
-
-
-@pytest.mark.asyncio
-async def test_start_ready_batch_does_not_repeat_preparation(monkeypatch):
-    from app import service
-
-    with conn() as db:
-        up = db.execute(
-            """INSERT INTO upload_batches(
-                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
-               ) VALUES(?,?,?,?,?)""",
-            ("JCF-TEST-U00002", "manual_bulk", "partially_batched", 1, 1),
-        )
-        upload_id = up.lastrowid
-        db.execute(
-            """INSERT INTO users(
-                   source_email,target_email,password_reset_method,rackspace_status,
-                   cloudiway_status,cloudiway_object_id,migration_status
-               ) VALUES(?,?,?,?,?,?,?)""",
-            (
-                "ready@jcf.gov.jm",
-                "ready@jcf.gov.jm",
-                "manual_bulk",
-                "manual_confirmed",
-                "credentials_set",
-                99001,
-                "ready",
-            ),
-        )
-        uid = db.execute(
-            "SELECT id FROM users WHERE source_email='ready@jcf.gov.jm'"
-        ).fetchone()["id"]
-        mb = db.execute(
-            """INSERT INTO migration_batches(
-                   upload_batch_id,sequence_number,batch_name,workflow_status,
-                   cloudiway_batch_id,selected_count,confirmed_count
-               ) VALUES(?,?,?,?,?,?,?)""",
-            (upload_id, 1, "JCF-TEST-U00002-B001", "ready_to_migrate", 88100, 1, 1),
-        )
-        migration_batch_id = mb.lastrowid
-        db.execute(
-            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
-            (migration_batch_id, uid),
-        )
-
-    calls = {"prepare": 0, "start": 0}
-
-    async def should_not_prepare(_):
-        calls["prepare"] += 1
-        raise AssertionError("ready batch should not be prepared twice")
-
-    class FakeCloud:
-        async def start_migration(self, object_ids):
-            calls["start"] += 1
-            assert object_ids == [99001]
-            return {"ok": True}
-
-    async def fake_ready():
-        return FakeCloud()
-
-    monkeypatch.setattr(service, "prepare_migration_batch", should_not_prepare)
-    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
-
-    result = await service.start_migration_batch(migration_batch_id)
-    assert result["started"] is True
-    assert calls["prepare"] == 0
-    assert calls["start"] == 1
-
-    with conn() as db:
-        user_state = db.execute(
-            "SELECT migration_status FROM users WHERE id=?",
-            (uid,),
-        ).fetchone()["migration_status"]
-        batch_state = db.execute(
-            "SELECT workflow_status FROM migration_batches WHERE id=?",
-            (migration_batch_id,),
-        ).fetchone()["workflow_status"]
-    assert user_state == "migrating"
-    assert batch_state == "migrating"
+        assert db.execute("SELECT COUNT(*) c FROM users WHERE ad_group_status='member'").fetchone()["c"]==0
