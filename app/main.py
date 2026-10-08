@@ -609,23 +609,11 @@ async def upload_users(
     request: Request,
     file: UploadFile = File(...),
     workflow_mode: str = Form("manual_bulk"),
-    auto_start: str = Form(""),
 ):
     require_admin(request)
 
     if workflow_mode not in ("manual_bulk", "automatic"):
         workflow_mode = "manual_bulk"
-
-    if not get_setting("cloudiway_token"):
-        return templates.TemplateResponse(
-            request=request,
-            name="upload.html",
-            context={
-                "request": request,
-                "error": "Connect Cloudiway before uploading. Every upload must receive a Cloudiway batch number.",
-            },
-            status_code=400,
-        )
 
     raw = await file.read()
     try:
@@ -686,18 +674,19 @@ async def upload_users(
                 pending_name,
                 file.filename,
                 workflow_mode,
-                "uploaded",
-                1 if auto_start else 0,
+                "staged",
+                0,
                 total_rows,
             ),
         )
         upload_batch_id = int(cursor.lastrowid)
-        batch_name = f"JCF-{time.strftime('%Y%m%d', time.gmtime())}-B{upload_batch_id:05d}"
+        batch_name = f"JCF-{time.strftime('%Y%m%d', time.gmtime())}-U{upload_batch_id:05d}"
         db.execute(
-            "UPDATE upload_batches SET batch_name=?,cloudiway_batch_name=? WHERE id=?",
-            (batch_name, batch_name, upload_batch_id),
+            "UPDATE upload_batches SET batch_name=?,cloudiway_batch_name=NULL WHERE id=?",
+            (batch_name, upload_batch_id),
         )
 
+        row_order = 0
         for _, row in df.iterrows():
             src = _clean_cell(row.get("source_email")).lower()
             tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
@@ -712,10 +701,15 @@ async def upload_users(
             computer_number = _clean_cell(row.get("computer_number"))
 
             existing = db.execute(
-                "SELECT id,migration_status FROM users WHERE source_email=?",
+                """SELECT u.id,u.migration_status,
+                          (SELECT COUNT(*) FROM migration_batch_members mbm WHERE mbm.user_id=u.id) AS assigned
+                   FROM users u WHERE u.source_email=?""",
                 (src,),
             ).fetchone()
-            if existing and existing["migration_status"] in ("preparing", "ready", "migrating", "completed"):
+            if existing and (
+                existing["migration_status"] in ("preparing", "ready", "migrating", "completed")
+                or int(existing.get("assigned") or 0) > 0
+            ):
                 protected += 1
                 continue
 
@@ -738,46 +732,37 @@ async def upload_users(
                 (src,),
             ).fetchone()
             user_id = int(user_row["id"])
+            row_order += 1
             db.execute(
-                """INSERT IGNORE INTO upload_batch_members(upload_batch_id,user_id)
-                   VALUES(?,?)""",
-                (upload_batch_id, user_id),
+                """INSERT IGNORE INTO upload_batch_members(upload_batch_id,user_id,row_order)
+                   VALUES(?,?,?)""",
+                (upload_batch_id, user_id, row_order),
             )
 
-            if workflow_mode == "manual_bulk":
-                password = generate_password()
-                db.execute(
-                    """UPDATE users
-                       SET generated_password_enc=?,
-                           password_reset_method='manual_bulk',
-                           rackspace_status='manual_file_generated',
-                           manual_password_generated_at=CURRENT_TIMESTAMP,
-                           manual_password_confirmed_at=NULL,
-                           migration_status='waiting',
-                           cloudiway_status='not_submitted',
-                           error_message=NULL,
-                           progress_percent=NULL,
-                           batch_number=?,
-                           batch_started_at=NULL,
-                           updated_at=CURRENT_TIMESTAMP
-                       WHERE id=?""",
-                    (encrypt_secret(password), upload_batch_id, user_id),
-                )
-            else:
-                db.execute(
-                    """UPDATE users
-                       SET password_reset_method='automatic',
-                           rackspace_status='pending',
-                           migration_status='waiting',
-                           cloudiway_status='not_submitted',
-                           error_message=NULL,
-                           progress_percent=NULL,
-                           batch_number=?,
-                           batch_started_at=NULL,
-                           updated_at=CURRENT_TIMESTAMP
-                       WHERE id=?""",
-                    (upload_batch_id, user_id),
-                )
+            # Staging an upload does not generate passwords. The admin chooses
+            # the next quantity (or exact users) before a migration batch is created.
+            db.execute(
+                """UPDATE users
+                   SET generated_password_enc=NULL,
+                       password_reset_method=?,
+                       manual_password_generated_at=NULL,
+                       manual_password_confirmed_at=NULL,
+                       rackspace_status=?,
+                       cloudiway_status='not_submitted',
+                       migration_status='waiting',
+                       progress_percent=NULL,
+                       progress_detail=NULL,
+                       error_message=NULL,
+                       batch_number=NULL,
+                       batch_started_at=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (
+                    workflow_mode,
+                    "not_generated" if workflow_mode == "manual_bulk" else "pending",
+                    user_id,
+                ),
+            )
 
             member_ids.append(user_id)
             imported += 1
@@ -789,45 +774,27 @@ async def upload_users(
                 name="upload.html",
                 context={
                     "request": request,
-                    "error": f"No eligible users were imported. Invalid: {skipped}; active/completed protected: {protected}.",
+                    "error": f"No eligible users were imported. Invalid: {skipped}; active/already assigned protected: {protected}.",
                 },
                 status_code=400,
             )
 
-        initial_status = "passwords_generated" if workflow_mode == "manual_bulk" else "ready_for_automatic"
         db.execute(
             """UPDATE upload_batches
-               SET imported_rows=?,skipped_rows=?,protected_rows=?,workflow_status=?
+               SET imported_rows=?,skipped_rows=?,protected_rows=?,workflow_status='staged'
                WHERE id=?""",
-            (imported, skipped, protected, initial_status, upload_batch_id),
+            (imported, skipped, protected, upload_batch_id),
         )
-
-    cloud_batch_error = None
-    try:
-        cloud_batch_id = await ensure_upload_cloudiway_batch(upload_batch_id)
-    except Exception as exc:
-        cloud_batch_id = None
-        cloud_batch_error = str(exc)
 
     log_event(
         None,
-        "file_upload",
-        f"Upload batch {upload_batch_id} ({batch_name}): imported {imported}; invalid {skipped}; protected {protected}; Cloudiway batch={cloud_batch_id}; file={file.filename}",
+        "file_upload_staged",
+        f"Upload {upload_batch_id} ({batch_name}) staged {imported} user(s); invalid {skipped}; protected {protected}; file={file.filename}",
     )
-
-    if workflow_mode == "automatic" and auto_start and cloud_batch_id:
-        try:
-            await start_upload_batch(upload_batch_id)
-        except Exception as exc:
-            cloud_batch_error = str(exc)
-
     request.session["workflow_notice"] = (
-        f"Upload batch {batch_name} created with {imported} user(s). "
-        + (f"Cloudiway batch ID {cloud_batch_id} created." if cloud_batch_id else "Cloudiway batch creation needs attention.")
+        f"Upload {batch_name} staged with {imported} user(s). "
+        "Choose how many users to process next; passwords will only be generated for that selection."
     )
-    if cloud_batch_error:
-        request.session["workflow_error"] = cloud_batch_error[:1000]
-
     return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
 
