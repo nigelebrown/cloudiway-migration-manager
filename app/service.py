@@ -539,7 +539,14 @@ async def prepare_user(user_id: int) -> int:
             )
         log_event(user_id, "rackspace_password_reset", "Rackspace mailbox password changed")
 
-        await cloud.register_source_credentials(token, user["source_email"], password)
+        username = str(user["source_email"]).strip().lower()
+        log_event(
+            user_id,
+            "cloudiway_credential_payload",
+            f"Registering Cloudiway source credentials: username={username}; "
+            f"password_source=generated_or_reset; password_length={len(password)}",
+        )
+        await cloud.register_source_credentials(token, username, password)
         with conn() as db:
             db.execute(
                 "UPDATE users SET cloudiway_status='credentials_set',migration_status='ready',updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -943,11 +950,17 @@ async def prepare_manual_user(user_id: int) -> int:
     if not user.get("generated_password_enc"):
         raise RuntimeError("No generated Rackspace password is stored for this user")
 
-    password = decrypt_secret(user["generated_password_enc"])
+    username, password, credential_origin = _source_credentials_for_cloudiway(user)
     cloud = await _cloudiway_client_ready()
     object_id = await ensure_cloudiway_user(user)
     token = await cloud.get_self_service_token(object_id)
-    await cloud.register_source_credentials(token, user["source_email"], password)
+    log_event(
+        user_id,
+        "cloudiway_credential_payload",
+        f"Registering Cloudiway source credentials: username={username}; "
+        f"password_source={credential_origin}; password_length={len(password)}",
+    )
+    await cloud.register_source_credentials(token, username, password)
 
     with conn() as db:
         db.execute(
@@ -967,6 +980,39 @@ async def prepare_manual_user(user_id: int) -> int:
     return object_id
 
 
+def _source_credentials_for_cloudiway(user: dict) -> tuple[str, str, str]:
+    """Return the exact source username/password that will be sent to Cloudiway.
+
+    Username is always the full source email address. Existing-password uploads
+    use the dedicated encrypted upload credential; generated/reset workflows use
+    the generated password field.
+    """
+    username = str(user.get("source_email") or "").strip().lower()
+    if not username or "@" not in username:
+        raise RuntimeError("Cloudiway source username must be the full source email address")
+
+    method = user.get("password_reset_method") or ""
+    if method == "existing_password":
+        stored_username = str(user.get("source_credential_username") or "").strip().lower()
+        if stored_username and stored_username != username:
+            raise RuntimeError(
+                f"Stored source credential username '{stored_username}' does not match source email '{username}'"
+            )
+        encrypted = user.get("source_credential_password_enc")
+        # Backward-compatible fallback for rows created before the dedicated
+        # source credential columns were added.
+        if not encrypted:
+            encrypted = user.get("generated_password_enc")
+        if not encrypted:
+            raise RuntimeError("No uploaded existing source password is stored for this user")
+        return username, decrypt_secret(encrypted), "uploaded_excel"
+
+    encrypted = user.get("generated_password_enc")
+    if not encrypted:
+        raise RuntimeError("No generated/reset source password is stored for this user")
+    return username, decrypt_secret(encrypted), "generated_or_reset"
+
+
 async def prepare_existing_password_user(user_id: int) -> int:
     """Register an administrator-supplied existing source password with Cloudiway.
 
@@ -982,14 +1028,18 @@ async def prepare_existing_password_user(user_id: int) -> int:
 
     if user.get("password_reset_method") != "existing_password":
         raise RuntimeError("User is not assigned to the existing-password Cloudiway-only workflow")
-    if not user.get("generated_password_enc"):
-        raise RuntimeError("No supplied source password is stored for this user")
 
-    password = decrypt_secret(user["generated_password_enc"])
+    username, password, credential_origin = _source_credentials_for_cloudiway(user)
     cloud = await _cloudiway_client_ready()
     object_id = await ensure_cloudiway_user(user)
     token = await cloud.get_self_service_token(object_id)
-    await cloud.register_source_credentials(token, user["source_email"], password)
+    log_event(
+        user_id,
+        "cloudiway_credential_payload",
+        f"Registering Cloudiway source credentials: username={username}; "
+        f"password_source={credential_origin}; password_length={len(password)}",
+    )
+    await cloud.register_source_credentials(token, username, password)
 
     with conn() as db:
         db.execute(
