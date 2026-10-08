@@ -406,3 +406,61 @@ async def test_cloudiway_batch_api_is_used_for_each_migration_batch(monkeypatch)
             (migration_batch_id,),
         ).fetchone()
         assert row["cloudiway_batch_id"] == 88001
+
+
+def test_workflow_page_shows_quantity_selection_and_remaining_users(monkeypatch):
+    from app import main as main_module
+
+    _fake_cloud_batch_creator(main_module, monkeypatch)
+    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
+
+    with TestClient(app) as client:
+        _login(client)
+        client.post(
+            "/upload",
+            files={"file": ("users.csv", _master_csv(40), "text/csv")},
+            data={"workflow_mode": "manual_bulk"},
+            follow_redirects=False,
+        )
+        with conn() as db:
+            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+
+        page = client.get(f"/workflow/{upload_id}")
+        assert page.status_code == 200
+        assert "Next quantity" in page.text
+        assert "40" in page.text
+        assert "Generate Passwords, Create Cloudiway Batch &amp; Download" in page.text or "Generate Passwords, Create Cloudiway Batch & Download" in page.text
+
+        client.post(f"/workflow/{upload_id}/generate", data={"quantity": "20"})
+        page2 = client.get(f"/workflow/{upload_id}")
+        assert page2.status_code == 200
+        assert "20" in page2.text
+        assert "Cloudiway Batch" in page2.text
+        assert "B001" in page2.text
+
+
+def test_dashboard_exposes_migration_batch_name_and_cloudiway_batch(monkeypatch):
+    from app import main as main_module
+
+    _fake_cloud_batch_creator(main_module, monkeypatch)
+    set_setting("cloudiway_token", encrypt_secret("test-token"), True)
+
+    with TestClient(app) as client:
+        _login(client)
+        client.post(
+            "/upload",
+            files={"file": ("users.csv", _master_csv(5), "text/csv")},
+            data={"workflow_mode": "manual_bulk"},
+            follow_redirects=False,
+        )
+        with conn() as db:
+            upload_id = db.execute("SELECT id FROM upload_batches").fetchone()["id"]
+
+        client.post(f"/workflow/{upload_id}/generate", data={"quantity": "5"})
+        api = client.get("/api/dashboard")
+        assert api.status_code == 200
+        users = api.json()["users"]
+        batched = [u for u in users if u.get("migration_batch_name")]
+        assert len(batched) == 5
+        assert all(u["cloudiway_batch_id"] for u in batched)
+        assert all("-B001" in u["migration_batch_name"] for u in batched)
