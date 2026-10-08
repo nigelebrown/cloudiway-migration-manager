@@ -69,6 +69,7 @@ SCHEMA = [
     CREATE TABLE IF NOT EXISTS upload_batch_members (
         upload_batch_id BIGINT NOT NULL,
         user_id BIGINT NOT NULL,
+        row_order INT NOT NULL DEFAULT 0,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (upload_batch_id, user_id),
         INDEX idx_upload_batch_members_user (user_id),
@@ -76,6 +77,46 @@ SCHEMA = [
             FOREIGN KEY (upload_batch_id) REFERENCES upload_batches(id)
             ON DELETE CASCADE,
         CONSTRAINT fk_upload_batch_members_user
+            FOREIGN KEY (user_id) REFERENCES users(id)
+            ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS migration_batches (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        upload_batch_id BIGINT NOT NULL,
+        sequence_number INT NOT NULL,
+        batch_name VARCHAR(255) NOT NULL UNIQUE,
+        workflow_status VARCHAR(64) NOT NULL DEFAULT 'selected',
+        auto_start TINYINT(1) NOT NULL DEFAULT 0,
+        cloudiway_batch_id BIGINT NULL,
+        cloudiway_batch_name VARCHAR(255) NULL,
+        selected_count INT NOT NULL DEFAULT 0,
+        confirmed_count INT NOT NULL DEFAULT 0,
+        last_error LONGTEXT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_migration_batch_sequence (upload_batch_id, sequence_number),
+        INDEX idx_migration_batches_upload (upload_batch_id),
+        INDEX idx_migration_batches_status (workflow_status),
+        INDEX idx_migration_batches_cloudiway (cloudiway_batch_id),
+        CONSTRAINT fk_migration_batches_upload
+            FOREIGN KEY (upload_batch_id) REFERENCES upload_batches(id)
+            ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS migration_batch_members (
+        migration_batch_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (migration_batch_id, user_id),
+        UNIQUE KEY uq_user_one_migration_batch (user_id),
+        INDEX idx_migration_batch_members_user (user_id),
+        CONSTRAINT fk_migration_batch_members_batch
+            FOREIGN KEY (migration_batch_id) REFERENCES migration_batches(id)
+            ON DELETE CASCADE,
+        CONSTRAINT fk_migration_batch_members_user
             FOREIGN KEY (user_id) REFERENCES users(id)
             ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -195,12 +236,26 @@ def init_db():
                 "ALTER TABLE users ADD COLUMN manual_password_confirmed_at DATETIME NULL AFTER manual_password_generated_at"
             )
 
+        upload_member_columns = {
+            row["COLUMN_NAME"]
+            for row in db.execute(
+                """SELECT COLUMN_NAME
+                   FROM INFORMATION_SCHEMA.COLUMNS
+                   WHERE TABLE_SCHEMA=? AND TABLE_NAME='upload_batch_members'""",
+                (settings.db_name,),
+            ).fetchall()
+        }
+        if "row_order" not in upload_member_columns:
+            db.execute(
+                "ALTER TABLE upload_batch_members ADD COLUMN row_order INT NOT NULL DEFAULT 0 AFTER user_id"
+            )
+
 
 def reset_test_data():
     """Clear application data while preserving the MySQL schema."""
     with conn() as db:
         db.execute("SET FOREIGN_KEY_CHECKS=0")
-        for table in ("events", "upload_batch_members", "upload_batches", "users", "settings", "runtime"):
+        for table in ("events", "migration_batch_members", "migration_batches", "upload_batch_members", "upload_batches", "users", "settings", "runtime"):
             db.execute(f"TRUNCATE TABLE {table}")
         db.execute("SET FOREIGN_KEY_CHECKS=1")
 
