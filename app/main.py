@@ -524,8 +524,8 @@ async def save_provisioning_profile(
 
     values = (
         name.strip(), env_type, production_max_batch,
-        ad_host.strip(), ad_port, 1 if ad_use_ssl else 0, ad_base_dn.strip(),
-        ad_bind_username.strip(), enc_or_existing(ad_bind_password, "ad_bind_password_enc"),
+        ad_host.strip(), ad_port, 1 if ad_use_ssl else 0, 1 if ad_tls_validate else 0,
+        ad_ca_cert_path.strip(), ad_base_dn.strip(), ad_bind_username.strip(), enc_or_existing(ad_bind_password, "ad_bind_password_enc"),
         ad_target_ou.strip(), ad_license_group_dn.strip(), ad_computer_number_attribute.strip(),
         ad_upn_suffix.strip(), enc_or_existing(ad_default_password, "ad_default_password_enc"),
         1 if ad_force_password_change else 0,
