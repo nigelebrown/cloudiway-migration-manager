@@ -1,18 +1,62 @@
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>New Migration Upload</title><style>
-:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}body{background:#07111f;color:#e5e7eb;margin:0}.wrap{max-width:900px;margin:40px auto;padding:20px}.card{background:#101a2b;border:1px solid #22324a;padding:26px;border-radius:14px}a{color:#38bdf8}.err{background:#451a1a;color:#fecaca;padding:10px;border-radius:8px}.hint{color:#94a3b8;font-size:13px}.field{margin:14px 0}input,select,button{padding:11px;border-radius:8px}input[type=file],select{width:100%;box-sizing:border-box;background:#0b1220;color:#fff;border:1px solid #334155}button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#020617;padding:2px 5px;border-radius:4px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:18px 0}.step{background:#0b1220;border:1px solid #334155;border-radius:10px;padding:12px;font-size:13px}.step b{display:block;margin-bottom:5px}@media(max-width:700px){.flow{grid-template-columns:1fr 1fr}}
+:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}
+body{background:#07111f;color:#e5e7eb;margin:0}.wrap{max-width:980px;margin:40px auto;padding:20px}.card{background:#101a2b;border:1px solid #22324a;padding:26px;border-radius:14px}
+a{color:#38bdf8}.err{background:#451a1a;color:#fecaca;padding:10px;border-radius:8px}.info{background:#0c4a6e;color:#e0f2fe;padding:12px;border-radius:8px}.warn{background:#422006;color:#fde68a;padding:12px;border-radius:8px}
+.hint{color:#94a3b8;font-size:13px}.field{margin:14px 0}input,select,button{padding:11px;border-radius:8px}input[type=file],select{width:100%;box-sizing:border-box;background:#0b1220;color:#fff;border:1px solid #334155}
+button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#020617;padding:2px 5px;border-radius:4px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:18px 0}.step{background:#0b1220;border:1px solid #334155;border-radius:10px;padding:12px;font-size:13px}.step b{display:block;margin-bottom:5px}
+.modebox{border:1px solid #334155;border-radius:10px;padding:14px;margin-top:12px}.modebox h3{margin-top:0}
+@media(max-width:700px){.flow{grid-template-columns:1fr 1fr}}
 </style></head><body><div class="wrap"><p><a href="/workflow">← Migration Workflow</a> &nbsp; <a href="/dashboard">Dashboard</a></p><div class="card">
 <h1>New Migration Upload</h1>
-<p>Upload the full master list once using the standard identity fields. The app stages all valid users without changing AD or generating passwords. You then release controlled groups through AD identity validation, provisioning, Microsoft 365 readiness, Rackspace, and Cloudiway. <b>Each released migration group receives its own Cloudiway Mail Batch number.</b></p><p><a href="/upload/template.xlsx">Download the standard JCF upload template</a></p>
-<div class="flow"><div class="step"><b>1. Upload</b>Stage the full master list.</div><div class="step"><b>2. Select</b>Choose the next quantity or exact users.</div><div class="step"><b>3. Rackspace</b>Generate/download passwords only for that group.</div><div class="step"><b>4. Cloudiway</b>Re-upload confirmation, prepare, migrate and monitor.</div></div>
-<p>Required columns: <code>computer_number</code>, <code>source_email</code>, <code>target_email</code>, <code>first_name</code>, <code>last_name</code>. Optional: <code>middle_name</code>.</p>
-<p class="hint">Computer Number is a required identity control. Existing AD users are automatically accepted only when email/UPN, Computer Number, and first/last name identify the same enabled AD object. Partial or conflicting matches are held for individual manual review.</p>
+<p>Choose the workflow that matches the users you are loading. The normal workflows can validate/provision AD and Microsoft 365. The new <b>existing-password Cloudiway-only</b> workflow skips AD and Rackspace password changes completely.</p>
+
+<div class="flow">
+<div class="step"><b>1. Upload</b>Stage the master list.</div>
+<div class="step"><b>2. Select</b>Choose the next quantity or exact users.</div>
+<div class="step"><b>3. Credentials</b>Generate Rackspace passwords, use the API, or use passwords already supplied in Excel.</div>
+<div class="step"><b>4. Cloudiway</b>Create a Cloudiway batch, register source credentials, migrate and monitor.</div>
+</div>
+
+<p>
+<a href="/upload/template.xlsx">Download the standard AD/M365 upload template</a>
+&nbsp; | &nbsp;
+<a href="/upload/existing-password-template.xlsx">Download the existing-password Cloudiway-only template</a>
+</p>
+
 {% if error %}<p class="err">{{error}}</p>{% endif %}
+
 <form method="post" enctype="multipart/form-data">
 <div class="field"><label><b>Migration file</b></label><input type="file" name="file" accept=".xlsx,.csv" required></div>
-<div class="field"><label><b>Rackspace password method</b></label><select name="workflow_mode">
-<option value="manual_bulk" selected>Manual Rackspace bulk import — generate password file automatically</option>
-<option value="automatic">Automatic Rackspace API reset — use when API access is working</option>
+
+<div class="field"><label><b>Workflow / source password method</b></label>
+<select id="workflowMode" name="workflow_mode" onchange="showModeHelp()">
+<option value="manual_bulk" selected>Manual Rackspace bulk reset — generate new passwords later</option>
+<option value="automatic">Automatic Rackspace API reset — use Rackspace API when available</option>
+<option value="existing_password">Existing source password in Excel — Cloudiway only, skip AD and password reset</option>
 </select></div>
+
+<div id="normalHelp" class="modebox">
+<h3>AD / Microsoft 365 controlled workflow</h3>
+<p>Required columns: <code>computer_number</code>, <code>source_email</code>, <code>target_email</code>, <code>first_name</code>, <code>last_name</code>. Optional: <code>middle_name</code>.</p>
+<p class="hint">These users go through the configured AD identity and Microsoft 365 readiness controls before migration.</p>
+</div>
+
+<div id="existingHelp" class="modebox" style="display:none">
+<h3>Existing password → Cloudiway only</h3>
+<p>Required columns: <code>source_email</code>, <code>target_email</code>, <code>password</code>.</p>
+<p>Optional reference columns: <code>first_name</code>, <code>middle_name</code>, <code>last_name</code>, <code>computer_number</code>.</p>
+<div class="warn"><b>No AD work is performed in this mode.</b> The app does not create, modify, enable, or validate an AD account and does not reset the Rackspace password. It encrypts the supplied password, sends that source credential to Cloudiway for the selected users, and uses the existing configured Cloudiway source/target connectors. The Microsoft 365 target mailbox therefore needs to already exist and be usable.</div>
+<p class="hint">The password is stored encrypted in MySQL and is not written to application logs. Use the exact current IMAP/Rackspace source password in the spreadsheet.</p>
+</div>
+
 <button>Upload & Stage Master List</button>
 </form>
-</div></div></body></html>
+</div></div>
+<script>
+function showModeHelp(){
+  const direct=document.getElementById('workflowMode').value==='existing_password';
+  document.getElementById('existingHelp').style.display=direct?'block':'none';
+  document.getElementById('normalHelp').style.display=direct?'none':'block';
+}
+showModeHelp();
+</script></body></html>
