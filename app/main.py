@@ -812,7 +812,10 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                 """SELECT ub.*,
                           COUNT(ubm.user_id) AS member_count,
                           SUM(mbm.user_id IS NOT NULL) AS assigned_count,
-                          SUM(mbm.user_id IS NULL) AS available_count,
+                          SUM(mbm.user_id IS NULL
+                              AND u.migration_status='waiting'
+                              AND u.cloudiway_object_id IS NULL
+                              AND u.generated_password_enc IS NULL) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -843,7 +846,10 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                 """SELECT ub.*,
                           COUNT(ubm.user_id) AS member_count,
                           SUM(mbm.user_id IS NOT NULL) AS assigned_count,
-                          SUM(mbm.user_id IS NULL) AS available_count,
+                          SUM(mbm.user_id IS NULL
+                              AND u.migration_status='waiting'
+                              AND u.cloudiway_object_id IS NULL
+                              AND u.generated_password_enc IS NULL) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -881,7 +887,12 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                         (upload_batch_id,),
                     ).fetchall()
                 ]
-                available_members = [m for m in members if not m.get("migration_batch_id")]
+                available_members = [
+                    m for m in members
+                    if not m.get("migration_batch_id")
+                    and m.get("migration_status") == "waiting"
+                    and not m.get("cloudiway_object_id")
+                ]
                 migration_batches = [
                     dict(r) for r in db.execute(
                         """SELECT mb.*,
@@ -972,6 +983,9 @@ async def workflow_generate_batch(
                FROM upload_batch_members ubm
                JOIN users u ON u.id=ubm.user_id
                WHERE ubm.upload_batch_id=?
+                 AND u.migration_status='waiting'
+                 AND u.cloudiway_object_id IS NULL
+                 AND u.generated_password_enc IS NULL
                  AND NOT EXISTS (
                      SELECT 1
                      FROM migration_batch_members mbm
