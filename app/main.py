@@ -892,6 +892,7 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                     if not m.get("migration_batch_id")
                     and m.get("migration_status") == "waiting"
                     and not m.get("cloudiway_object_id")
+                    and m.get("rackspace_status") in ("not_generated", "pending")
                 ]
                 migration_batches = [
                     dict(r) for r in db.execute(
