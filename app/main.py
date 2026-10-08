@@ -961,6 +961,72 @@ async def download_upload_template(request: Request):
     )
 
 
+@app.get("/upload/existing-password-template.xlsx")
+async def download_existing_password_template(request: Request):
+    require_admin(request)
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cloudiway Existing Password"
+    headers = [
+        "source_email",
+        "target_email",
+        "password",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "computer_number",
+    ]
+    ws.append(headers)
+    ws.append([
+        "john.brown@jcf.gov.jm",
+        "john.brown@jcf.gov.jm",
+        "ExistingSourcePasswordHere",
+        "John",
+        "A.",
+        "Brown",
+        "14323",
+    ])
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    widths = [34, 34, 34, 20, 18, 22, 18]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + idx)].width = width
+    ws.freeze_panes = "A2"
+
+    info = wb.create_sheet("Instructions")
+    rows = [
+        ["Field", "Required", "Purpose"],
+        ["source_email", "Yes", "Existing Rackspace/IMAP source mailbox username."],
+        ["target_email", "Yes", "Existing Microsoft 365 target mailbox."],
+        ["password", "Yes", "Current source mailbox password. Stored encrypted; AD and Rackspace password changes are bypassed."],
+        ["first_name", "No", "Optional display/reference field only in this mode."],
+        ["middle_name", "No", "Optional display/reference field only in this mode."],
+        ["last_name", "No", "Optional display/reference field only in this mode."],
+        ["computer_number", "No", "Optional reference field only; no AD lookup is performed in this mode."],
+    ]
+    for row in rows:
+        info.append(row)
+    for cell in info[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    info.column_dimensions["A"].width = 22
+    info.column_dimensions["B"].width = 12
+    info.column_dimensions["C"].width = 95
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="JCF_Cloudiway_Existing_Password_Upload_Template.xlsx"'},
+    )
+
+
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page(request: Request):
     redirect = _page_auth(request)
@@ -983,9 +1049,9 @@ async def upload_users(
     raw = await file.read()
     try:
         if file.filename.lower().endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(raw))
+            df = pd.read_csv(io.BytesIO(raw), dtype=str).fillna("")
         else:
-            df = pd.read_excel(io.BytesIO(raw))
+            df = pd.read_excel(io.BytesIO(raw), dtype=str).fillna("")
     except Exception as exc:
         return templates.TemplateResponse(
             request=request,
@@ -1083,7 +1149,8 @@ async def upload_users(
             middle = _clean_cell(row.get("middle_name"))
             last = _clean_cell(row.get("last_name"))
             computer_number = _clean_cell(row.get("computer_number"))
-            supplied_password = _clean_cell(row.get("password"))
+            raw_password = row.get("password")
+            supplied_password = "" if raw_password is None or pd.isna(raw_password) else str(raw_password)
             if workflow_mode == "existing_password":
                 if not supplied_password:
                     skipped += 1
@@ -1205,7 +1272,7 @@ async def upload_users(
     )
     request.session["workflow_notice"] = (
         f"Upload {batch_name} staged with {imported} user(s). "
-        (
+        + (
             "Choose how many users to push to Cloudiway next; the supplied source passwords are already stored encrypted."
             if workflow_mode == "existing_password"
             else "Choose how many users to process next; passwords will only be generated for that selection."
