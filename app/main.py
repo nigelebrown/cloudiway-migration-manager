@@ -1125,7 +1125,7 @@ async def upload_users(
                 file.filename,
                 workflow_mode,
                 "staged",
-                int(get_active_profile()["id"]) if get_active_profile() else None,
+                None if workflow_mode == "existing_password" else (int(get_active_profile()["id"]) if get_active_profile() else None),
                 0,
                 total_rows,
             ),
