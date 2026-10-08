@@ -1111,7 +1111,7 @@ async def advance_upload_workflows() -> dict:
         auto_rows = db.execute(
             """SELECT id FROM upload_batches
                WHERE auto_start=1
-                 AND workflow_status IN ('passwords_confirmed','ready_to_migrate')
+                 AND workflow_status IN ('passwords_confirmed','ready_to_migrate','ready_for_automatic')
                ORDER BY id LIMIT 5"""
         ).fetchall()
 
