@@ -77,6 +77,8 @@ SCHEMA = [
         ad_host VARCHAR(255) NULL,
         ad_port INT NOT NULL DEFAULT 636,
         ad_use_ssl TINYINT(1) NOT NULL DEFAULT 1,
+        ad_tls_validate TINYINT(1) NOT NULL DEFAULT 1,
+        ad_ca_cert_path VARCHAR(1024) NULL,
         ad_base_dn VARCHAR(1024) NULL,
         ad_bind_username VARCHAR(512) NULL,
         ad_bind_password_enc LONGTEXT NULL,
@@ -377,6 +379,24 @@ def init_db():
         ]:
             if column_name not in migration_batch_columns:
                 db.execute(f"ALTER TABLE migration_batches ADD COLUMN {column_name} {definition}")
+
+        profile_columns = {
+            row["COLUMN_NAME"]
+            for row in db.execute(
+                """SELECT COLUMN_NAME
+                   FROM INFORMATION_SCHEMA.COLUMNS
+                   WHERE TABLE_SCHEMA=? AND TABLE_NAME='environment_profiles'""",
+                (settings.db_name,),
+            ).fetchall()
+        }
+        if "ad_tls_validate" not in profile_columns:
+            db.execute(
+                "ALTER TABLE environment_profiles ADD COLUMN ad_tls_validate TINYINT(1) NOT NULL DEFAULT 1 AFTER ad_use_ssl"
+            )
+        if "ad_ca_cert_path" not in profile_columns:
+            db.execute(
+                "ALTER TABLE environment_profiles ADD COLUMN ad_ca_cert_path VARCHAR(1024) NULL AFTER ad_tls_validate"
+            )
 
         migration_member_indexes = {
             row["INDEX_NAME"]
