@@ -977,7 +977,7 @@ async def upload_users(
 ):
     require_admin(request)
 
-    if workflow_mode not in ("manual_bulk", "automatic"):
+    if workflow_mode not in ("manual_bulk", "automatic", "existing_password"):
         workflow_mode = "manual_bulk"
 
     raw = await file.read()
@@ -1016,9 +1016,18 @@ async def upload_users(
         "computernumber": "computer_number",
         "computer_no": "computer_number",
         "computer no": "computer_number",
+        "source password": "password",
+        "sourcepassword": "password",
+        "imap password": "password",
+        "imappassword": "password",
+        "rackspace password": "password",
+        "rackspacepassword": "password",
     }
     df.rename(columns={col: aliases.get(col, col) for col in df.columns}, inplace=True)
-    required_columns = {"computer_number", "source_email", "target_email", "first_name", "last_name"}
+    if workflow_mode == "existing_password":
+        required_columns = {"source_email", "target_email", "password"}
+    else:
+        required_columns = {"computer_number", "source_email", "target_email", "first_name", "last_name"}
     missing_columns = sorted(required_columns - set(df.columns))
     if missing_columns:
         return templates.TemplateResponse(
@@ -1027,7 +1036,9 @@ async def upload_users(
             context={
                 "request": request,
                 "error": "Missing required upload column(s): " + ", ".join(missing_columns)
-                + ". Download and use the standard JCF upload template."
+                + (". For Cloudiway-only existing-password mode, source_email, target_email and password are required."
+                   if workflow_mode == "existing_password"
+                   else ". Download and use the standard JCF upload template.")
             },
             status_code=400,
         )
@@ -1072,7 +1083,12 @@ async def upload_users(
             middle = _clean_cell(row.get("middle_name"))
             last = _clean_cell(row.get("last_name"))
             computer_number = _clean_cell(row.get("computer_number"))
-            if not all([computer_number, src, tgt, first, last]):
+            supplied_password = _clean_cell(row.get("password"))
+            if workflow_mode == "existing_password":
+                if not supplied_password:
+                    skipped += 1
+                    continue
+            elif not all([computer_number, src, tgt, first, last]):
                 skipped += 1
                 continue
 
@@ -1116,15 +1132,28 @@ async def upload_users(
                 (upload_batch_id, user_id, row_order),
             )
 
-            # Staging an upload does not generate passwords. The admin chooses
-            # the next quantity (or exact users) before a migration batch is created.
+            # Normal/manual workflows stage users without passwords. In
+            # existing-password mode, the supplied source password is encrypted
+            # immediately and is never written to logs or rendered in the UI.
+            stored_password = encrypt_secret(supplied_password) if workflow_mode == "existing_password" else None
+            rackspace_state = (
+                "existing_password"
+                if workflow_mode == "existing_password"
+                else ("not_generated" if workflow_mode == "manual_bulk" else "pending")
+            )
+            provisioning_state = "bypassed" if workflow_mode == "existing_password" else "not_checked"
             db.execute(
                 """UPDATE users
-                   SET generated_password_enc=NULL,
+                   SET generated_password_enc=?,
                        password_reset_method=?,
                        manual_password_generated_at=NULL,
                        manual_password_confirmed_at=NULL,
                        rackspace_status=?,
+                       provisioning_status=?,
+                       ad_match_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
+                       entra_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
+                       license_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
+                       mailbox_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
                        cloudiway_status='not_submitted',
                        migration_status='waiting',
                        progress_percent=NULL,
@@ -1135,8 +1164,14 @@ async def upload_users(
                        updated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
                 (
+                    stored_password,
                     workflow_mode,
-                    "not_generated" if workflow_mode == "manual_bulk" else "pending",
+                    rackspace_state,
+                    provisioning_state,
+                    workflow_mode,
+                    workflow_mode,
+                    workflow_mode,
+                    workflow_mode,
                     user_id,
                 ),
             )
@@ -1170,7 +1205,11 @@ async def upload_users(
     )
     request.session["workflow_notice"] = (
         f"Upload {batch_name} staged with {imported} user(s). "
-        "Choose how many users to process next; passwords will only be generated for that selection."
+        (
+            "Choose how many users to push to Cloudiway next; the supplied source passwords are already stored encrypted."
+            if workflow_mode == "existing_password"
+            else "Choose how many users to process next; passwords will only be generated for that selection."
+        )
     )
     return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
@@ -1185,7 +1224,7 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                           SUM(mbm.user_id IS NULL
                               AND u.migration_status='waiting'
                               AND u.cloudiway_object_id IS NULL
-                              AND u.generated_password_enc IS NULL) AS available_count,
+                              AND (ub.workflow_mode='existing_password' OR u.generated_password_enc IS NULL)) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -1219,7 +1258,7 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                           SUM(mbm.user_id IS NULL
                               AND u.migration_status='waiting'
                               AND u.cloudiway_object_id IS NULL
-                              AND u.generated_password_enc IS NULL) AS available_count,
+                              AND (ub.workflow_mode='existing_password' OR u.generated_password_enc IS NULL)) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -1271,7 +1310,10 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                     if not m.get("migration_batch_id")
                     and m.get("migration_status") == "waiting"
                     and not m.get("cloudiway_object_id")
-                    and m.get("rackspace_status") in ("not_generated", "pending")
+                    and (
+                        upload.get("workflow_mode") == "existing_password"
+                        or m.get("rackspace_status") in ("not_generated", "pending")
+                    )
                 ]
                 migration_batches = [
                     dict(r) for r in db.execute(
@@ -1360,8 +1402,16 @@ async def workflow_generate_batch(
         )
         return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
-    profile = get_active_profile()
-    if not profile:
+    with conn() as db:
+        upload = db.execute(
+            "SELECT * FROM upload_batches WHERE id=?",
+            (upload_batch_id,),
+        ).fetchone()
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload batch not found")
+
+    profile = None if upload["workflow_mode"] == "existing_password" else get_active_profile()
+    if upload["workflow_mode"] != "existing_password" and not profile:
         request.session["workflow_error"] = (
             "No AD/Microsoft 365 environment profile is active. Configure and activate TEST or PRODUCTION first."
         )
@@ -1382,7 +1432,7 @@ async def workflow_generate_batch(
                WHERE ubm.upload_batch_id=?
                  AND u.migration_status='waiting'
                  AND u.cloudiway_object_id IS NULL
-                 AND u.generated_password_enc IS NULL
+                 AND (?='existing_password' OR u.generated_password_enc IS NULL)
                  AND NOT EXISTS (
                      SELECT 1
                      FROM migration_batch_members mbm
@@ -1390,7 +1440,7 @@ async def workflow_generate_batch(
                      WHERE mb.upload_batch_id=? AND mbm.user_id=u.id
                  )
                ORDER BY ubm.row_order,u.id""",
-            (upload_batch_id, upload_batch_id),
+            (upload_batch_id, upload["workflow_mode"], upload_batch_id),
         ).fetchall()
 
         available_ids = [int(r["id"]) for r in available]
@@ -1418,7 +1468,7 @@ async def workflow_generate_batch(
                 return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
             selected_ids = available_ids[:quantity]
 
-        if str(profile["environment_type"]).upper() == "PRODUCTION":
+        if profile and str(profile["environment_type"]).upper() == "PRODUCTION":
             maximum = int(profile.get("production_max_batch") or 100)
             if len(selected_ids) > maximum:
                 request.session["workflow_error"] = (
@@ -1444,8 +1494,8 @@ async def workflow_generate_batch(
                 upload_batch_id,
                 seq,
                 batch_name,
-                "identity_pending",
-                int(profile["id"]),
+                "ready_for_cloudiway" if upload["workflow_mode"] == "existing_password" else "identity_pending",
+                int(profile["id"]) if profile else None,
                 1 if auto_start else 0,
                 batch_name,
                 len(selected_ids),
@@ -1461,21 +1511,23 @@ async def workflow_generate_batch(
             )
             db.execute(
                 """UPDATE users
-                   SET provisioning_profile_id=?,provisioning_status='not_checked',
-                       ad_match_status='not_checked',ad_conflict_reason=NULL,
+                   SET provisioning_profile_id=?,
+                       provisioning_status=CASE WHEN password_reset_method='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
+                       ad_match_status=CASE WHEN password_reset_method='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
+                       ad_conflict_reason=NULL,
                        provisioning_error=NULL,batch_number=?,
                        rackspace_status=CASE
                          WHEN password_reset_method='manual_bulk' THEN 'not_generated'
                          ELSE rackspace_status END,
                        updated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
-                (int(profile["id"]), migration_batch_id, uid),
+                (int(profile["id"]) if profile else None, migration_batch_id, uid),
             )
 
         db.execute(
             "UPDATE upload_batches SET provisioning_profile_id=?,workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (
-                int(profile["id"]),
+                int(profile["id"]) if profile else None,
                 "fully_batched" if len(selected_ids) == len(available_ids) else "partially_batched",
                 upload_batch_id,
             ),
@@ -1490,23 +1542,44 @@ async def workflow_generate_batch(
         )
         return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
-    try:
-        assessment = assess_migration_batch(migration_batch_id)
-        request.session["workflow_notice"] = (
-            f"{batch_name} created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
-            f"AD dry-run: {assessment['confirmed']} confirmed, {assessment['not_found']} missing/new-user candidates, "
-            f"{assessment['manual_review']} manual review, {assessment['errors']} errors. "
-            "No AD changes or Rackspace password changes were made."
-        )
-    except Exception as exc:
-        request.session["workflow_error"] = (
-            f"{batch_name} and Cloudiway batch {cloud_batch_id} were created, but the AD dry-run failed: {exc}"
-        )
+    if upload["workflow_mode"] == "existing_password":
+        try:
+            prepared = await prepare_migration_batch(migration_batch_id)
+            if prepared.get("ready"):
+                request.session["workflow_notice"] = (
+                    f"{batch_name} created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
+                    "AD and Rackspace password-reset steps were bypassed. The supplied Excel passwords were "
+                    "registered with Cloudiway and the batch is ready to migrate."
+                )
+                if auto_start:
+                    started = await start_migration_batch(migration_batch_id)
+                    if started.get("started"):
+                        request.session["workflow_notice"] += " Migration started automatically."
+            else:
+                request.session["workflow_error"] = str(prepared.get("reason") or "Cloudiway preparation did not complete")
+        except Exception as exc:
+            request.session["workflow_error"] = (
+                f"{batch_name} and Cloudiway batch {cloud_batch_id} were created, but Cloudiway credential preparation failed: {exc}"
+            )
+    else:
+        try:
+            assessment = assess_migration_batch(migration_batch_id)
+            request.session["workflow_notice"] = (
+                f"{batch_name} created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
+                f"AD dry-run: {assessment['confirmed']} confirmed, {assessment['not_found']} missing/new-user candidates, "
+                f"{assessment['manual_review']} manual review, {assessment['errors']} errors. "
+                "No AD changes or Rackspace password changes were made."
+            )
+        except Exception as exc:
+            request.session["workflow_error"] = (
+                f"{batch_name} and Cloudiway batch {cloud_batch_id} were created, but the AD dry-run failed: {exc}"
+            )
 
     log_event(
         None,
         "migration_batch_selected",
-        f"{batch_name}: selected {len(selected_ids)} user(s); profile={profile['name']}; Cloudiway batch {cloud_batch_id}",
+        f"{batch_name}: selected {len(selected_ids)} user(s); mode={upload['workflow_mode']}; "
+        f"profile={(profile['name'] if profile else 'bypassed')}; Cloudiway batch {cloud_batch_id}",
     )
     return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
