@@ -25,7 +25,7 @@ def test_admin_login_and_upload_csv(monkeypatch):
     with TestClient(app) as client:
         r = client.post("/login", data={"admin_password": "test-admin-password"}, follow_redirects=False)
         assert r.status_code == 303
-        csv = b"source_email,target_email,first_name,last_name\na@example.com,a@jcf.gov.jm,A,User\n"
+        csv = b"computer_number,source_email,target_email,first_name,middle_name,last_name\n14323,a@example.com,a@jcf.gov.jm,A,,User\n"
         r = client.post("/upload", files={"file": ("users.csv", csv, "text/csv")}, follow_redirects=False)
         assert r.status_code == 303
         r = client.get("/api/dashboard")
