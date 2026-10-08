@@ -63,6 +63,8 @@ def ad_client_for_profile(profile: dict) -> ActiveDirectoryClient:
         license_group_dn=profile.get("ad_license_group_dn") or "",
         computer_number_attribute=profile.get("ad_computer_number_attribute") or "",
         upn_suffix=profile.get("ad_upn_suffix") or "",
+        tls_validate=bool(profile.get("ad_tls_validate", 1)),
+        ca_cert_path=profile.get("ad_ca_cert_path") or "",
     )
 
 
@@ -117,6 +119,10 @@ def _assert_writes_allowed(profile: dict, selected_count: int = 1) -> None:
         raise RuntimeError("Emergency Stop is active. All directory write operations are blocked.")
     if int(profile.get("writes_enabled") or 0) != 1:
         raise RuntimeError("Directory writes are disabled for the active environment profile.")
+    if int(profile.get("ad_use_ssl") or 0) != 1:
+        raise RuntimeError("Directory writes require LDAPS; insecure LDAP is not permitted.")
+    if int(profile.get("ad_tls_validate", 1) or 0) != 1:
+        raise RuntimeError("Directory writes require AD TLS certificate validation.")
     if str(profile.get("environment_type") or "").upper() == "PRODUCTION":
         maximum = int(profile.get("production_max_batch") or 100)
         if selected_count > maximum:
