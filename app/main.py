@@ -895,6 +895,69 @@ async def api_cloudiway_pools(request: Request):
         return JSONResponse({"ok": False, "message": str(exc), "choices": []}, status_code=400)
 
 
+@app.get("/upload/template.xlsx")
+async def download_upload_template(request: Request):
+    require_admin(request)
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Users Template"
+    headers = [
+        "computer_number",
+        "source_email",
+        "target_email",
+        "first_name",
+        "middle_name",
+        "last_name",
+    ]
+    ws.append(headers)
+    ws.append([
+        "14323",
+        "john.brown@jcf.gov.jm",
+        "john.brown@jcf.gov.jm",
+        "John",
+        "A.",
+        "Brown",
+    ])
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    widths = [18, 34, 34, 22, 18, 24]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + idx)].width = width
+    ws.freeze_panes = "A2"
+
+    info = wb.create_sheet("Instructions")
+    rows = [
+        ["Field", "Required", "Purpose"],
+        ["computer_number", "Yes", "JCF Computer Number; must match the configured custom AD attribute for existing accounts."],
+        ["source_email", "Yes", "Current Rackspace/source mailbox."],
+        ["target_email", "Yes", "Target AD UPN / Microsoft 365 mailbox."],
+        ["first_name", "Yes", "Authoritative first name used in AD identity matching."],
+        ["middle_name", "No", "Optional middle name/initial."],
+        ["last_name", "Yes", "Authoritative surname used in AD identity matching."],
+    ]
+    for row in rows:
+        info.append(row)
+    for cell in info[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    info.column_dimensions["A"].width = 22
+    info.column_dimensions["B"].width = 12
+    info.column_dimensions["C"].width = 80
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="JCF_M365_AD_Provisioning_Upload_Template.xlsx"'},
+    )
+
+
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page(request: Request):
     redirect = _page_auth(request)
@@ -937,6 +1000,8 @@ async def upload_users(
         "lastname": "last_name",
         "first name": "first_name",
         "last name": "last_name",
+        "middlename": "middle_name",
+        "middle name": "middle_name",
         "username": "source_email",
         "sourceemail": "source_email",
         "source email address": "source_email",
@@ -950,11 +1015,17 @@ async def upload_users(
         "computer no": "computer_number",
     }
     df.rename(columns={col: aliases.get(col, col) for col in df.columns}, inplace=True)
-    if "source_email" not in df.columns:
+    required_columns = {"computer_number", "source_email", "target_email", "first_name", "last_name"}
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
         return templates.TemplateResponse(
             request=request,
             name="upload.html",
-            context={"request": request, "error": "The file must include source_email (or Email)."},
+            context={
+                "request": request,
+                "error": "Missing required upload column(s): " + ", ".join(missing_columns)
+                + ". Download and use the standard JCF upload template."
+            },
             status_code=400,
         )
 
@@ -967,13 +1038,14 @@ async def upload_users(
         cursor = db.execute(
             """INSERT INTO upload_batches(
                    batch_name,original_filename,workflow_mode,workflow_status,
-                   auto_start,total_rows
-               ) VALUES(?,?,?,?,?,?)""",
+                   provisioning_profile_id,auto_start,total_rows
+               ) VALUES(?,?,?,?,?,?,?)""",
             (
                 pending_name,
                 file.filename,
                 workflow_mode,
                 "staged",
+                int(get_active_profile()["id"]) if get_active_profile() else None,
                 0,
                 total_rows,
             ),
@@ -996,8 +1068,12 @@ async def upload_users(
                 continue
 
             first = _clean_cell(row.get("first_name"))
+            middle = _clean_cell(row.get("middle_name"))
             last = _clean_cell(row.get("last_name"))
             computer_number = _clean_cell(row.get("computer_number"))
+            if not all([computer_number, src, tgt, first, last]):
+                skipped += 1
+                continue
 
             existing = db.execute(
                 """SELECT u.id,u.migration_status,
@@ -1014,17 +1090,18 @@ async def upload_users(
 
             db.execute(
                 """INSERT INTO users(
-                       source_email,target_email,first_name,last_name,computer_number,
+                       source_email,target_email,first_name,middle_name,last_name,computer_number,
                        password_reset_method
                    )
-                   VALUES(?,?,?,?,?,?)
+                   VALUES(?,?,?,?,?,?,?)
                    ON DUPLICATE KEY UPDATE
                      target_email=VALUES(target_email),
                      first_name=VALUES(first_name),
+                     middle_name=VALUES(middle_name),
                      last_name=VALUES(last_name),
                      computer_number=VALUES(computer_number),
                      password_reset_method=VALUES(password_reset_method)""",
-                (src, tgt, first, last, computer_number, workflow_mode),
+                (src, tgt, first, middle, last, computer_number, workflow_mode),
             )
             user_row = db.execute(
                 "SELECT id FROM users WHERE source_email=?",
