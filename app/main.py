@@ -1058,6 +1058,14 @@ async def workflow_generate_batch(
                 (migration_batch_id, uid),
             )
 
+        db.execute(
+            "UPDATE upload_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (
+                "fully_batched" if len(selected_ids) == len(available_ids) else "partially_batched",
+                upload_batch_id,
+            ),
+        )
+
         if upload["workflow_mode"] == "manual_bulk":
             for uid in selected_ids:
                 password = generate_password()
