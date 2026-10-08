@@ -618,3 +618,13 @@ def test_logout_does_not_disconnect_cloudiway():
     assert get_setting("cloudiway_token") != ""
     assert get_setting("cloudiway_keep_connected") == "1"
     assert get_setting("cloudiway_username") == "admin@example.com"
+
+
+def test_classify_cannot_connect_imap_client():
+    status, code, message = service.classify_cloudiway_issue(
+        {"status": "Stopped"},
+        {"logs": ["Migration Error: Cannot connect Imap client"]},
+    )
+    assert status == "failed"
+    assert code == "source_imap_connection_failed"
+    assert "source imap mailbox" in message.lower()
