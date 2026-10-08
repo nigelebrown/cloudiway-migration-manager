@@ -441,6 +441,273 @@ async def settings_page(request: Request):
     )
 
 
+@app.get("/settings/provisioning", response_class=HTMLResponse)
+async def provisioning_settings_page(request: Request, profile_id: int | None = None):
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
+    profiles = list_profiles()
+    selected = None
+    if profile_id:
+        selected = get_profile(profile_id)
+    elif profiles:
+        active = next((p for p in profiles if int(p.get("is_active") or 0) == 1), None)
+        selected = get_profile(int((active or profiles[0])["id"]))
+    return templates.TemplateResponse(
+        request=request,
+        name="provisioning_settings.html",
+        context={
+            "request": request,
+            "profiles": profiles,
+            "profile": selected,
+            "notice": request.session.pop("provisioning_notice", None),
+            "error": request.session.pop("provisioning_error", None),
+        },
+    )
+
+
+@app.post("/settings/provisioning/save")
+async def save_provisioning_profile(
+    request: Request,
+    profile_id: int = Form(0),
+    name: str = Form(...),
+    environment_type: str = Form("TEST"),
+    production_max_batch: int = Form(100),
+    ad_host: str = Form(""),
+    ad_port: int = Form(636),
+    ad_use_ssl: str = Form(""),
+    ad_base_dn: str = Form(""),
+    ad_bind_username: str = Form(""),
+    ad_bind_password: str = Form(""),
+    ad_target_ou: str = Form(""),
+    ad_license_group_dn: str = Form(""),
+    ad_computer_number_attribute: str = Form(""),
+    ad_upn_suffix: str = Form(""),
+    ad_default_password: str = Form(""),
+    ad_force_password_change: str = Form(""),
+    ad_allow_user_creation: str = Form(""),
+    ad_allow_group_changes: str = Form(""),
+    graph_tenant_id: str = Form(""),
+    graph_client_id: str = Form(""),
+    graph_client_secret: str = Form(""),
+    graph_required_sku: str = Form(""),
+    sync_agent_url: str = Form(""),
+    sync_agent_token: str = Form(""),
+    sql_host: str = Form(""),
+    sql_port: int = Form(1433),
+    sql_database: str = Form(""),
+    sql_username: str = Form(""),
+    sql_password: str = Form(""),
+    sql_source_view: str = Form(""),
+    vpn_profile_name: str = Form(""),
+    network_notes: str = Form(""),
+):
+    require_admin(request)
+    env_type = environment_type.strip().upper()
+    if env_type not in ("TEST", "PRODUCTION"):
+        request.session["provisioning_error"] = "Environment type must be TEST or PRODUCTION."
+        return RedirectResponse("/settings/provisioning", 303)
+    if not name.strip():
+        request.session["provisioning_error"] = "Profile name is required."
+        return RedirectResponse("/settings/provisioning", 303)
+    if production_max_batch < 1 or production_max_batch > 5000:
+        request.session["provisioning_error"] = "Maximum batch size must be between 1 and 5000."
+        return RedirectResponse("/settings/provisioning", 303)
+
+    existing = get_profile(profile_id) if profile_id else None
+    def enc_or_existing(raw_value: str, column: str):
+        if raw_value:
+            return encrypt_secret(raw_value)
+        return (existing or {}).get(column)
+
+    values = (
+        name.strip(), env_type, production_max_batch,
+        ad_host.strip(), ad_port, 1 if ad_use_ssl else 0, ad_base_dn.strip(),
+        ad_bind_username.strip(), enc_or_existing(ad_bind_password, "ad_bind_password_enc"),
+        ad_target_ou.strip(), ad_license_group_dn.strip(), ad_computer_number_attribute.strip(),
+        ad_upn_suffix.strip(), enc_or_existing(ad_default_password, "ad_default_password_enc"),
+        1 if ad_force_password_change else 0,
+        1 if ad_allow_user_creation else 0,
+        1 if ad_allow_group_changes else 0,
+        graph_tenant_id.strip(), graph_client_id.strip(),
+        enc_or_existing(graph_client_secret, "graph_client_secret_enc"),
+        graph_required_sku.strip(),
+        sync_agent_url.strip(), enc_or_existing(sync_agent_token, "sync_agent_token_enc"),
+        sql_host.strip(), sql_port, sql_database.strip(), sql_username.strip(),
+        enc_or_existing(sql_password, "sql_password_enc"), sql_source_view.strip(),
+        vpn_profile_name.strip(), network_notes.strip(),
+    )
+
+    with conn() as db:
+        if existing:
+            db.execute(
+                """UPDATE environment_profiles SET
+                   name=?,environment_type=?,production_max_batch=?,
+                   ad_host=?,ad_port=?,ad_use_ssl=?,ad_base_dn=?,ad_bind_username=?,
+                   ad_bind_password_enc=?,ad_target_ou=?,ad_license_group_dn=?,
+                   ad_computer_number_attribute=?,ad_upn_suffix=?,ad_default_password_enc=?,
+                   ad_force_password_change=?,ad_allow_user_creation=?,ad_allow_group_changes=?,
+                   graph_tenant_id=?,graph_client_id=?,graph_client_secret_enc=?,graph_required_sku=?,
+                   sync_agent_url=?,sync_agent_token_enc=?,
+                   sql_host=?,sql_port=?,sql_database=?,sql_username=?,sql_password_enc=?,sql_source_view=?,
+                   vpn_profile_name=?,network_notes=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (*values, profile_id),
+            )
+            saved_id = profile_id
+        else:
+            cur = db.execute(
+                """INSERT INTO environment_profiles(
+                   name,environment_type,production_max_batch,
+                   ad_host,ad_port,ad_use_ssl,ad_base_dn,ad_bind_username,ad_bind_password_enc,
+                   ad_target_ou,ad_license_group_dn,ad_computer_number_attribute,ad_upn_suffix,
+                   ad_default_password_enc,ad_force_password_change,ad_allow_user_creation,
+                   ad_allow_group_changes,graph_tenant_id,graph_client_id,graph_client_secret_enc,
+                   graph_required_sku,sync_agent_url,sync_agent_token_enc,
+                   sql_host,sql_port,sql_database,sql_username,sql_password_enc,sql_source_view,
+                   vpn_profile_name,network_notes
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                values,
+            )
+            saved_id = int(cur.lastrowid)
+    request.session["provisioning_notice"] = (
+        "Environment profile saved. Secrets are encrypted in MySQL; the application encryption key remains outside the database."
+    )
+    return RedirectResponse(f"/settings/provisioning?profile_id={saved_id}", 303)
+
+
+@app.post("/settings/provisioning/{profile_id}/activate")
+async def activate_provisioning_profile(
+    request: Request,
+    profile_id: int,
+    confirmation: str = Form(""),
+):
+    require_admin(request)
+    profile = get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if str(profile["environment_type"]).upper() == "PRODUCTION" and confirmation.strip().upper() != "PRODUCTION":
+        request.session["provisioning_error"] = "Type PRODUCTION to activate a production profile."
+        return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+    with conn() as db:
+        db.execute("UPDATE environment_profiles SET is_active=0")
+        db.execute(
+            "UPDATE environment_profiles SET is_active=1,writes_enabled=0 WHERE id=?",
+            (profile_id,),
+        )
+    request.session["provisioning_notice"] = (
+        f"{profile['name']} is now active. Directory writes remain disabled until explicitly enabled."
+    )
+    log_event(None, "provisioning_profile_activated", f"Activated {profile['name']} ({profile['environment_type']}); writes disabled")
+    return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+
+
+@app.post("/settings/provisioning/{profile_id}/writes")
+async def set_provisioning_writes(
+    request: Request,
+    profile_id: int,
+    enable: str = Form("0"),
+    confirmation: str = Form(""),
+):
+    require_admin(request)
+    profile = get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    enabling = enable == "1"
+    if enabling:
+        expected = "ENABLE PRODUCTION WRITES" if str(profile["environment_type"]).upper() == "PRODUCTION" else "ENABLE TEST WRITES"
+        if confirmation.strip().upper() != expected:
+            request.session["provisioning_error"] = f"Type {expected} exactly to enable directory writes."
+            return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+        if int(profile.get("is_active") or 0) != 1:
+            request.session["provisioning_error"] = "Only the active environment profile can have writes enabled."
+            return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+    with conn() as db:
+        db.execute(
+            "UPDATE environment_profiles SET writes_enabled=? WHERE id=?",
+            (1 if enabling else 0, profile_id),
+        )
+    request.session["provisioning_notice"] = (
+        "Directory writes enabled." if enabling else "Directory writes disabled."
+    )
+    log_event(None, "provisioning_writes_changed", f"Profile {profile['name']}: writes={'enabled' if enabling else 'disabled'}")
+    return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+
+
+@app.post("/settings/provisioning/{profile_id}/emergency-stop")
+async def provisioning_emergency_stop(request: Request, profile_id: int):
+    require_admin(request)
+    profile = get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    with conn() as db:
+        db.execute(
+            "UPDATE environment_profiles SET emergency_stop=1,writes_enabled=0 WHERE id=?",
+            (profile_id,),
+        )
+    log_event(None, "provisioning_emergency_stop", f"Emergency Stop activated for {profile['name']}")
+    request.session["provisioning_notice"] = "Emergency Stop activated. All AD write operations are blocked."
+    return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+
+
+@app.post("/settings/provisioning/{profile_id}/clear-stop")
+async def provisioning_clear_stop(
+    request: Request,
+    profile_id: int,
+    confirmation: str = Form(""),
+):
+    require_admin(request)
+    if confirmation.strip().upper() != "CLEAR STOP":
+        request.session["provisioning_error"] = "Type CLEAR STOP to clear Emergency Stop."
+        return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+    profile = get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    with conn() as db:
+        db.execute(
+            "UPDATE environment_profiles SET emergency_stop=0,writes_enabled=0 WHERE id=?",
+            (profile_id,),
+        )
+    log_event(None, "provisioning_emergency_stop_cleared", f"Emergency Stop cleared for {profile['name']}; writes remain disabled")
+    request.session["provisioning_notice"] = "Emergency Stop cleared. Directory writes remain disabled until re-enabled."
+    return RedirectResponse(f"/settings/provisioning?profile_id={profile_id}", 303)
+
+
+@app.post("/settings/provisioning/{profile_id}/test")
+async def test_provisioning_profile(request: Request, profile_id: int):
+    require_admin(request)
+    profile = get_profile(profile_id)
+    if not profile:
+        return JSONResponse({"ok": False, "message": "Profile not found"}, status_code=404)
+    results = {"profile": profile["name"], "environment_type": profile["environment_type"]}
+    try:
+        results["ad"] = ad_client_for_profile(profile).test_connection()
+    except Exception as exc:
+        results["ad"] = {"ok": False, "message": str(exc)}
+    try:
+        results["graph"] = await graph_client_for_profile(profile).test_connection()
+    except Exception as exc:
+        results["graph"] = {"ok": False, "message": str(exc)}
+    if profile.get("sql_host"):
+        try:
+            results["sql"] = sql_client_for_profile(profile).test_connection()
+        except Exception as exc:
+            results["sql"] = {"ok": False, "message": str(exc)}
+    else:
+        results["sql"] = {"ok": None, "message": "Not configured"}
+    sync = sync_client_for_profile(profile)
+    if sync:
+        try:
+            results["sync_agent"] = await sync.test_connection()
+        except Exception as exc:
+            results["sync_agent"] = {"ok": False, "message": str(exc)}
+    else:
+        results["sync_agent"] = {"ok": None, "message": "Not configured; normal Entra Connect schedule will be used"}
+    required_ok = bool(results["ad"].get("ok")) and bool(results["graph"].get("ok"))
+    results["ok"] = required_ok
+    return JSONResponse(results, status_code=200 if required_ok else 400)
+
+
 @app.post("/settings/rackspace")
 async def save_rackspace(
     request: Request,
