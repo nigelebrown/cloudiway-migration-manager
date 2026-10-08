@@ -1339,7 +1339,14 @@ async def workflow_generate_batch(
 
     if not get_setting("cloudiway_token"):
         request.session["workflow_error"] = (
-            "Connect Cloudiway first. Every generated migration batch must receive a Cloudiway batch number."
+            "Connect Cloudiway first. Every released migration group must receive a Cloudiway batch number."
+        )
+        return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+
+    profile = get_active_profile()
+    if not profile:
+        request.session["workflow_error"] = (
+            "No AD/Microsoft 365 environment profile is active. Configure and activate TEST or PRODUCTION first."
         )
         return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
@@ -1394,6 +1401,14 @@ async def workflow_generate_batch(
                 return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
             selected_ids = available_ids[:quantity]
 
+        if str(profile["environment_type"]).upper() == "PRODUCTION":
+            maximum = int(profile.get("production_max_batch") or 100)
+            if len(selected_ids) > maximum:
+                request.session["workflow_error"] = (
+                    f"Production profile maximum is {maximum} users per provisioning batch."
+                )
+                return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+
         seq = int(
             db.execute(
                 "SELECT COALESCE(MAX(sequence_number),0) n FROM migration_batches WHERE upload_batch_id=?",
@@ -1406,13 +1421,14 @@ async def workflow_generate_batch(
         cursor = db.execute(
             """INSERT INTO migration_batches(
                    upload_batch_id,sequence_number,batch_name,workflow_status,
-                   auto_start,cloudiway_batch_name,selected_count
-               ) VALUES(?,?,?,?,?,?,?)""",
+                   provisioning_profile_id,auto_start,cloudiway_batch_name,selected_count
+               ) VALUES(?,?,?,?,?,?,?,?)""",
             (
                 upload_batch_id,
                 seq,
                 batch_name,
-                "selected",
+                "identity_pending",
+                int(profile["id"]),
                 1 if auto_start else 0,
                 batch_name,
                 len(selected_ids),
@@ -1426,108 +1442,253 @@ async def workflow_generate_batch(
                    VALUES(?,?)""",
                 (migration_batch_id, uid),
             )
+            db.execute(
+                """UPDATE users
+                   SET provisioning_profile_id=?,provisioning_status='not_checked',
+                       ad_match_status='not_checked',ad_conflict_reason=NULL,
+                       provisioning_error=NULL,batch_number=?,
+                       rackspace_status=CASE
+                         WHEN password_reset_method='manual_bulk' THEN 'not_generated'
+                         ELSE rackspace_status END,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (int(profile["id"]), migration_batch_id, uid),
+            )
 
         db.execute(
-            "UPDATE upload_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE upload_batches SET provisioning_profile_id=?,workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (
+                int(profile["id"]),
                 "fully_batched" if len(selected_ids) == len(available_ids) else "partially_batched",
                 upload_batch_id,
             ),
         )
 
-        if upload["workflow_mode"] == "manual_bulk":
-            for uid in selected_ids:
-                password = generate_password()
-                db.execute(
-                    """UPDATE users
-                       SET generated_password_enc=?,
-                           password_reset_method='manual_bulk',
-                           rackspace_status='manual_file_generated',
-                           manual_password_generated_at=CURRENT_TIMESTAMP,
-                           manual_password_confirmed_at=NULL,
-                           cloudiway_status='not_submitted',
-                           migration_status='waiting',
-                           progress_percent=NULL,
-                           progress_detail=NULL,
-                           error_message=NULL,
-                           batch_number=?,
-                           batch_started_at=NULL,
-                           updated_at=CURRENT_TIMESTAMP
-                       WHERE id=?""",
-                    (encrypt_secret(password), migration_batch_id, uid),
-                )
-            db.execute(
-                "UPDATE migration_batches SET workflow_status='passwords_generated' WHERE id=?",
-                (migration_batch_id,),
-            )
-        else:
-            for uid in selected_ids:
-                db.execute(
-                    """UPDATE users
-                       SET password_reset_method='automatic',
-                           rackspace_status='pending',
-                           cloudiway_status='not_submitted',
-                           migration_status='waiting',
-                           error_message=NULL,
-                           batch_number=?,
-                           batch_started_at=NULL,
-                           updated_at=CURRENT_TIMESTAMP
-                       WHERE id=?""",
-                    (migration_batch_id, uid),
-                )
-            db.execute(
-                "UPDATE migration_batches SET workflow_status='ready_for_automatic' WHERE id=?",
-                (migration_batch_id,),
-            )
-
     try:
         cloud_batch_id = await ensure_migration_cloudiway_batch(migration_batch_id)
     except Exception as exc:
         request.session["workflow_error"] = (
-            f"Local batch {batch_name} was created, but Cloudiway batch creation failed: {exc}. "
-            "Use Retry Cloudiway Batch on the workflow page."
+            f"{batch_name} was created locally, but Cloudiway batch creation failed: {exc}. "
+            "The users remain safely staged; use Retry Cloudiway Batch after correcting the connection."
         )
         return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
+    try:
+        assessment = assess_migration_batch(migration_batch_id)
+        request.session["workflow_notice"] = (
+            f"{batch_name} created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
+            f"AD dry-run: {assessment['confirmed']} confirmed, {assessment['not_found']} missing/new-user candidates, "
+            f"{assessment['manual_review']} manual review, {assessment['errors']} errors. "
+            "No AD changes or Rackspace password changes were made."
+        )
+    except Exception as exc:
+        request.session["workflow_error"] = (
+            f"{batch_name} and Cloudiway batch {cloud_batch_id} were created, but the AD dry-run failed: {exc}"
+        )
+
     log_event(
         None,
-        "migration_batch_generated",
-        f"{batch_name}: selected {len(selected_ids)} user(s); Cloudiway batch {cloud_batch_id}",
+        "migration_batch_selected",
+        f"{batch_name}: selected {len(selected_ids)} user(s); profile={profile['name']}; Cloudiway batch {cloud_batch_id}",
     )
-
-    if upload["workflow_mode"] == "manual_bulk":
-        archive, archive_name = _build_rackspace_password_package(migration_batch_id)
-        return StreamingResponse(
-            archive,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{archive_name}"'},
-        )
-
-    if auto_start:
-        try:
-            await start_migration_batch(migration_batch_id)
-        except Exception as exc:
-            request.session["workflow_error"] = str(exc)
-    else:
-        request.session["workflow_notice"] = (
-            f"{batch_name} created with {len(selected_ids)} user(s). "
-            f"Cloudiway batch ID {cloud_batch_id} is ready."
-        )
     return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
+
+
+@app.post("/migration-batch/{migration_batch_id}/assess")
+async def migration_batch_assess(request: Request, migration_batch_id: int):
+    require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            "SELECT upload_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
+    try:
+        result = assess_migration_batch(migration_batch_id)
+        request.session["workflow_notice"] = (
+            f"AD dry-run complete: {result['confirmed']} confirmed, {result['not_found']} missing/new-user candidates, "
+            f"{result['manual_review']} manual review, {result['errors']} errors. No AD writes were made."
+        )
+    except Exception as exc:
+        request.session["workflow_error"] = str(exc)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
+
+
+@app.post("/migration-batch/{migration_batch_id}/provision")
+async def migration_batch_provision(request: Request, migration_batch_id: int):
+    require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            "SELECT upload_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
+    try:
+        result = await provision_migration_batch(migration_batch_id)
+        request.session["workflow_notice"] = (
+            f"Provisioning run: {result['provisioned']} processed, "
+            f"{result['manual_review']} waiting for manual review, {result['failed']} failed. "
+            + (result.get("sync_note") or "")
+        )
+    except Exception as exc:
+        request.session["workflow_error"] = str(exc)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
+
+
+@app.post("/migration-batch/{migration_batch_id}/refresh-m365")
+async def migration_batch_refresh_m365(request: Request, migration_batch_id: int):
+    require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            "SELECT upload_batch_id FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
+    try:
+        result = await refresh_migration_batch_readiness(migration_batch_id)
+        request.session["workflow_notice"] = (
+            f"Microsoft 365 readiness: {result['ready']}/{result['total']} ready, "
+            f"{result['pending']} pending, {result['failed']} requiring review."
+        )
+    except Exception as exc:
+        request.session["workflow_error"] = str(exc)
+    return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
+
+
+@app.post("/provisioning/user/{user_id}/recheck")
+async def provisioning_user_recheck(request: Request, user_id: int):
+    require_admin(request)
+    with conn() as db:
+        row = db.execute(
+            """SELECT mb.upload_batch_id,mb.id AS migration_batch_id
+               FROM migration_batch_members mbm
+               JOIN migration_batches mb ON mb.id=mbm.migration_batch_id
+               WHERE mbm.user_id=? ORDER BY mb.id DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User is not in a migration batch")
+    try:
+        result = assess_user(user_id)
+        request.session["workflow_notice"] = f"AD re-check result: {result['status']} — {result.get('reason','')}"
+    except Exception as exc:
+        request.session["workflow_error"] = str(exc)
+    return RedirectResponse(f"/workflow/{row['upload_batch_id']}", 303)
+
+
+@app.post("/provisioning/user/{user_id}/resolve")
+async def provisioning_user_resolve(
+    request: Request,
+    user_id: int,
+    candidate_dn: str = Form(...),
+    resolution_note: str = Form(...),
+):
+    require_admin(request)
+    with conn() as db:
+        row = db.execute(
+            """SELECT mb.upload_batch_id,mb.id AS migration_batch_id
+               FROM migration_batch_members mbm
+               JOIN migration_batches mb ON mb.id=mbm.migration_batch_id
+               WHERE mbm.user_id=? ORDER BY mb.id DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User is not in a migration batch")
+    try:
+        resolve_manual_review(user_id, candidate_dn, resolution_note)
+        provision_result = provision_user(user_id)
+        request.session["workflow_notice"] = (
+            "Manual identity review resolved for this user and provisioning continued. "
+            + ("A new account was created." if provision_result.get("created") else "The verified existing AD account was used.")
+        )
+    except Exception as exc:
+        request.session["workflow_error"] = str(exc)
+    return RedirectResponse(f"/workflow/{row['upload_batch_id']}", 303)
+
+
+@app.post("/migration-batch/{migration_batch_id}/rackspace-package")
+async def migration_batch_generate_rackspace_package(request: Request, migration_batch_id: int):
+    require_admin(request)
+    with conn() as db:
+        batch = db.execute(
+            """SELECT mb.*,ub.workflow_mode
+               FROM migration_batches mb
+               JOIN upload_batches ub ON ub.id=mb.upload_batch_id
+               WHERE mb.id=?""",
+            (migration_batch_id,),
+        ).fetchone()
+        rows = db.execute(
+            """SELECT u.*
+               FROM migration_batch_members mbm
+               JOIN users u ON u.id=mbm.user_id
+               WHERE mbm.migration_batch_id=? ORDER BY u.id""",
+            (migration_batch_id,),
+        ).fetchall()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
+    if batch["workflow_mode"] != "manual_bulk":
+        raise HTTPException(status_code=400, detail="This batch uses automatic Rackspace password reset")
+    not_ready = [r["source_email"] for r in rows if r["provisioning_status"] != "m365_ready"]
+    if not_ready:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{len(not_ready)} user(s) are not Microsoft 365 mailbox-ready; Rackspace passwords will not be changed yet.",
+        )
+
+    with conn() as db:
+        for row in rows:
+            if not row.get("generated_password_enc"):
+                password = generate_password()
+                db.execute(
+                    """UPDATE users SET generated_password_enc=?,
+                       rackspace_status='manual_file_generated',
+                       manual_password_generated_at=CURRENT_TIMESTAMP,
+                       manual_password_confirmed_at=NULL,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (encrypt_secret(password), int(row["id"])),
+                )
+        db.execute(
+            "UPDATE migration_batches SET workflow_status='passwords_generated',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (migration_batch_id,),
+        )
+
+    archive, archive_name = _build_rackspace_password_package(migration_batch_id)
+    log_event(None, "rackspace_package_generated", f"Migration batch {migration_batch_id}: {len(rows)} password(s) generated after M365 readiness")
+    return StreamingResponse(
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{archive_name}"'},
+    )
 
 
 @app.get("/migration-batch/{migration_batch_id}/download")
 async def migration_batch_download(request: Request, migration_batch_id: int):
     require_admin(request)
+    with conn() as db:
+        count = db.execute(
+            """SELECT COUNT(*) c
+               FROM migration_batch_members mbm
+               JOIN users u ON u.id=mbm.user_id
+               WHERE mbm.migration_batch_id=? AND u.generated_password_enc IS NOT NULL""",
+            (migration_batch_id,),
+        ).fetchone()["c"]
+        total = db.execute(
+            "SELECT COUNT(*) c FROM migration_batch_members WHERE migration_batch_id=?",
+            (migration_batch_id,),
+        ).fetchone()["c"]
+    if not total or int(count) != int(total):
+        raise HTTPException(
+            status_code=409,
+            detail="Rackspace password package has not been generated for this batch yet.",
+        )
     try:
         archive, archive_name = _build_rackspace_password_package(migration_batch_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    log_event(
-        None,
-        "migration_batch_package_downloaded",
-        f"Migration batch {migration_batch_id}: {archive_name}",
-    )
+    log_event(None, "migration_batch_package_downloaded", f"Migration batch {migration_batch_id}: {archive_name}")
     return StreamingResponse(
         archive,
         media_type="application/zip",
