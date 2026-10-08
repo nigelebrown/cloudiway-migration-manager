@@ -31,6 +31,9 @@ from app.service import (
     ensure_upload_cloudiway_batch,
     prepare_manual_upload_batch,
     start_upload_batch,
+    ensure_migration_cloudiway_batch,
+    prepare_migration_batch,
+    start_migration_batch,
     advance_upload_workflows,
 )
 
@@ -105,34 +108,37 @@ def _clean_cell(value) -> str:
     return str(value).strip()
 
 
-def _build_rackspace_password_package(batch_id: int) -> tuple[io.BytesIO, str]:
+def _build_rackspace_password_package(migration_batch_id: int) -> tuple[io.BytesIO, str]:
     import csv as _csv
 
     with conn() as db:
         batch = db.execute(
-            "SELECT id,batch_name FROM upload_batches WHERE id=?",
-            (batch_id,),
+            """SELECT mb.id,mb.batch_name,mb.upload_batch_id,ub.batch_name AS upload_batch_name
+               FROM migration_batches mb
+               JOIN upload_batches ub ON ub.id=mb.upload_batch_id
+               WHERE mb.id=?""",
+            (migration_batch_id,),
         ).fetchone()
         rows = db.execute(
             """SELECT u.*
-               FROM upload_batch_members m
+               FROM migration_batch_members m
                JOIN users u ON u.id=m.user_id
-               WHERE m.upload_batch_id=?
+               WHERE m.migration_batch_id=?
                ORDER BY u.id""",
-            (batch_id,),
+            (migration_batch_id,),
         ).fetchall()
 
     if not batch:
-        raise RuntimeError("Upload batch not found")
+        raise RuntimeError("Migration batch not found")
     if not rows:
-        raise RuntimeError("Upload batch has no users")
+        raise RuntimeError("Migration batch has no users")
 
     generated = []
     for row in rows:
         user = dict(row)
         if not user.get("generated_password_enc"):
             raise RuntimeError(
-                f"No generated password exists for {user['source_email']}; regenerate/repair this batch first."
+                f"No generated password exists for {user['source_email']} in this migration batch."
             )
         generated.append((user, decrypt_secret(user["generated_password_enc"])))
 
@@ -163,7 +169,8 @@ def _build_rackspace_password_package(batch_id: int) -> tuple[io.BytesIO, str]:
                 "first_name": user.get("first_name") or "",
                 "last_name": user.get("last_name") or "",
                 "computer_number": user.get("computer_number") or "",
-                "upload_batch": batch["batch_name"],
+                "upload_batch": batch["upload_batch_name"],
+                "migration_batch": batch["batch_name"],
             }
         )
     admin_df = pd.DataFrame(admin_rows)
@@ -172,7 +179,7 @@ def _build_rackspace_password_package(batch_id: int) -> tuple[io.BytesIO, str]:
         admin_df.to_excel(writer_xlsx, index=False, sheet_name="Password Map")
     workbook.seek(0)
 
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", batch["batch_name"]).strip("-") or f"batch-{batch_id}"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", batch["batch_name"]).strip("-") or f"batch-{migration_batch_id}"
     archive_name = f"{safe_name}-rackspace-password-package.zip"
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
