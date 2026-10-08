@@ -1,4 +1,5 @@
 import re
+import ssl
 import uuid
 from typing import Any
 
@@ -38,6 +39,8 @@ class ActiveDirectoryClient:
         license_group_dn: str,
         computer_number_attribute: str,
         upn_suffix: str = "",
+        tls_validate: bool = True,
+        ca_cert_path: str = "",
     ):
         self.host = host
         self.port = int(port or 636)
@@ -49,6 +52,8 @@ class ActiveDirectoryClient:
         self.license_group_dn = license_group_dn
         self.computer_number_attribute = computer_number_attribute
         self.upn_suffix = upn_suffix
+        self.tls_validate = bool(tls_validate)
+        self.ca_cert_path = ca_cert_path or ""
 
         if not _ATTRIBUTE_RE.fullmatch(computer_number_attribute or ""):
             raise RuntimeError("Invalid AD computer-number attribute name")
@@ -58,10 +63,17 @@ class ActiveDirectoryClient:
             raise RuntimeError("Configured target OU is outside the configured AD base DN")
 
     def _connect(self) -> Connection:
+        tls = None
+        if self.use_ssl:
+            tls = Tls(
+                validate=ssl.CERT_REQUIRED if self.tls_validate else ssl.CERT_NONE,
+                ca_certs_file=self.ca_cert_path or None,
+            )
         server = Server(
             self.host,
             port=self.port,
             use_ssl=self.use_ssl,
+            tls=tls,
             get_info=ALL,
             connect_timeout=10,
         )
