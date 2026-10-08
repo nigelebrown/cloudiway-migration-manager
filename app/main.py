@@ -1061,8 +1061,6 @@ async def upload_users(
         for _, row in df.iterrows():
             src = _clean_cell(row.get("source_email")).lower()
             tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
-            if not tgt:
-                tgt = src
             if not EMAIL_RE.fullmatch(src) or not EMAIL_RE.fullmatch(tgt):
                 skipped += 1
                 continue
