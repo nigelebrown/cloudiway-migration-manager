@@ -353,3 +353,28 @@ def test_existing_password_dedicated_credential_username_mismatch_is_rejected():
     }
     with pytest.raises(RuntimeError, match="does not match source email"):
         _source_credentials_for_cloudiway(user)
+
+
+def test_admin_reveal_shows_exact_username_sent_to_cloudiway_and_uploaded_password():
+    with TestClient(app) as client:
+        login(client)
+        response = client.post(
+            "/upload",
+            files={"file": ("existing.csv", existing_password_csv(), "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+        with conn() as db:
+            user_id = db.execute(
+                "SELECT id FROM users WHERE source_email='one@rack.example'"
+            ).fetchone()["id"]
+
+        response = client.get(f"/users/{user_id}/password")
+        assert response.status_code == 200
+        payload = response.json()
+
+    assert payload["username_sent_to_cloudiway"] == "one@rack.example"
+    assert payload["password"] == "0012A#$"
+    assert payload["password_source"] == "uploaded_excel"
