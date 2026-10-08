@@ -878,10 +878,13 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                                   mb.cloudiway_batch_id
                            FROM upload_batch_members ubm
                            JOIN users u ON u.id=ubm.user_id
-                           LEFT JOIN migration_batch_members mbm2 ON mbm2.user_id=u.id
-                           LEFT JOIN migration_batches mb
-                                  ON mb.id=mbm2.migration_batch_id
-                                 AND mb.upload_batch_id=ubm.upload_batch_id
+                           LEFT JOIN migration_batch_members mbm2
+                                  ON mbm2.user_id=u.id
+                                 AND mbm2.migration_batch_id IN (
+                                     SELECT id FROM migration_batches
+                                     WHERE upload_batch_id=ubm.upload_batch_id
+                                 )
+                           LEFT JOIN migration_batches mb ON mb.id=mbm2.migration_batch_id
                            WHERE ubm.upload_batch_id=?
                            ORDER BY ubm.row_order,u.id""",
                         (upload_batch_id,),
