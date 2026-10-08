@@ -1136,10 +1136,47 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
 
 
 async def start_migration_batch(migration_batch_id: int) -> dict:
-    """Prepare and start exactly one selected incremental batch."""
-    prepared = await prepare_migration_batch(migration_batch_id)
-    if not prepared.get("ready"):
-        return {"started": False, **prepared}
+    """Start exactly one selected incremental batch without duplicating preparation."""
+    with conn() as db:
+        batch = db.execute(
+            "SELECT * FROM migration_batches WHERE id=?",
+            (migration_batch_id,),
+        ).fetchone()
+        rows = db.execute(
+            """SELECT u.id,u.cloudiway_object_id,u.cloudiway_status
+               FROM migration_batch_members m
+               JOIN users u ON u.id=m.user_id
+               WHERE m.migration_batch_id=?
+               ORDER BY u.id""",
+            (migration_batch_id,),
+        ).fetchall()
+
+    if not batch:
+        return {"started": False, "reason": "Migration batch not found"}
+
+    object_ids = [
+        int(r["cloudiway_object_id"])
+        for r in rows
+        if r.get("cloudiway_object_id")
+    ]
+    already_prepared = (
+        batch["workflow_status"] == "ready_to_migrate"
+        and len(object_ids) == len(rows)
+        and len(rows) > 0
+    )
+
+    if already_prepared:
+        prepared = {
+            "ready": True,
+            "migration_batch_id": migration_batch_id,
+            "cloudiway_batch_id": int(batch["cloudiway_batch_id"]),
+            "users": len(rows),
+            "object_ids": object_ids,
+        }
+    else:
+        prepared = await prepare_migration_batch(migration_batch_id)
+        if not prepared.get("ready"):
+            return {"started": False, **prepared}
 
     with conn() as db:
         member_rows = db.execute(
