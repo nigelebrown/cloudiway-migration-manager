@@ -1073,6 +1073,17 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
     if not rows:
         return {"ready": False, "reason": "Migration batch has no users"}
 
+    not_m365_ready = [
+        int(row["id"]) for row in rows
+        if row.get("provisioning_status") != "m365_ready"
+    ]
+    if not_m365_ready:
+        return {
+            "ready": False,
+            "reason": f"{len(not_m365_ready)} selected user(s) are not yet Microsoft 365 mailbox-ready",
+            "not_m365_ready": not_m365_ready,
+        }
+
     if batch["workflow_mode"] == "manual_bulk":
         unconfirmed = [
             int(row["id"]) for row in rows
