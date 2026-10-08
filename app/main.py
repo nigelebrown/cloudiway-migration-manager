@@ -19,6 +19,23 @@ from app.security import encrypt_secret, decrypt_secret, generate_password
 from app.clients.cloudiway import CloudiwayClient
 from app.diagnostics import log_info, log_error, tail_log, redact
 from app.rackspace_template import RACKSPACE_MAILBOX_HEADERS, rackspace_row
+from app.provisioning import (
+    list_profiles,
+    get_profile,
+    get_active_profile,
+    ad_client_for_profile,
+    graph_client_for_profile,
+    sql_client_for_profile,
+    sync_client_for_profile,
+    validate_profile_configuration,
+    assess_user,
+    assess_migration_batch,
+    resolve_manual_review,
+    provision_user,
+    provision_migration_batch,
+    refresh_migration_batch_readiness,
+    refresh_pending_provisioning_batches,
+)
 from app.service import (
     launch_next_batch,
     refresh_status,
@@ -294,6 +311,14 @@ async def status_poller():
             # administrator login session.
             if token_present and keep_connected:
                 await _cloudiway_client_ready()
+
+            # M365 provisioning readiness is independent of the web login and
+            # independent of Cloudiway. Continue polling Entra/licence/mailbox
+            # state even while the administrator is logged out.
+            try:
+                await refresh_pending_provisioning_batches()
+            except Exception as provisioning_exc:
+                log_event(None, "background_provisioning_refresh_failed", str(provisioning_exc))
 
             if token_present:
                 await advance_upload_workflows()
