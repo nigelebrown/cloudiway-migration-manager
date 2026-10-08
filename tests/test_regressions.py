@@ -129,43 +129,34 @@ def test_reupload_does_not_change_inflight_target(monkeypatch):
         assert target == "u1@jcf.gov.jm"
 
 
-def test_blank_target_and_spaced_name_headers_are_normalized(monkeypatch):
-    _enable_upload_batch_mock(monkeypatch)
+def test_blank_target_is_rejected_under_standard_identity_template():
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         csv = (
-            b"Email,Target Email,First Name,Last Name\n"
-            b"a@x.com,,Ann,Lee\n"
+            b"computer_number,source_email,target_email,first_name,middle_name,last_name\n"
+            b"14323,a@x.com,,Ann,,Lee\n"
         )
         r = client.post(
             "/upload",
             files={"file": ("users.csv", csv, "text/csv")},
             follow_redirects=False,
         )
-        assert r.status_code == 303
-        with conn() as db:
-            row = db.execute(
-                "SELECT target_email,first_name,last_name FROM users WHERE source_email=?",
-                ("a@x.com",),
-            ).fetchone()
-        assert row["target_email"] == "a@x.com"
-        assert row["first_name"] == "Ann"
-        assert row["last_name"] == "Lee"
+        assert r.status_code == 400
 
 
-def test_blank_names_do_not_become_nan(monkeypatch):
-    _enable_upload_batch_mock(monkeypatch)
+def test_blank_required_names_are_rejected():
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
-        csv = b"source_email,target_email,first_name,last_name\na@x.com,a@y.com,,\n"
-        client.post("/upload", files={"file": ("users.csv", csv, "text/csv")})
-        with conn() as db:
-            row = db.execute(
-                "SELECT first_name,last_name FROM users WHERE source_email=?",
-                ("a@x.com",),
-            ).fetchone()
-        assert row["first_name"] == ""
-        assert row["last_name"] == ""
+        csv = (
+            b"computer_number,source_email,target_email,first_name,middle_name,last_name\n"
+            b"14323,a@x.com,a@y.com,,,\n"
+        )
+        r = client.post(
+            "/upload",
+            files={"file": ("users.csv", csv, "text/csv")},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
 
 
 def test_progress_window_uses_minutes(monkeypatch):
@@ -337,8 +328,7 @@ def test_diagnostics_download_requires_admin():
         assert r.status_code == 401
 
 
-def test_upload_accepts_rackspace_template_with_target_email(monkeypatch):
-    _enable_upload_batch_mock(monkeypatch)
+def test_legacy_rackspace_template_without_computer_number_is_rejected():
     with TestClient(app) as client:
         client.post("/login", data={"admin_password": "test-admin-password"})
         csv_data = (
@@ -350,15 +340,8 @@ def test_upload_accepts_rackspace_template_with_target_email(monkeypatch):
             files={"file": ("rackspace.csv", csv_data, "text/csv")},
             follow_redirects=False,
         )
-        assert response.status_code == 303
-        with conn() as db:
-            row = db.execute(
-                "SELECT source_email,target_email,first_name,last_name FROM users WHERE source_email=?",
-                ("user@rack.example",),
-            ).fetchone()
-        assert row["target_email"] == "user@jcf.gov.jm"
-        assert row["first_name"] == "Test"
-        assert row["last_name"] == "User"
+        assert response.status_code == 400
+        assert "computer_number" in response.text
 
 
 def test_manual_rackspace_generate_and_confirm_round_trip():
