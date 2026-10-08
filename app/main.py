@@ -561,7 +561,8 @@ async def save_provisioning_profile(
             cur = db.execute(
                 """INSERT INTO environment_profiles(
                    name,environment_type,production_max_batch,
-                   ad_host,ad_port,ad_use_ssl,ad_base_dn,ad_bind_username,ad_bind_password_enc,
+                   ad_host,ad_port,ad_use_ssl,ad_tls_validate,ad_ca_cert_path,
+                   ad_base_dn,ad_bind_username,ad_bind_password_enc,
                    ad_target_ou,ad_license_group_dn,ad_computer_number_attribute,ad_upn_suffix,
                    ad_default_password_enc,ad_force_password_change,ad_allow_user_creation,
                    ad_allow_group_changes,graph_tenant_id,graph_client_id,graph_client_secret_enc,
