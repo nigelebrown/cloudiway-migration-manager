@@ -216,6 +216,86 @@ def _extract_cloudiway_batch_id(data, expected_name: str | None = None) -> int |
     return walk(data)
 
 
+async def ensure_migration_cloudiway_batch(migration_batch_id: int) -> int:
+    """Ensure one incremental migration batch has its own Cloudiway Mail Batch."""
+    with conn() as db:
+        batch = db.execute(
+            """SELECT mb.*,ub.batch_name AS upload_name
+               FROM migration_batches mb
+               JOIN upload_batches ub ON ub.id=mb.upload_batch_id
+               WHERE mb.id=?""",
+            (migration_batch_id,),
+        ).fetchone()
+    if not batch:
+        raise RuntimeError(f"Migration batch {migration_batch_id} was not found")
+    if batch.get("cloudiway_batch_id"):
+        return int(batch["cloudiway_batch_id"])
+
+    client = await _cloudiway_client_ready()
+    name = batch["batch_name"]
+
+    try:
+        created = await client.create_mail_batch(name)
+        cloud_batch_id = _extract_cloudiway_batch_id(created, name)
+        if not cloud_batch_id:
+            existing = await client.mail_batches()
+            cloud_batch_id = _extract_cloudiway_batch_id(existing, name)
+        if not cloud_batch_id:
+            raise RuntimeError(
+                f"Cloudiway batch '{name}' was submitted but no batch ID could be resolved"
+            )
+
+        with conn() as db:
+            db.execute(
+                """UPDATE migration_batches
+                   SET cloudiway_batch_id=?,cloudiway_batch_name=?,
+                       last_error=NULL,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (cloud_batch_id, name, migration_batch_id),
+            )
+        log_event(
+            None,
+            "cloudiway_migration_batch_created",
+            f"Migration batch {migration_batch_id} mapped to Cloudiway batch {cloud_batch_id} ({name})",
+        )
+        return cloud_batch_id
+    except Exception as exc:
+        with conn() as db:
+            db.execute(
+                """UPDATE migration_batches
+                   SET workflow_status='cloudiway_batch_error',last_error=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (str(exc)[:3000], migration_batch_id),
+            )
+        log_event(
+            None,
+            "cloudiway_migration_batch_failed",
+            f"Migration batch {migration_batch_id}: {exc}",
+        )
+        raise
+
+
+async def assign_migration_batch_members(migration_batch_id: int, object_ids: list[int]) -> int:
+    if not object_ids:
+        raise RuntimeError("No Cloudiway object IDs were supplied for batch assignment")
+    cloud_batch_id = await ensure_migration_cloudiway_batch(migration_batch_id)
+    client = await _cloudiway_client_ready()
+    await client.add_mail_batch_members(cloud_batch_id, object_ids)
+    with conn() as db:
+        db.execute(
+            """UPDATE migration_batches
+               SET workflow_status='cloudiway_members_assigned',last_error=NULL,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (migration_batch_id,),
+        )
+    log_event(
+        None,
+        "cloudiway_migration_batch_members_assigned",
+        f"Assigned {len(object_ids)} user(s) to Cloudiway batch {cloud_batch_id}",
+    )
+    return cloud_batch_id
+
+
 async def ensure_upload_cloudiway_batch(upload_batch_id: int) -> int:
     """Ensure every application upload has a corresponding Cloudiway Mail Batch."""
     with conn() as db:
@@ -969,6 +1049,140 @@ async def start_manual_migrations(user_ids: list[int]) -> dict:
     }
 
 
+async def prepare_migration_batch(migration_batch_id: int) -> dict:
+    """Prepare only the users selected into one incremental migration batch."""
+    with conn() as db:
+        batch = db.execute(
+            """SELECT mb.*,ub.workflow_mode
+               FROM migration_batches mb
+               JOIN upload_batches ub ON ub.id=mb.upload_batch_id
+               WHERE mb.id=?""",
+            (migration_batch_id,),
+        ).fetchone()
+        rows = db.execute(
+            """SELECT u.*
+               FROM migration_batch_members m
+               JOIN users u ON u.id=m.user_id
+               WHERE m.migration_batch_id=?
+               ORDER BY u.id""",
+            (migration_batch_id,),
+        ).fetchall()
+
+    if not batch:
+        return {"ready": False, "reason": "Migration batch not found"}
+    if not rows:
+        return {"ready": False, "reason": "Migration batch has no users"}
+
+    if batch["workflow_mode"] == "manual_bulk":
+        unconfirmed = [
+            int(row["id"]) for row in rows
+            if row["rackspace_status"] != "manual_confirmed"
+        ]
+        if unconfirmed:
+            return {
+                "ready": False,
+                "reason": f"{len(unconfirmed)} selected user(s) have not yet been confirmed as updated in Rackspace",
+                "unconfirmed": unconfirmed,
+            }
+
+    object_ids: list[int] = []
+    failed: list[dict] = []
+    for row in rows:
+        user = dict(row)
+        try:
+            if batch["workflow_mode"] == "manual_bulk":
+                oid = await prepare_manual_user(int(user["id"]))
+            else:
+                oid = await prepare_user(int(user["id"]))
+            object_ids.append(int(oid))
+        except Exception as exc:
+            failed.append({"user_id": int(user["id"]), "error": str(exc)})
+            with conn() as db:
+                db.execute(
+                    """UPDATE users SET migration_status='failed',error_message=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (str(exc)[:3000], int(user["id"])),
+                )
+
+    if failed:
+        with conn() as db:
+            db.execute(
+                """UPDATE migration_batches
+                   SET workflow_status='attention',last_error=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (f"{len(failed)} user(s) failed Cloudiway preparation", migration_batch_id),
+            )
+        return {
+            "ready": False,
+            "reason": f"{len(failed)} user(s) failed Cloudiway preparation",
+            "failed": failed,
+        }
+
+    cloud_batch_id = await assign_migration_batch_members(migration_batch_id, object_ids)
+    with conn() as db:
+        db.execute(
+            """UPDATE migration_batches
+               SET workflow_status='ready_to_migrate',last_error=NULL,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (migration_batch_id,),
+        )
+    return {
+        "ready": True,
+        "migration_batch_id": migration_batch_id,
+        "cloudiway_batch_id": cloud_batch_id,
+        "users": len(rows),
+        "object_ids": object_ids,
+    }
+
+
+async def start_migration_batch(migration_batch_id: int) -> dict:
+    """Prepare and start exactly one selected incremental batch."""
+    prepared = await prepare_migration_batch(migration_batch_id)
+    if not prepared.get("ready"):
+        return {"started": False, **prepared}
+
+    with conn() as db:
+        member_rows = db.execute(
+            "SELECT user_id FROM migration_batch_members WHERE migration_batch_id=?",
+            (migration_batch_id,),
+        ).fetchall()
+    user_ids = [int(r["user_id"]) for r in member_rows]
+
+    cloud = await _cloudiway_client_ready()
+    await cloud.start_migration(prepared["object_ids"])
+
+    if user_ids:
+        placeholders = ",".join("?" for _ in user_ids)
+        with conn() as db:
+            db.execute(
+                f"""UPDATE users
+                    SET migration_status='migrating',batch_number=?,
+                        batch_started_at=CURRENT_TIMESTAMP,error_message=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})""",
+                (migration_batch_id, *user_ids),
+            )
+            db.execute(
+                """UPDATE migration_batches
+                   SET workflow_status='migrating',last_error=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (migration_batch_id,),
+            )
+
+    set_runtime("automation_running", "1")
+    log_event(
+        None,
+        "migration_batch_started",
+        f"Migration batch {migration_batch_id} started in Cloudiway batch {prepared['cloudiway_batch_id']} with {len(user_ids)} user(s)",
+    )
+    return {
+        "started": True,
+        "migration_batch_id": migration_batch_id,
+        "cloudiway_batch_id": prepared["cloudiway_batch_id"],
+        "users_started": len(user_ids),
+    }
+
+
 async def prepare_manual_upload_batch(upload_batch_id: int) -> dict:
     """Prepare every confirmed member of an upload batch and assign it to its Cloudiway batch."""
     with conn() as db:
@@ -1093,7 +1307,7 @@ async def start_upload_batch(upload_batch_id: int) -> dict:
 
 
 async def advance_upload_workflows() -> dict:
-    """Background workflow maintenance: create missing Cloudiway batches and auto-start confirmed batches."""
+    """Background maintenance for incremental migration batches."""
     summary = {"cloudiway_batches_created": 0, "auto_started": 0, "errors": 0}
 
     if not get_setting("cloudiway_token"):
@@ -1101,7 +1315,7 @@ async def advance_upload_workflows() -> dict:
 
     with conn() as db:
         pending = db.execute(
-            """SELECT id FROM upload_batches
+            """SELECT id FROM migration_batches
                WHERE cloudiway_batch_id IS NULL
                  AND workflow_status NOT IN ('completed')
                ORDER BY id LIMIT 20"""
@@ -1109,14 +1323,14 @@ async def advance_upload_workflows() -> dict:
 
     for row in pending:
         try:
-            await ensure_upload_cloudiway_batch(int(row["id"]))
+            await ensure_migration_cloudiway_batch(int(row["id"]))
             summary["cloudiway_batches_created"] += 1
         except Exception:
             summary["errors"] += 1
 
     with conn() as db:
         auto_rows = db.execute(
-            """SELECT id FROM upload_batches
+            """SELECT id FROM migration_batches
                WHERE auto_start=1
                  AND workflow_status IN ('passwords_confirmed','ready_to_migrate','ready_for_automatic')
                ORDER BY id LIMIT 5"""
@@ -1124,14 +1338,14 @@ async def advance_upload_workflows() -> dict:
 
     for row in auto_rows:
         try:
-            result = await start_upload_batch(int(row["id"]))
+            result = await start_migration_batch(int(row["id"]))
             if result.get("started"):
                 summary["auto_started"] += 1
         except Exception as exc:
             summary["errors"] += 1
             with conn() as db:
                 db.execute(
-                    """UPDATE upload_batches SET workflow_status='attention',last_error=?,
+                    """UPDATE migration_batches SET workflow_status='attention',last_error=?,
                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (str(exc)[:3000], int(row["id"])),
                 )
@@ -1140,21 +1354,21 @@ async def advance_upload_workflows() -> dict:
 
 
 def refresh_upload_batch_states() -> None:
-    """Roll up user migration states into upload-batch workflow states."""
+    """Roll up user states into incremental batches and their parent uploads."""
     with conn() as db:
-        batches = db.execute(
-            """SELECT b.id,b.workflow_status,
+        migration_batches = db.execute(
+            """SELECT mb.id,mb.workflow_status,
                       COUNT(m.user_id) total,
                       SUM(u.migration_status='completed') completed,
                       SUM(u.migration_status IN ('failed','attention','timed_out')) problems,
                       SUM(u.migration_status='migrating') migrating
-               FROM upload_batches b
-               LEFT JOIN upload_batch_members m ON m.upload_batch_id=b.id
+               FROM migration_batches mb
+               LEFT JOIN migration_batch_members m ON m.migration_batch_id=mb.id
                LEFT JOIN users u ON u.id=m.user_id
-               GROUP BY b.id,b.workflow_status"""
+               GROUP BY mb.id,mb.workflow_status"""
         ).fetchall()
 
-        for row in batches:
+        for row in migration_batches:
             total = int(row["total"] or 0)
             completed = int(row["completed"] or 0)
             problems = int(row["problems"] or 0)
@@ -1168,8 +1382,46 @@ def refresh_upload_batch_states() -> None:
                 new_status = "migrating"
             if new_status and new_status != row["workflow_status"]:
                 db.execute(
-                    "UPDATE upload_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    "UPDATE migration_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (new_status, int(row["id"])),
+                )
+
+        uploads = db.execute(
+            """SELECT ub.id,ub.workflow_status,
+                      COUNT(ubm.user_id) total,
+                      SUM(mbm.user_id IS NOT NULL) assigned,
+                      SUM(u.migration_status='completed') completed,
+                      SUM(u.migration_status IN ('failed','attention','timed_out')) problems,
+                      SUM(u.migration_status='migrating') migrating
+               FROM upload_batches ub
+               LEFT JOIN upload_batch_members ubm ON ubm.upload_batch_id=ub.id
+               LEFT JOIN users u ON u.id=ubm.user_id
+               LEFT JOIN migration_batch_members mbm ON mbm.user_id=u.id
+               GROUP BY ub.id,ub.workflow_status"""
+        ).fetchall()
+
+        for row in uploads:
+            total = int(row["total"] or 0)
+            assigned = int(row["assigned"] or 0)
+            completed = int(row["completed"] or 0)
+            problems = int(row["problems"] or 0)
+            migrating = int(row["migrating"] or 0)
+            if total and completed == total:
+                state = "completed"
+            elif problems:
+                state = "attention"
+            elif migrating:
+                state = "migrating"
+            elif assigned and assigned == total:
+                state = "fully_batched"
+            elif assigned:
+                state = "partially_batched"
+            else:
+                state = "staged"
+            if state != row["workflow_status"]:
+                db.execute(
+                    "UPDATE upload_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (state, int(row["id"])),
                 )
 
 
