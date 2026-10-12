@@ -149,6 +149,17 @@ class CloudiwayClient:
         self._raise(r, "Could not retrieve Cloudiway migration progress")
         return r.json() if r.content else {}
 
+    async def job_status(self, object_id: int):
+        """Retrieve Cloudiway's live mail job status for an object."""
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.get(
+                f"{settings.cloudiway_base_url}/Mail/GetListJobStatus",
+                headers=self._headers(),
+                params={"objectId": int(object_id)},
+            )
+        self._raise(r, "Could not retrieve Cloudiway mail job status")
+        return r.json() if r.content else {}
+
     async def audit(self, object_id: int):
         return await self._get(f"/Mail/Audit/{object_id}", "Could not retrieve Cloudiway audit")
 
