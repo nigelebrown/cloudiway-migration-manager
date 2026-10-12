@@ -51,6 +51,7 @@ from app.service import (
     ensure_migration_cloudiway_batch,
     prepare_migration_batch,
     start_migration_batch,
+    restart_stuck_cloudiway_user,
     advance_upload_workflows,
     process_background_issues,
     recover_credential_issue,
@@ -2268,6 +2269,36 @@ async def migration_batch_prepare(request: Request, migration_batch_id: int):
     except Exception as exc:
         request.session["workflow_error"] = str(exc)
     return RedirectResponse(f"/workflow/{batch['upload_batch_id']}", 303)
+
+
+@app.post("/cloudiway/user/{user_id}/start-again")
+async def cloudiway_user_start_again(request: Request, user_id: int):
+    require_admin(request)
+    with conn() as db:
+        row = db.execute(
+            """SELECT mb.upload_batch_id
+               FROM users u
+               LEFT JOIN migration_batches mb ON mb.id=u.batch_number
+               WHERE u.id=?""",
+            (int(user_id),),
+        ).fetchone()
+    if not row or not row.get("upload_batch_id"):
+        raise HTTPException(status_code=404, detail="User or migration batch not found")
+    try:
+        result = await restart_stuck_cloudiway_user(int(user_id))
+        if result.get("started"):
+            request.session["workflow_notice"] = (
+                f"Cloudiway start/restart requested for object "
+                f"{result.get('cloudiway_object_id')}. The app will show MIGRATING "
+                "only after Cloudiway confirms Scheduled/Pending/Working."
+            )
+        else:
+            request.session["workflow_error"] = str(
+                result.get("reason") or "Cloudiway start/restart was not submitted."
+            )
+    except Exception as exc:
+        request.session["workflow_error"] = str(exc)
+    return RedirectResponse(f"/workflow/{row['upload_batch_id']}", 303)
 
 
 @app.post("/migration-batch/{migration_batch_id}/start")
