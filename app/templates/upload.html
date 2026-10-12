@@ -20,7 +20,9 @@ button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#
 <p>
 <a href="/upload/template.xlsx">Download the standard AD/M365 upload template</a>
 &nbsp; | &nbsp;
-<a href="/upload/existing-password-template.xlsx">Download the existing-password Cloudiway-only template</a>
+<a href="/upload/existing-password-template.xlsx">Download direct-migration template</a>
+&nbsp; | &nbsp;
+<a href="/upload/recovery-template.xlsx">Download Cloudiway error-recovery template</a>
 </p>
 
 {% if error %}<p class="err">{{error}}</p>{% endif %}
@@ -44,7 +46,7 @@ button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#
 
 <div id="existingHelp" class="modebox" style="display:none">
 <h3>Existing password → Cloudiway only</h3>
-<p>Required columns: <code>username</code> (or email) and <code>password</code>. If username has no @domain, the saved Direct Migration Email Domain is appended automatically. The resolved email is used as both source and destination.</p>
+<p>Required columns: <code>username</code>/<code>source_email</code> and <code>password</code>. If username has no @domain, the saved Direct Migration Email Domain is appended automatically. <code>target_email</code> is optional; when omitted or blank, the resolved source address is used as the destination.</p>
 <p>Optional reference columns: <code>first_name</code>, <code>middle_name</code>, <code>last_name</code>, <code>computer_number</code>.</p>
 <div class="warn"><b>No AD work is performed in this mode.</b> The supplied password is encrypted and registered with Cloudiway. Use this option for a new/direct migration where the Cloudiway user may need to be created.</div>
 </div>
