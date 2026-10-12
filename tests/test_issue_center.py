@@ -57,6 +57,8 @@ def configure_cloud(monkeypatch, cloud):
 
     monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
     set_setting("cloudiway_token", encrypt_secret("test-cloud-token"), True)
+    set_setting("cloudiway_source_pool_id", "4")
+    set_setting("cloudiway_target_pool_id", "3")
 
 
 def seed_user(state="failed", password="Known#Password2026"):
