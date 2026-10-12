@@ -22,7 +22,7 @@ async function load(){
   }
 }
 function render(d){
- const names=['waiting','preparing','ready','migrating','completed','failed','attention','timed_out'];
+ const names=['waiting','preparing','ready','starting','migrating','completed','failed','attention','timed_out'];
  document.getElementById('cards').innerHTML=names.map(s=>`<div class="card"><div class="n">${d.counts[s]||0}</div><div class="label">${s.toUpperCase()}</div></div>`).join('');
  const issueOrder=['credentials','target_mailbox','source_mailbox','source_connectivity','ad_identity','provisioning','timeout','cloudiway','other'];
  document.getElementById('issueCards').innerHTML=issueOrder.map(k=>`<a class="card" style="color:inherit;text-decoration:none" href="/issues?category=${encodeURIComponent(k)}"><div class="n">${(d.issue_counts||{})[k]||0}</div><div class="label">${esc((d.issue_labels||{})[k]||k).toUpperCase()}</div></a>`).join('');
