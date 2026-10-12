@@ -760,7 +760,51 @@ async def refresh_status() -> dict:
                 request_state = str(row.get("cloudiway_status") or "")
                 start_age = int(row.get("start_age_seconds") or 0)
 
-                if previous_status == "starting" and start_age < 30:
+                if (
+                    previous_status == "migrating"
+                    and row.get("batch_started_at")
+                    and start_age >= 30
+                ):
+                    # Repair users created by older builds that were marked
+                    # MIGRATING locally although Cloudiway still says
+                    # NotStarted. A non-null batch_started_at proves a start
+                    # had previously been requested, so it is safe to retry
+                    # using the corrected batch-start path automatically.
+                    if (
+                        row.get("cloudiway_batch_id")
+                        and hasattr(cloud, "start_batch_migration")
+                    ):
+                        repair_response = await cloud.start_batch_migration(
+                            int(row["cloudiway_batch_id"])
+                        )
+                        repair_action = "StartBatch"
+                    else:
+                        repair_response = await cloud.start_migration([object_id])
+                        repair_action = "StartJobs"
+                    _assert_cloudiway_command_accepted(
+                        repair_response,
+                        f"{repair_action} legacy repair",
+                    )
+                    status = "starting"
+                    cloud_status = "start_requested"
+                    with conn() as db:
+                        db.execute(
+                            """UPDATE users
+                               SET batch_started_at=CURRENT_TIMESTAMP,
+                                   migration_status='starting',
+                                   cloudiway_status='start_requested',
+                                   updated_at=CURRENT_TIMESTAMP
+                               WHERE id=?""",
+                            (int(row["id"]),),
+                        )
+                    log_event(
+                        int(row["id"]),
+                        "cloudiway_notstarted_legacy_repair",
+                        f"Local state was MIGRATING but Cloudiway reported NotStarted. "
+                        f"{repair_action} was sent automatically for object {object_id}; response="
+                        + json.dumps(repair_response, default=str)[:1000],
+                    )
+                elif previous_status == "starting" and start_age < 30:
                     # Give Cloudiway a short scheduling window before deciding
                     # that the accepted start request did not transition.
                     status = "starting"
