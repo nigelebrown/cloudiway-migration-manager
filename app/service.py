@@ -722,6 +722,26 @@ async def refresh_status() -> dict:
                 max(1, settings.progress_window_minutes),
             )
             status, percent, detail = parse_progress(data)
+
+            # MailProgress is a cumulative statistics endpoint and sometimes
+            # returns no textual job state. Before treating that as an issue,
+            # ask Cloudiway's live mail job-status endpoint.
+            job_status_data = None
+            if status == "attention":
+                try:
+                    job_status_data = await cloud.job_status(int(row["cloudiway_object_id"]))
+                    job_status, job_percent, job_detail = parse_progress(job_status_data)
+                    if job_status != "attention":
+                        status = job_status
+                        if job_percent is not None:
+                            percent = job_percent
+                        detail = json.dumps(
+                            {"progress": data, "jobStatus": job_status_data},
+                            default=str,
+                        )[:1500]
+                except Exception as job_exc:
+                    log_event(row["id"], "cloudiway_job_status_fetch_failed", str(job_exc))
+
             error_message = None
             cloud_status = status
 
@@ -1563,6 +1583,45 @@ async def process_background_issues() -> dict:
     return summary
 
 
+def _successful_mail_progress_envelope(data) -> tuple[bool, float | None]:
+    """Recognize Cloudiway MailProgress API success envelopes.
+
+    The MailProgress endpoint can legitimately return no textual migration
+    status, especially immediately after a job starts. In that case
+    isSuccess=true + responseData counters + an empty error collection means
+    "the progress query succeeded", not "migration requires attention".
+    """
+    if not isinstance(data, dict) or data.get("isSuccess") is not True:
+        return False, None
+    response = data.get("responseData")
+    if not isinstance(response, dict):
+        return False, None
+    errors = response.get("error")
+    if errors not in (None, [], {}, ""):
+        return False, None
+
+    expected = {
+        "blockId", "migratedEmails", "errorEmails", "ignoredEmails",
+        "totalEmails", "recentMigratedEmails", "windowMinutes",
+        "startDateTime", "lastActivityDateTime",
+    }
+    if not (set(response.keys()) & expected):
+        return False, None
+
+    try:
+        total = float(response.get("totalEmails") or 0)
+        migrated = float(response.get("migratedEmails") or 0)
+        ignored = float(response.get("ignoredEmails") or 0)
+        errors_count = float(response.get("errorEmails") or 0)
+        if total > 0:
+            percent = max(0.0, min(100.0, ((migrated + ignored + errors_count) / total) * 100.0))
+        else:
+            percent = 0.0
+    except Exception:
+        percent = None
+    return True, percent
+
+
 def parse_progress(data) -> tuple[str, float | None, str]:
     detail = json.dumps(data, default=str)[:1500]
     text_statuses: list[str] = []
@@ -1616,7 +1675,13 @@ def parse_progress(data) -> tuple[str, float | None, str]:
     elif numeric_status_seen or percent is not None:
         status = "migrating"
     else:
-        status = "attention"
+        envelope_ok, envelope_percent = _successful_mail_progress_envelope(data)
+        if envelope_ok:
+            status = "migrating"
+            if percent is None:
+                percent = envelope_percent
+        else:
+            status = "attention"
 
     return status, percent, detail
 
