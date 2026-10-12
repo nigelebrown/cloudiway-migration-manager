@@ -146,7 +146,22 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 <td><b>{{u.target_email}}</b><br><span class="muted">{{u.first_name or ''}} {{u.middle_name or ''}} {{u.last_name or ''}}</span><br><span class="muted">Source: {{u.source_email}}</span></td>
 <td>{{u.migration_batch_name or 'Not batched'}}<br><span class="muted">{% if u.cloudiway_batch_id %}Cloudiway #{{u.cloudiway_batch_id}}{% endif %}</span></td>
 <td class="{{'good' if u.ad_match_status in ['confirmed','manual_resolved'] else ('bad' if u.ad_match_status=='manual_review' else 'waiting')}}">{{u.ad_match_status}}{% if u.ad_created_by_app %}<br><span class="good">created by app</span>{% endif %}</td>
-<td>{{u.ad_group_status or ''}}</td><td>{{u.entra_status}}</td><td>{{u.license_status}}</td><td class="{{'good' if u.mailbox_status=='ready' else 'waiting'}}">{{u.mailbox_status}}</td><td>{{u.rackspace_status}}</td><td>{{u.migration_status}}{% if u.progress_percent is not none %}<br>{{u.progress_percent}}%{% endif %}</td>
+<td>{{u.ad_group_status or ''}}</td><td>{{u.entra_status}}</td><td>{{u.license_status}}</td><td class="{{'good' if u.mailbox_status=='ready' else 'waiting'}}">{{u.mailbox_status}}</td><td>{{u.rackspace_status}}</td>
+<td>
+<b>{{u.migration_status}}</b>{% if u.progress_percent is not none %}<br>{{u.progress_percent}}%{% endif %}
+{% if u.cloudiway_object_id %}
+<br><span class="muted">Cloudiway #{{u.cloudiway_object_id}}</span>
+{% if u.migration_status != 'completed' %}
+<form method="post" action="/cloudiway/user/{{u.id}}/start-again" style="margin-top:6px">
+<button class="secondary" title="Check Cloudiway live state, then start or restart this existing mailbox migration without creating a duplicate user or changing the stored password.">Start / Restart</button>
+</form>
+{% else %}
+<br><span class="good">Completed</span>
+{% endif %}
+{% else %}
+<br><span class="muted">Not yet pushed to Cloudiway</span>
+{% endif %}
+</td>
 <td>
 {% if u.ad_match_status=='manual_review' %}
 <div class="review"><b>MANUAL REVIEW</b><br>{{u.ad_conflict_reason or u.provisioning_error or 'Identity requires review.'}}
@@ -165,11 +180,6 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 {% elif u.provisioning_status=='m365_ready' %}<span class="good">M365 READY</span>
 {% else %}{{u.provisioning_status}}{% endif %}
 {% if u.error_message %}<br><span class="bad">{{u.error_message}}</span>{% endif %}
-{% if u.cloudiway_object_id and u.migration_status in ['ready','starting','failed','attention','timed_out'] %}
-<form method="post" action="/cloudiway/user/{{u.id}}/start-again" style="margin-top:6px">
-<button class="secondary" title="Reuse this user's existing Cloudiway object and request Mail migration start again. No password is changed and no duplicate user is created.">Start / Restart Cloudiway</button>
-</form>
-{% endif %}
 </td></tr>
 {% endfor %}
 </tbody></table></div></div>
