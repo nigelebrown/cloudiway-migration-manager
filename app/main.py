@@ -1165,12 +1165,21 @@ async def upload_users(
                    FROM users u WHERE u.source_email=?""",
                 (src,),
             ).fetchone()
-            if existing and (
-                existing["migration_status"] in ("preparing", "ready", "migrating", "completed")
-                or int(existing.get("assigned") or 0) > 0
-            ):
-                protected += 1
-                continue
+            if existing:
+                existing_status = str(existing["migration_status"] or "").strip().lower()
+                # Direct existing-password uploads may intentionally refresh a
+                # previously failed Cloudiway object. Running/completed/ready
+                # users remain protected and are never duplicated or restarted.
+                retry_existing_error = (
+                    workflow_mode == "existing_password"
+                    and existing_status in ("failed", "attention", "timed_out")
+                )
+                if not retry_existing_error and (
+                    existing_status in ("preparing", "ready", "migrating", "completed")
+                    or int(existing.get("assigned") or 0) > 0
+                ):
+                    protected += 1
+                    continue
 
             db.execute(
                 """INSERT INTO users(
