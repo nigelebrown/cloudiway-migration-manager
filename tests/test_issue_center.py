@@ -295,3 +295,50 @@ def test_ambiguous_imap_connectivity_is_not_auto_recovered():
     assert row["issue_category"] == "source_connectivity"
     assert row["issue_status"] == "manual_required"
     assert row["manual_action_required"] == 1
+
+
+
+def test_explicit_authentication_failure_beats_generic_imap_connection_error():
+    status, code, message = service.classify_cloudiway_issue(
+        {"status": "Stopped"},
+        {"logs": ["Cannot connect Imap client", "Authentication failed: invalid credentials"]},
+    )
+    assert status == "failed"
+    assert code == "mailbox_authentication_failed"
+    assert "authentication failed" in message.lower()
+
+
+def test_issue_recovery_settings_can_be_changed():
+    with TestClient(app) as client:
+        login(client)
+        r = client.post(
+            "/settings/issue-recovery",
+            data={
+                "enabled": "1",
+                "retry_delay_minutes": "5",
+                "retry_max": "3",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+
+    from app.db import get_setting
+    assert get_setting("issue_auto_recovery_enabled") == "1"
+    assert get_setting("issue_credential_retry_delay_minutes") == "5"
+    assert get_setting("issue_credential_retry_max") == "3"
+
+
+def test_issue_center_exposes_multiple_issue_categories():
+    with TestClient(app) as client:
+        login(client)
+        r = client.get("/issues")
+        assert r.status_code == 200
+    for label in (
+        "Password / Credentials",
+        "Microsoft 365 Target Mailbox",
+        "Source IMAP / Connectivity",
+        "AD Identity Review",
+        "AD / M365 Provisioning",
+        "Migration Timeout",
+    ):
+        assert label in r.text
