@@ -990,7 +990,7 @@ def record_user_issue(
         auto_status = "scheduled" if auto_eligible else "manual_required"
         next_at = now + timedelta(minutes=delay_minutes) if auto_eligible else None
 
-        if same_issue and row.get("issue_status") == "recovering":
+        if same_issue and row.get("issue_status") == "recovering" and attempts < max_attempts:
             # A restarted job has not yet had time to prove success/failure.
             issue_status = "recovering"
             auto_status = "monitoring"
