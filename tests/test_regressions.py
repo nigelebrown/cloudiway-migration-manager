@@ -743,7 +743,7 @@ def test_refresh_corrects_false_migrating_to_ready_when_cloudiway_is_notstarted(
             """INSERT INTO users(
                    source_email,target_email,cloudiway_object_id,cloudiway_status,
                    migration_status,batch_number,batch_started_at
-               ) VALUES(?,?,?,?,?,?,DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE))""",
+               ) VALUES(?,?,?,?,?,?,NULL)""",
             ("denzel.smith@jcf.gov.jm", "denzel.smith@jcf.gov.jm", 427, "migrating", "migrating", batch_id),
         )
         uid = int(db.execute(
