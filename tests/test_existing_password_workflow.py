@@ -670,3 +670,131 @@ def test_individual_push_and_start_uses_mail_start_api_with_batch_id(monkeypatch
     assert len(cloud.started) == 1
     assert len(cloud.started[0]) == 1
     assert cloud.mail_start_requests == [(cloud.started[0], [99001])]
+
+
+
+def test_per_user_start_restart_reuses_existing_cloudiway_object(monkeypatch):
+    from app import service
+
+    class RestartCloud(FakeCloud):
+        def __init__(self):
+            super().__init__()
+            self.mail_start_requests = []
+
+        async def start_mail_migration(self, object_ids, batch_ids=None):
+            self.mail_start_requests.append((list(object_ids), list(batch_ids or [])))
+            return {
+                "isSuccess": True,
+                "message": "StartMailJobs done",
+                "responseData": None,
+                "error": [],
+            }
+
+    cloud = RestartCloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+    set_setting("cloudiway_token", encrypt_secret("test-cloudiway-token"), True)
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
+               ) VALUES(?,?,?,?,?)""",
+            ("RESTART-U1", "existing_password", "fully_batched", 1, 1),
+        )
+        upload_id = int(up.lastrowid)
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   cloudiway_batch_id,selected_count
+               ) VALUES(?,?,?,?,?,?)""",
+            (upload_id, 1, "RESTART-U1-B001", "ready_to_migrate", 77, 1),
+        )
+        batch_id = int(mb.lastrowid)
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,cloudiway_status,
+                   migration_status,batch_number
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                "stuck@jcf.gov.jm",
+                "stuck@jcf.gov.jm",
+                429,
+                "not_started",
+                "ready",
+                batch_id,
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='stuck@jcf.gov.jm'"
+        ).fetchone()["id"])
+        db.execute(
+            "INSERT INTO upload_batch_members(upload_batch_id,user_id,row_order) VALUES(?,?,?)",
+            (upload_id, uid, 1),
+        )
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (batch_id, uid),
+        )
+
+    with TestClient(app) as client:
+        login(client)
+        page = client.get(f"/workflow/{upload_id}")
+        assert "Start / Restart Cloudiway" in page.text
+        response = client.post(
+            f"/cloudiway/user/{uid}/start-again",
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert cloud.mail_start_requests == [([429], [77])]
+    assert cloud.users == {}
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        batch = db.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+
+    assert row["cloudiway_object_id"] == 429
+    assert row["migration_status"] == "starting"
+    assert row["cloudiway_status"] == "manual_start_requested"
+    assert batch["workflow_status"] == "starting"
+
+
+def test_per_user_start_restart_protects_running_and_completed(monkeypatch):
+    from app import service
+    cloud = FakeCloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+
+    with conn() as db:
+        for email, status, oid in [
+            ("running@jcf.gov.jm", "migrating", 500),
+            ("done@jcf.gov.jm", "completed", 501),
+        ]:
+            db.execute(
+                """INSERT INTO users(
+                       source_email,target_email,cloudiway_object_id,cloudiway_status,migration_status
+                   ) VALUES(?,?,?,?,?)""",
+                (email, email, oid, status, status),
+            )
+        running_id = int(db.execute(
+            "SELECT id FROM users WHERE source_email='running@jcf.gov.jm'"
+        ).fetchone()["id"])
+        done_id = int(db.execute(
+            "SELECT id FROM users WHERE source_email='done@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    import asyncio
+    running = asyncio.run(service.restart_stuck_cloudiway_user(running_id))
+    done = asyncio.run(service.restart_stuck_cloudiway_user(done_id))
+
+    assert running["started"] is False
+    assert "already reports" in running["reason"]
+    assert done["started"] is False
+    assert "Completed" in done["reason"]
