@@ -2350,6 +2350,13 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
         else:
             start_ids.append(oid)
 
+    start_user_ids = [
+        int(r["id"])
+        for r in rows
+        if r.get("cloudiway_object_id")
+        and int(r["cloudiway_object_id"]) in start_ids
+    ]
+
     if start_ids:
         await cloud.start_migration(start_ids)
 
@@ -2359,27 +2366,43 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
         restarted_user_ids.append(uid)
         log_event(
             uid,
-            "cloudiway_existing_migration_restarted",
-            f"Reused Cloudiway object {oid}; refreshed source password and restarted existing migration.",
+            "cloudiway_existing_migration_restart_requested",
+            f"Requested restart of existing Cloudiway object {oid}; live job status will confirm when it is actually running.",
         )
 
-    active_user_ids = [
-        int(r["id"])
-        for r in rows
-        if int(r["id"]) not in completed_user_ids
-    ]
-    if active_user_ids:
-        placeholders = ",".join("?" for _ in active_user_ids)
+    # A successful API request means Cloudiway accepted the start/restart
+    # request; it does NOT prove that the job is already Working. Keep those
+    # users READY until GetListJobStatus confirms Scheduled/Pending/Working.
+    requested_user_ids = start_user_ids + restarted_user_ids
+    if requested_user_ids:
+        placeholders = ",".join("?" for _ in requested_user_ids)
+        with conn() as db:
+            db.execute(
+                f"""UPDATE users
+                    SET migration_status='ready',batch_number=?,
+                        cloudiway_status=CASE
+                            WHEN cloudiway_status='restart_required' THEN 'restart_requested'
+                            ELSE 'start_requested'
+                        END,
+                        batch_started_at=COALESCE(batch_started_at,CURRENT_TIMESTAMP),
+                        error_message=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})""",
+                (migration_batch_id, *requested_user_ids),
+            )
+
+    if running_user_ids:
+        placeholders = ",".join("?" for _ in running_user_ids)
         with conn() as db:
             db.execute(
                 f"""UPDATE users
                     SET migration_status='migrating',batch_number=?,
                         batch_started_at=COALESCE(batch_started_at,CURRENT_TIMESTAMP),
-                        error_message=NULL,
-                        updated_at=CURRENT_TIMESTAMP
+                        error_message=NULL,updated_at=CURRENT_TIMESTAMP
                     WHERE id IN ({placeholders})""",
-                (migration_batch_id, *active_user_ids),
+                (migration_batch_id, *running_user_ids),
             )
+
     if completed_user_ids:
         placeholders = ",".join("?" for _ in completed_user_ids)
         with conn() as db:
@@ -2391,22 +2414,27 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
             )
 
     with conn() as db:
+        if len(completed_user_ids) == len(rows) and rows:
+            batch_state = "completed"
+        elif running_user_ids:
+            batch_state = "migrating"
+        else:
+            # Keep the batch startable until Cloudiway confirms the live job
+            # transitioned away from NotStarted.
+            batch_state = "ready_to_migrate"
         db.execute(
             """UPDATE migration_batches
                SET workflow_status=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
-            (
-                "completed" if len(completed_user_ids) == len(rows) and rows else "migrating",
-                migration_batch_id,
-            ),
+            (batch_state, migration_batch_id),
         )
 
     set_runtime("automation_running", "1")
     log_event(
         None,
-        "migration_batch_started",
-        f"Migration batch {migration_batch_id}: new starts={len(start_ids)}, "
-        f"existing restarts={len(restarted_user_ids)}, already running={len(running_user_ids)}, "
+        "migration_batch_start_requested",
+        f"Migration batch {migration_batch_id}: start requests={len(start_ids)}, "
+        f"restart requests={len(restarted_user_ids)}, already running={len(running_user_ids)}, "
         f"already completed={len(completed_user_ids)}",
     )
     return {
@@ -2600,7 +2628,8 @@ def refresh_upload_batch_states() -> None:
                       COUNT(m.user_id) total,
                       SUM(u.migration_status='completed') completed,
                       SUM(u.migration_status IN ('failed','attention','timed_out')) problems,
-                      SUM(u.migration_status='migrating') migrating
+                      SUM(u.migration_status='migrating') migrating,
+                      SUM(u.migration_status='ready') ready
                FROM migration_batches mb
                LEFT JOIN migration_batch_members m ON m.migration_batch_id=mb.id
                LEFT JOIN users u ON u.id=m.user_id
@@ -2612,6 +2641,7 @@ def refresh_upload_batch_states() -> None:
             completed = int(row["completed"] or 0)
             problems = int(row["problems"] or 0)
             migrating = int(row["migrating"] or 0)
+            ready = int(row["ready"] or 0)
             new_status = None
             if total and completed == total:
                 new_status = "completed"
@@ -2619,6 +2649,11 @@ def refresh_upload_batch_states() -> None:
                 new_status = "attention"
             elif migrating:
                 new_status = "migrating"
+            elif total and ready > 0 and (ready + completed) == total:
+                # Cloudiway can explicitly report NotStarted even when a prior
+                # local start request was recorded. Put the group back into a
+                # startable state rather than leaving it stuck as migrating.
+                new_status = "ready_to_migrate"
             if new_status and new_status != row["workflow_status"]:
                 db.execute(
                     "UPDATE migration_batches SET workflow_status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
