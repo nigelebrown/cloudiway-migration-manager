@@ -406,7 +406,8 @@ def test_individual_push_button_creates_one_user_cloudiway_group(monkeypatch):
         page = client.get(f"/workflow/{upload_id}")
         assert page.status_code == 200
         assert f'/workflow/{upload_id}/push-user/{user_id}' in page.text
-        assert "Push This User" in page.text
+        assert "Push Only" in page.text
+        assert "Push &amp; Start" in page.text or "Push & Start" in page.text
 
         response = client.post(
             f"/workflow/{upload_id}/push-user/{user_id}",
@@ -485,3 +486,55 @@ def test_workflow_does_not_require_preexisting_access_token_when_service_can_rea
     assert len(cloud.credentials) == 1
     with conn() as db:
         assert db.execute("SELECT COUNT(*) c FROM migration_batches").fetchone()["c"] == 1
+
+
+
+def test_individual_push_and_start_requests_cloudiway_start(monkeypatch):
+    cloud = configure_cloudiway(monkeypatch)
+
+    with TestClient(app) as client:
+        login(client)
+        upload_response = client.post(
+            "/upload",
+            files={"file": ("existing.csv", existing_password_csv(), "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        assert upload_response.status_code == 303
+
+        with conn() as db:
+            upload_id = int(db.execute("SELECT id FROM upload_batches").fetchone()["id"])
+            user_id = int(
+                db.execute(
+                    "SELECT id FROM users WHERE source_email='two@rack.example'"
+                ).fetchone()["id"]
+            )
+
+        page = client.get(f"/workflow/{upload_id}")
+        assert f'/workflow/{upload_id}/push-start-user/{user_id}' in page.text
+
+        response = client.post(
+            f"/workflow/{upload_id}/push-start-user/{user_id}",
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert len(cloud.credentials) == 1
+    assert len(cloud.started) == 1
+    assert len(cloud.started[0]) == 1
+
+    with conn() as db:
+        batch = db.execute("SELECT * FROM migration_batches").fetchone()
+        member = db.execute(
+            """SELECT u.source_email,u.migration_status,u.cloudiway_status
+               FROM migration_batch_members mbm
+               JOIN users u ON u.id=mbm.user_id
+               WHERE mbm.migration_batch_id=?""",
+            (batch["id"],),
+        ).fetchone()
+
+    assert batch["selected_count"] == 1
+    assert batch["workflow_status"] == "starting"
+    assert member["source_email"] == "two@rack.example"
+    assert member["migration_status"] == "starting"
+    assert member["cloudiway_status"] == "start_requested"
