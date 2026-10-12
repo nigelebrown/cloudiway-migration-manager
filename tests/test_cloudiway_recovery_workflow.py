@@ -344,11 +344,12 @@ def test_full_recovery_upload_repushes_password_and_restarts_same_object(monkeyp
         ]
 
     assert row["cloudiway_object_id"] == 45821
-    assert row["migration_status"] == "migrating"
+    assert row["migration_status"] == "starting"
+    assert row["cloudiway_status"] == "restart_requested"
     assert mb["cloudiway_batch_id"] == cloud.batch_id
-    assert mb["workflow_status"] == "migrating"
+    assert mb["workflow_status"] == "starting"
     assert "credentials_refreshed_restart_required" in events
-    assert "cloudiway_existing_migration_restarted" in events
+    assert "cloudiway_existing_migration_restart_requested" in events
 
 
 def test_recovery_upload_protects_locally_running_and_completed_users():
