@@ -2818,6 +2818,97 @@ async def retry_user(request: Request, user_id: int):
     return {"ok": True}
 
 
+@app.get("/issues", response_class=HTMLResponse)
+async def issues_page(
+    request: Request,
+    category: str = "",
+    state: str = "",
+    q: str = "",
+):
+    redirect = _page_auth(request)
+    if redirect:
+        return redirect
+
+    where = ["issue_status NOT IN ('none','resolved')"]
+    params = []
+    if category:
+        where.append("COALESCE(issue_category,'other')=?")
+        params.append(category)
+    if state:
+        where.append("issue_status=?")
+        params.append(state)
+    if q:
+        where.append(
+            "(source_email LIKE ? OR target_email LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR error_message LIKE ?)"
+        )
+        needle = f"%{q}%"
+        params.extend([needle, needle, needle, needle, needle])
+
+    with conn() as db:
+        category_counts = {
+            r["issue_category"]: int(r["c"])
+            for r in db.execute(
+                """SELECT COALESCE(issue_category,'other') issue_category,COUNT(*) c
+                   FROM users
+                   WHERE issue_status NOT IN ('none','resolved')
+                   GROUP BY COALESCE(issue_category,'other')"""
+            ).fetchall()
+        }
+        state_counts = {
+            r["issue_status"]: int(r["c"])
+            for r in db.execute(
+                """SELECT issue_status,COUNT(*) c
+                   FROM users
+                   WHERE issue_status NOT IN ('none','resolved')
+                   GROUP BY issue_status"""
+            ).fetchall()
+        }
+        rows = db.execute(
+            f"""SELECT id,source_email,target_email,first_name,middle_name,last_name,
+                       computer_number,migration_status,cloudiway_status,cloudiway_object_id,
+                       issue_code,COALESCE(issue_category,'other') issue_category,issue_status,
+                       issue_detected_at,issue_last_seen_at,manual_action_required,
+                       auto_recovery_attempts,auto_recovery_status,auto_recovery_last_at,
+                       auto_recovery_next_at,error_message,password_reset_method,
+                       source_credential_password_enc,generated_password_enc,updated_at
+                FROM users
+                WHERE {' AND '.join(where)}
+                ORDER BY manual_action_required DESC,
+                         COALESCE(issue_last_seen_at,updated_at) DESC,id DESC
+                LIMIT 1000""",
+            tuple(params),
+        ).fetchall()
+
+    users = []
+    for row in rows:
+        item = dict(row)
+        item["has_stored_credential"] = bool(
+            item.pop("source_credential_password_enc", None)
+            or item.pop("generated_password_enc", None)
+        )
+        users.append(item)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="issues.html",
+        context={
+            "request": request,
+            "users": users,
+            "category_counts": category_counts,
+            "state_counts": state_counts,
+            "labels": ISSUE_CATEGORY_LABELS,
+            "selected_category": category,
+            "selected_state": state,
+            "q": q,
+            "notice": request.session.pop("issues_notice", None),
+            "error": request.session.pop("issues_error", None),
+            "auto_recovery_enabled": (get_setting("issue_auto_recovery_enabled") or "1") == "1",
+            "retry_delay_minutes": get_setting("issue_credential_retry_delay_minutes") or "3",
+            "retry_max": get_setting("issue_credential_retry_max") or "2",
+        },
+    )
+
+
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request, level: str = "", q: str = ""):
     redirect = _page_auth(request)
