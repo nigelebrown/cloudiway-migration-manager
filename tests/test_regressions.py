@@ -684,3 +684,90 @@ def test_mail_progress_envelope_computes_safe_percent_from_counts():
     status, percent, _ = parse_progress(payload)
     assert status == "migrating"
     assert percent == 50.0
+
+
+
+def test_cloudiway_notstarted_job_status_is_authoritative():
+    state, detail = service.parse_cloudiway_job_status(
+        {"isSuccess": True, "responseData": {"status": "NotStarted"}, "error": []}
+    )
+    assert state == "not_started"
+    assert "NotStarted" in detail
+
+
+def test_refresh_corrects_false_migrating_to_ready_when_cloudiway_is_notstarted(monkeypatch):
+    class FakeCloud:
+        async def job_status(self, object_id):
+            return {"isSuccess": True, "responseData": {"status": "NotStarted"}, "error": []}
+
+        async def progress(self, object_id, since_minutes):
+            return {
+                "isSuccess": True,
+                "message": "GetMailProgress done",
+                "count": 1,
+                "responseData": {
+                    "blockId": 427,
+                    "migratedEmails": 0,
+                    "errorEmails": 0,
+                    "ignoredEmails": 0,
+                    "totalEmails": 0,
+                    "recentMigratedEmails": 0,
+                    "windowMinutes": 1,
+                    "startDateTime": None,
+                    "lastActivityDateTime": None,
+                    "error": [],
+                },
+                "error": [],
+            }
+
+    async def fake_ready():
+        return FakeCloud()
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(batch_name,workflow_mode,workflow_status,total_rows,imported_rows)
+               VALUES(?,?,?,?,?)""",
+            ("U-NOTSTARTED", "existing_password", "fully_batched", 1, 1),
+        )
+        upload_id = int(up.lastrowid)
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,cloudiway_batch_id,selected_count
+               ) VALUES(?,?,?,?,?,?)""",
+            (upload_id, 1, "U-NOTSTARTED-B001", "migrating", 14, 1),
+        )
+        batch_id = int(mb.lastrowid)
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,cloudiway_status,
+                   migration_status,batch_number,batch_started_at
+               ) VALUES(?,?,?,?,?,?,DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE))""",
+            ("denzel.smith@jcf.gov.jm", "denzel.smith@jcf.gov.jm", 427, "migrating", "migrating", batch_id),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='denzel.smith@jcf.gov.jm'"
+        ).fetchone()["id"])
+        db.execute(
+            "INSERT INTO upload_batch_members(upload_batch_id,user_id,row_order) VALUES(?,?,?)",
+            (upload_id, uid, 1),
+        )
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (batch_id, uid),
+        )
+
+    import asyncio
+    result = asyncio.run(service.refresh_status())
+    assert result["not_started"] == 1
+    assert result["timed_out"] == 0
+
+    with conn() as db:
+        user = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        batch = db.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+
+    assert user["migration_status"] == "ready"
+    assert user["cloudiway_status"] == "not_started"
+    assert user["progress_percent"] == 0
+    assert batch["workflow_status"] == "ready_to_migrate"
