@@ -250,7 +250,7 @@ async def ensure_migration_cloudiway_batch(migration_batch_id: int) -> int:
                 """UPDATE migration_batches
                    SET cloudiway_batch_id=?,cloudiway_batch_name=?,
                        workflow_status=CASE
-                           WHEN workflow_status='cloudiway_batch_error' AND ?='existing_password' THEN 'ready_for_cloudiway'
+                           WHEN workflow_status='cloudiway_batch_error' AND ? IN ('existing_password','existing_password_retry') THEN 'ready_for_cloudiway'
                            WHEN workflow_status='cloudiway_batch_error' THEN 'identity_pending'
                            ELSE workflow_status
                        END,
@@ -992,7 +992,7 @@ def _source_credentials_for_cloudiway(user: dict) -> tuple[str, str, str]:
         raise RuntimeError("Cloudiway source username must be the full source email address")
 
     method = user.get("password_reset_method") or ""
-    if method == "existing_password":
+    if method in ("existing_password", "existing_password_retry"):
         stored_username = str(user.get("source_credential_username") or "").strip().lower()
         if stored_username and stored_username != username:
             raise RuntimeError(
@@ -1013,12 +1013,63 @@ def _source_credentials_for_cloudiway(user: dict) -> tuple[str, str, str]:
     return username, decrypt_secret(encrypted), "generated_or_reset"
 
 
-async def prepare_existing_password_user(user_id: int) -> int:
-    """Push an uploaded existing source password to Cloudiway without duplicating the mail user.
+async def find_existing_cloudiway_user(user: dict) -> int | None:
+    """Resolve an existing Cloudiway mail user without creating a new object."""
+    client = await _cloudiway_client_ready()
 
-    If the Cloudiway mail user already exists and its migration is failed/stopped/attention,
-    the existing object is marked for restart after credentials are refreshed. Running or
-    completed objects are never duplicated or blindly restarted.
+    if user.get("cloudiway_object_id"):
+        object_id = int(user["cloudiway_object_id"])
+        mapping = await _validate_cloudiway_user_mapping(
+            client, object_id, user["source_email"], user["target_email"]
+        )
+        log_event(
+            user["id"],
+            "cloudiway_recovery_mapping_verified",
+            "Recovery workflow verified existing Cloudiway object: "
+            + json.dumps(mapping, default=str)[:1200],
+        )
+        return object_id
+
+    try:
+        found = await client.verify_mail_user(user["source_email"])
+        object_id = _extract_object_id(found)
+        if not object_id:
+            return None
+        mapping = await _validate_cloudiway_user_mapping(
+            client, object_id, user["source_email"], user["target_email"]
+        )
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET cloudiway_object_id=?,cloudiway_status='existing',
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (object_id, user["id"]),
+            )
+        log_event(
+            user["id"],
+            "cloudiway_recovery_user_found",
+            "Recovery workflow found existing Cloudiway object and verified mapping: "
+            + json.dumps(mapping, default=str)[:1200],
+        )
+        return object_id
+    except Exception as exc:
+        message = str(exc)
+        log_event(user["id"], "cloudiway_recovery_lookup_failed", message)
+        if "(401)" in message or "(403)" in message:
+            raise
+        return None
+
+
+async def prepare_existing_password_user(user_id: int) -> int:
+    """Register an uploaded source password and safely handle existing Cloudiway state.
+
+    existing_password:
+      - creates/reuses the Cloudiway user and prepares a normal direct migration.
+    existing_password_retry:
+      - requires an existing Cloudiway user;
+      - if Cloudiway reports failed/attention, pushes the supplied password again and
+        marks the same object for Restart;
+      - running/completed objects are left alone and never duplicated/restarted.
     """
     with conn() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
@@ -1026,17 +1077,24 @@ async def prepare_existing_password_user(user_id: int) -> int:
         raise RuntimeError(f"User {user_id} not found")
     user = dict(row)
 
-    if user.get("password_reset_method") != "existing_password":
-        raise RuntimeError("User is not assigned to the existing-password Cloudiway-only workflow")
+    method = user.get("password_reset_method") or ""
+    if method not in ("existing_password", "existing_password_retry"):
+        raise RuntimeError("User is not assigned to an existing-password Cloudiway workflow")
 
+    recovery_only = method == "existing_password_retry"
     prior_local_status = str(user.get("migration_status") or "").strip().lower()
     username, password, credential_origin = _source_credentials_for_cloudiway(user)
     cloud = await _cloudiway_client_ready()
 
-    # Reuse the existing Cloudiway object when one already exists. ensure_cloudiway_user()
-    # verifies by source email before creating anything, so re-uploading credentials does
-    # not create a duplicate Cloudiway mail user.
-    object_id = await ensure_cloudiway_user(user)
+    if recovery_only:
+        object_id = await find_existing_cloudiway_user(user)
+        if not object_id:
+            raise RuntimeError(
+                f"No existing Cloudiway mail user was found for {username}. "
+                "Use the normal Existing source password workflow for a new Cloudiway migration."
+            )
+    else:
+        object_id = await ensure_cloudiway_user(user)
 
     remote_status = None
     remote_detail = None
@@ -1044,9 +1102,52 @@ async def prepare_existing_password_user(user_id: int) -> int:
         progress = await cloud.progress(object_id, max(1, settings.progress_window_minutes))
         remote_status, _, remote_detail = parse_progress(progress)
     except Exception as exc:
-        # A never-started object or unavailable progress endpoint should not block
-        # credential refresh. Local terminal state is used as the fallback signal.
         remote_detail = f"Progress lookup unavailable: {exc}"
+
+    # Recovery mode is deliberately state-aware. Running/completed jobs are not
+    # touched merely because their row was uploaded again.
+    if recovery_only and remote_status == "completed":
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET cloudiway_object_id=?,cloudiway_status='existing_completed',
+                       migration_status='completed',error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (object_id, user_id),
+            )
+        log_event(
+            user_id,
+            "cloudiway_recovery_skipped_completed",
+            f"Recovery upload found completed Cloudiway object {object_id}; password was not re-pushed and job was not restarted.",
+        )
+        return object_id
+
+    if recovery_only and remote_status == "migrating":
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET cloudiway_object_id=?,cloudiway_status='existing_migrating',
+                       migration_status='migrating',error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (object_id, user_id),
+            )
+        log_event(
+            user_id,
+            "cloudiway_recovery_skipped_running",
+            f"Recovery upload found Cloudiway object {object_id} already migrating; password was not re-pushed and job was not restarted.",
+        )
+        return object_id
+
+    should_restart = (
+        remote_status in ("failed", "attention")
+        or prior_local_status in ("failed", "attention", "timed_out")
+    )
+
+    if recovery_only and not should_restart:
+        raise RuntimeError(
+            f"Existing Cloudiway object {object_id} was found, but it is not in a failed/attention state "
+            f"(remote_status={remote_status or 'unknown'}). Recovery mode will not restart it blindly."
+        )
 
     token = await cloud.get_self_service_token(object_id)
     log_event(
@@ -1057,15 +1158,7 @@ async def prepare_existing_password_user(user_id: int) -> int:
     )
     await cloud.register_source_credentials(token, username, password)
 
-    if remote_status == "completed":
-        next_cloud_status = "existing_completed"
-        next_migration_status = "completed"
-        action = "credentials_refreshed_existing_completed"
-    elif remote_status == "migrating":
-        next_cloud_status = "existing_migrating"
-        next_migration_status = "migrating"
-        action = "credentials_refreshed_existing_migrating"
-    elif remote_status in ("failed", "attention") or prior_local_status in ("failed", "attention", "timed_out"):
+    if should_restart:
         next_cloud_status = "restart_required"
         next_migration_status = "ready"
         action = "credentials_refreshed_restart_required"
@@ -1096,10 +1189,11 @@ async def prepare_existing_password_user(user_id: int) -> int:
         user_id,
         action,
         "Existing Cloudiway object reused; uploaded source password pushed again. "
-        f"remote_status={remote_status or 'unknown'}; object_id={object_id}; "
-        f"detail={str(remote_detail)[:700]}",
+        f"recovery_only={recovery_only}; remote_status={remote_status or 'unknown'}; "
+        f"object_id={object_id}; detail={str(remote_detail)[:700]}",
     )
     return object_id
+
 
 
 async def start_manual_migrations(user_ids: list[int]) -> dict:
@@ -1213,7 +1307,7 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
     if not rows:
         return {"ready": False, "reason": "Migration batch has no users"}
 
-    if batch["workflow_mode"] != "existing_password":
+    if batch["workflow_mode"] not in ("existing_password", "existing_password_retry"):
         not_m365_ready = [
             int(row["id"]) for row in rows
             if row.get("provisioning_status") != "m365_ready"
@@ -1244,7 +1338,7 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
         try:
             if batch["workflow_mode"] == "manual_bulk":
                 oid = await prepare_manual_user(int(user["id"]))
-            elif batch["workflow_mode"] == "existing_password":
+            elif batch["workflow_mode"] in ("existing_password", "existing_password_retry"):
                 oid = await prepare_existing_password_user(int(user["id"]))
             else:
                 oid = await prepare_user(int(user["id"]))
