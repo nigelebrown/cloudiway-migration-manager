@@ -973,7 +973,6 @@ async def refresh_status() -> dict:
                 status == "ready"
                 and cloud_status == "not_started"
                 and error_message
-                and "two StartJobs requests" in error_message
             ):
                 record_user_issue(
                     int(row["id"]),
