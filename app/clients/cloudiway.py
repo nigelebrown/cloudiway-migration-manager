@@ -126,14 +126,23 @@ class CloudiwayClient:
             "Could not start Cloudiway migration",
         )
 
-    async def start_mail_migration(self, object_ids: list[int]):
-        """Start mail migration using Cloudiway's mail-specific endpoint."""
+    async def start_mail_migration(
+        self,
+        object_ids: list[int],
+        batch_ids: list[int] | None = None,
+    ):
+        """Start Mail migration using Cloudiway's Mail controller.
+
+        Cloudiway's Swagger defines /Mail/StartMailJobs/{jobTypeId} with a
+        MailUserInputDto payload containing objectIds and batchIds. Use this
+        endpoint for mailbox migrations instead of the generic Jobs endpoints.
+        """
         payload = {
             "mailUsers": None,
             "objectIds": [int(x) for x in object_ids],
             "mailUserSearch": None,
             "isAllSelected": False,
-            "batchIds": [],
+            "batchIds": [int(x) for x in (batch_ids or [])],
         }
         return await self._post(
             f"/Mail/StartMailJobs/{settings.cloudiway_job_type_migration}",
