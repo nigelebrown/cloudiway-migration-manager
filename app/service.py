@@ -718,7 +718,7 @@ async def refresh_status() -> dict:
     with conn() as db:
         rows = db.execute(
             "SELECT id,cloudiway_object_id,migration_status FROM users "
-            "WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready')"
+            "WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready','starting')"
         ).fetchall()
 
     updated = completed = failed = attention = timed_out = not_started = 0
@@ -780,12 +780,12 @@ async def refresh_status() -> dict:
                             or int(response.get("ignoredEmails") or 0) > 0
                         )
                     if (
-                        row.get("migration_status") == "ready"
+                        row.get("migration_status") in ("ready", "starting")
                         and envelope_ok
                         and not has_activity
                         and progress_status == "migrating"
                     ):
-                        status = "ready"
+                        status = row.get("migration_status")
 
                 detail = json.dumps(
                     {"jobStatus": job_status_data, "progress": data},
@@ -2379,7 +2379,7 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
         with conn() as db:
             db.execute(
                 f"""UPDATE users
-                    SET migration_status='ready',batch_number=?,
+                    SET migration_status='starting',batch_number=?,
                         cloudiway_status=CASE
                             WHEN cloudiway_status='restart_required' THEN 'restart_requested'
                             ELSE 'start_requested'
@@ -2419,9 +2419,7 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
         elif running_user_ids:
             batch_state = "migrating"
         else:
-            # Keep the batch startable until Cloudiway confirms the live job
-            # transitioned away from NotStarted.
-            batch_state = "ready_to_migrate"
+            batch_state = "starting"
         db.execute(
             """UPDATE migration_batches
                SET workflow_status=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP
@@ -2629,6 +2627,7 @@ def refresh_upload_batch_states() -> None:
                       SUM(u.migration_status='completed') completed,
                       SUM(u.migration_status IN ('failed','attention','timed_out')) problems,
                       SUM(u.migration_status='migrating') migrating,
+                      SUM(u.migration_status='starting') starting,
                       SUM(u.migration_status='ready') ready
                FROM migration_batches mb
                LEFT JOIN migration_batch_members m ON m.migration_batch_id=mb.id
@@ -2641,6 +2640,7 @@ def refresh_upload_batch_states() -> None:
             completed = int(row["completed"] or 0)
             problems = int(row["problems"] or 0)
             migrating = int(row["migrating"] or 0)
+            starting = int(row["starting"] or 0)
             ready = int(row["ready"] or 0)
             new_status = None
             if total and completed == total:
@@ -2649,6 +2649,8 @@ def refresh_upload_batch_states() -> None:
                 new_status = "attention"
             elif migrating:
                 new_status = "migrating"
+            elif starting:
+                new_status = "starting"
             elif total and ready > 0 and (ready + completed) == total:
                 # Cloudiway can explicitly report NotStarted even when a prior
                 # local start request was recorded. Put the group back into a
