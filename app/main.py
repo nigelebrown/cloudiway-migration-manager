@@ -52,6 +52,10 @@ from app.service import (
     prepare_migration_batch,
     start_migration_batch,
     advance_upload_workflows,
+    process_background_issues,
+    recover_credential_issue,
+    record_user_issue,
+    ISSUE_CATEGORY_LABELS,
 )
 
 app = FastAPI(title="JCF Mail Migration Console")
@@ -338,6 +342,13 @@ async def status_poller():
             if token_present:
                 await advance_upload_workflows()
 
+            # Issue detection/recovery runs independently of the web admin
+            # session and independently of whether the migration dashboard is open.
+            try:
+                await process_background_issues()
+            except Exception as issue_exc:
+                log_event(None, "background_issue_processing_failed", str(issue_exc))
+
             if get_runtime("automation_running", "0") == "1" and token_present:
                 await refresh_status()
         except Exception as exc:
@@ -451,6 +462,9 @@ async def settings_page(request: Request):
             "target_pool": get_setting("cloudiway_target_pool_id") or "",
             "cloudiway_pools": pools,
             "direct_email_domain": _direct_email_domain(),
+            "issue_auto_recovery_enabled": (get_setting("issue_auto_recovery_enabled") or "1") == "1",
+            "issue_credential_retry_delay_minutes": get_setting("issue_credential_retry_delay_minutes") or "3",
+            "issue_credential_retry_max": get_setting("issue_credential_retry_max") or "2",
             "error": request.session.pop("settings_error", None),
             "notice": request.session.pop("settings_notice", None),
         },
@@ -863,6 +877,26 @@ async def cloudiway_disconnect(request: Request):
     set_setting("cloudiway_password", "", True)
     request.session["settings_notice"] = (
         "Cloudiway disconnected from this application. Existing Cloudiway migration jobs continue on Cloudiway."
+    )
+    return RedirectResponse("/settings", 303)
+
+
+@app.post("/settings/issue-recovery")
+async def save_issue_recovery_settings(
+    request: Request,
+    enabled: str = Form(""),
+    retry_delay_minutes: int = Form(3),
+    retry_max: int = Form(2),
+):
+    require_admin(request)
+    retry_delay_minutes = max(1, min(60, int(retry_delay_minutes)))
+    retry_max = max(1, min(10, int(retry_max)))
+    set_setting("issue_auto_recovery_enabled", "1" if enabled else "0")
+    set_setting("issue_credential_retry_delay_minutes", str(retry_delay_minutes))
+    set_setting("issue_credential_retry_max", str(retry_max))
+    request.session["settings_notice"] = (
+        f"Issue recovery settings saved. Credential retry delay: {retry_delay_minutes} minute(s); "
+        f"maximum automatic retries: {retry_max}."
     )
     return RedirectResponse("/settings", 303)
 
