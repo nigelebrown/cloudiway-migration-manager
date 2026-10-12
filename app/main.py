@@ -55,6 +55,7 @@ from app.service import (
     process_background_issues,
     recover_credential_issue,
     record_user_issue,
+    clear_user_issue,
     ISSUE_CATEGORY_LABELS,
 )
 
@@ -2575,12 +2576,23 @@ async def dashboard_data(request: Request, q: str = ""):
                 "SELECT migration_status,COUNT(*) c FROM users GROUP BY migration_status"
             ).fetchall()
         }
+        issue_counts = {
+            r["issue_category"]: r["c"]
+            for r in db.execute(
+                """SELECT COALESCE(issue_category,'other') issue_category,COUNT(*) c
+                   FROM users
+                   WHERE issue_status NOT IN ('none','resolved')
+                   GROUP BY COALESCE(issue_category,'other')"""
+            ).fetchall()
+        }
         if q:
             values = tuple([f"%{q}%"] * 4)
             rows = db.execute(
                 """SELECT u.id,u.source_email,u.target_email,u.first_name,u.last_name,u.rackspace_status,
                           u.cloudiway_status,u.migration_status,u.progress_percent,u.error_message,u.batch_number,u.updated_at,
                           u.password_reset_method,u.manual_password_generated_at,u.manual_password_confirmed_at,u.computer_number,
+                          u.issue_code,u.issue_category,u.issue_status,u.auto_recovery_attempts,
+                          u.auto_recovery_status,u.manual_action_required,
                           mb.batch_name AS migration_batch_name,mb.cloudiway_batch_id
                    FROM users u
                    LEFT JOIN migration_batches mb ON mb.id=u.batch_number
@@ -2593,6 +2605,8 @@ async def dashboard_data(request: Request, q: str = ""):
                 """SELECT u.id,u.source_email,u.target_email,u.first_name,u.last_name,u.rackspace_status,
                           u.cloudiway_status,u.migration_status,u.progress_percent,u.error_message,u.batch_number,u.updated_at,
                           u.password_reset_method,u.manual_password_generated_at,u.manual_password_confirmed_at,u.computer_number,
+                          u.issue_code,u.issue_category,u.issue_status,u.auto_recovery_attempts,
+                          u.auto_recovery_status,u.manual_action_required,
                           mb.batch_name AS migration_batch_name,mb.cloudiway_batch_id
                    FROM users u
                    LEFT JOIN migration_batches mb ON mb.id=u.batch_number
@@ -2600,6 +2614,8 @@ async def dashboard_data(request: Request, q: str = ""):
             ).fetchall()
     return {
         "counts": counts,
+        "issue_counts": issue_counts,
+        "issue_labels": ISSUE_CATEGORY_LABELS,
         "users": [dict(r) for r in rows],
         "paused": get_runtime("automation_paused", "0") == "1",
         "pause_reason": get_runtime("pause_reason", ""),
