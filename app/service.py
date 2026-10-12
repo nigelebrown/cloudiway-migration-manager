@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app.config import settings
 from app.db import conn, get_setting, get_runtime, set_runtime, log_event, set_setting
@@ -854,7 +854,19 @@ def classify_cloudiway_issue(progress_data, logs_data=None) -> tuple[str | None,
             "Verify the source mailbox exists and that the generated password was applied.",
         )
 
-    if "invalid credential" in combined or "authentication failed" in combined:
+    credential_markers = (
+        "invalid credential",
+        "invalid credentials",
+        "authentication failed",
+        "authenticationfailed",
+        "login failed",
+        "invalid password",
+        "incorrect password",
+        "username or password",
+        "auth failed",
+        "imap authentication failed",
+    )
+    if any(marker in combined for marker in credential_markers):
         return (
             "failed",
             "mailbox_authentication_failed",
@@ -862,6 +874,332 @@ def classify_cloudiway_issue(progress_data, logs_data=None) -> tuple[str | None,
         )
 
     return None, None, None
+
+
+ISSUE_CATEGORY_LABELS = {
+    "credentials": "Password / Credentials",
+    "target_mailbox": "Microsoft 365 Target Mailbox",
+    "source_mailbox": "Rackspace Source Mailbox",
+    "source_connectivity": "Source IMAP / Connectivity",
+    "ad_identity": "AD Identity Review",
+    "provisioning": "AD / M365 Provisioning",
+    "timeout": "Migration Timeout",
+    "cloudiway": "Cloudiway Status",
+    "other": "Other / Unclassified",
+}
+
+
+def issue_category_for_code(issue_code: str | None) -> str:
+    mapping = {
+        "mailbox_authentication_failed": "credentials",
+        "target_mailbox_missing": "target_mailbox",
+        "target_mailbox_connection_failed": "target_mailbox",
+        "source_mailbox_connection_failed": "source_mailbox",
+        "source_imap_connection_failed": "source_connectivity",
+        "timed_out": "timeout",
+        "ad_identity_conflict": "ad_identity",
+        "ad_manual_review": "ad_identity",
+        "provisioning_failed": "provisioning",
+        "cloudiway_status_attention": "cloudiway",
+        "cloudiway_status_failed": "cloudiway",
+    }
+    return mapping.get(issue_code or "", "other")
+
+
+def _issue_recovery_settings() -> tuple[bool, int, int]:
+    enabled = (get_setting("issue_auto_recovery_enabled") or "1") == "1"
+    try:
+        delay_minutes = max(1, int(get_setting("issue_credential_retry_delay_minutes") or "3"))
+    except Exception:
+        delay_minutes = 3
+    try:
+        max_attempts = max(1, min(10, int(get_setting("issue_credential_retry_max") or "2")))
+    except Exception:
+        max_attempts = 2
+    return enabled, delay_minutes, max_attempts
+
+
+def record_user_issue(
+    user_id: int,
+    issue_code: str,
+    message: str,
+    *,
+    category: str | None = None,
+) -> None:
+    """Persist one current actionable issue for the user.
+
+    Credential failures can be scheduled for automatic recovery when a stored
+    source credential is available. Other categories are classified for the
+    issue dashboard and held for the appropriate manual/background workflow.
+    """
+    category = category or issue_category_for_code(issue_code)
+    enabled, delay_minutes, max_attempts = _issue_recovery_settings()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with conn() as db:
+        row = db.execute(
+            """SELECT issue_code,issue_status,auto_recovery_attempts,
+                      source_credential_password_enc,generated_password_enc
+               FROM users WHERE id=?""",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return
+
+        same_issue = row.get("issue_code") == issue_code and row.get("issue_status") not in (None, "", "none", "resolved")
+        attempts = int(row.get("auto_recovery_attempts") or 0) if same_issue else 0
+        credential_available = bool(
+            row.get("source_credential_password_enc") or row.get("generated_password_enc")
+        )
+
+        auto_eligible = (
+            category == "credentials"
+            and enabled
+            and credential_available
+            and attempts < max_attempts
+        )
+        manual_required = not auto_eligible
+        issue_status = "open" if auto_eligible else "manual_required"
+        auto_status = "scheduled" if auto_eligible else "manual_required"
+        next_at = now + timedelta(minutes=delay_minutes) if auto_eligible else None
+
+        if same_issue and row.get("issue_status") == "recovering":
+            # A restarted job has not yet had time to prove success/failure.
+            issue_status = "recovering"
+            auto_status = "monitoring"
+            next_at = now + timedelta(minutes=delay_minutes)
+            manual_required = False
+
+        db.execute(
+            """UPDATE users
+               SET issue_code=?,issue_category=?,issue_status=?,
+                   issue_detected_at=COALESCE(issue_detected_at,CURRENT_TIMESTAMP),
+                   issue_last_seen_at=CURRENT_TIMESTAMP,
+                   manual_action_required=?,
+                   auto_recovery_attempts=?,
+                   auto_recovery_status=?,
+                   auto_recovery_next_at=?,
+                   error_message=?,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (
+                issue_code,
+                category,
+                issue_status,
+                1 if manual_required else 0,
+                attempts,
+                auto_status,
+                next_at,
+                message[:3000],
+                user_id,
+            ),
+        )
+
+
+def clear_user_issue(user_id: int, reason: str = "") -> None:
+    with conn() as db:
+        row = db.execute(
+            "SELECT issue_code,issue_status FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return
+        had_issue = bool(row.get("issue_code")) and row.get("issue_status") not in ("none", "resolved")
+        db.execute(
+            """UPDATE users
+               SET issue_code=NULL,issue_category=NULL,issue_status='resolved',
+                   manual_action_required=0,auto_recovery_attempts=0,
+                   auto_recovery_status='resolved',auto_recovery_next_at=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (user_id,),
+        )
+    if had_issue:
+        log_event(
+            user_id,
+            "issue_resolved",
+            reason or "Previously detected migration issue is no longer present.",
+        )
+
+
+async def recover_credential_issue(user_id: int, *, force: bool = False) -> dict:
+    """Re-push a stored source password and restart the same Cloudiway object."""
+    enabled, delay_minutes, max_attempts = _issue_recovery_settings()
+    if not enabled and not force:
+        return {"recovered": False, "reason": "Automatic issue recovery is disabled"}
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row:
+        return {"recovered": False, "reason": "User not found"}
+    user = dict(row)
+
+    if not user.get("cloudiway_object_id"):
+        record_user_issue(
+            user_id,
+            "cloudiway_user_missing",
+            "No Cloudiway object ID exists for this user. Manual review is required.",
+            category="cloudiway",
+        )
+        return {"recovered": False, "reason": "No Cloudiway object ID"}
+
+    attempts = int(user.get("auto_recovery_attempts") or 0)
+    if attempts >= max_attempts and not force:
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET issue_status='manual_required',manual_action_required=1,
+                       auto_recovery_status='exhausted',auto_recovery_next_at=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (user_id,),
+            )
+        return {"recovered": False, "reason": "Automatic credential retries exhausted"}
+
+    cloud = await _cloudiway_client_ready()
+    object_id = int(user["cloudiway_object_id"])
+
+    # Re-check live Cloudiway state immediately before making a write.
+    progress = await cloud.progress(object_id, max(1, settings.progress_window_minutes))
+    remote_status, percent, detail = parse_progress(progress)
+    logs_data = None
+    if remote_status in ("failed", "attention"):
+        try:
+            logs_data = await cloud.logs(object_id)
+        except Exception as exc:
+            log_event(user_id, "cloudiway_logs_fetch_failed", str(exc))
+
+    _, current_issue_code, current_message = classify_cloudiway_issue(progress, logs_data)
+
+    if remote_status == "completed":
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET migration_status='completed',cloudiway_status='completed',
+                       progress_percent=?,progress_detail=?,error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (percent, detail, user_id),
+            )
+        clear_user_issue(user_id, "Cloudiway reports the migration as completed.")
+        return {"recovered": False, "resolved": True, "reason": "Already completed"}
+
+    if remote_status == "migrating":
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET migration_status='migrating',cloudiway_status='migrating',
+                       progress_percent=?,progress_detail=?,error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (percent, detail, user_id),
+            )
+        clear_user_issue(user_id, "Cloudiway reports the migration is running.")
+        return {"recovered": False, "resolved": True, "reason": "Already migrating"}
+
+    if current_issue_code != "mailbox_authentication_failed" and not force:
+        if current_issue_code:
+            record_user_issue(
+                user_id,
+                current_issue_code,
+                current_message or "Cloudiway returned a different issue during recovery.",
+            )
+        return {
+            "recovered": False,
+            "reason": "The current Cloudiway issue is not an explicit credential failure",
+        }
+
+    username, password, credential_origin = _source_credentials_for_cloudiway(user)
+    token = await cloud.get_self_service_token(object_id)
+    await cloud.register_source_credentials(token, username, password)
+    await cloud.restart_migration(object_id)
+
+    new_attempts = attempts + 1
+    next_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=delay_minutes)
+    with conn() as db:
+        db.execute(
+            """UPDATE users
+               SET migration_status='migrating',
+                   cloudiway_status='auto_credential_recovery_restarted',
+                   issue_code='mailbox_authentication_failed',
+                   issue_category='credentials',
+                   issue_status='recovering',
+                   manual_action_required=0,
+                   auto_recovery_attempts=?,
+                   auto_recovery_status='restarted',
+                   auto_recovery_last_at=CURRENT_TIMESTAMP,
+                   auto_recovery_next_at=?,
+                   error_message=?,
+                   batch_started_at=COALESCE(batch_started_at,CURRENT_TIMESTAMP),
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (
+                new_attempts,
+                next_at,
+                f"Credential error detected. Stored source credential was pushed to Cloudiway again and the existing migration was restarted automatically (attempt {new_attempts}/{max_attempts}).",
+                user_id,
+            ),
+        )
+    log_event(
+        user_id,
+        "automatic_credential_recovery",
+        f"Credential issue auto-recovery attempt {new_attempts}/{max_attempts}: "
+        f"username={username}; credential_source={credential_origin}; Cloudiway object={object_id}; same object restarted.",
+    )
+    return {
+        "recovered": True,
+        "attempt": new_attempts,
+        "max_attempts": max_attempts,
+        "object_id": object_id,
+    }
+
+
+async def process_background_issues() -> dict:
+    """Handle actionable issues independently of the administrator web session."""
+    enabled, _, max_attempts = _issue_recovery_settings()
+    summary = {"checked": 0, "recovered": 0, "resolved": 0, "manual": 0, "errors": 0}
+    if not enabled or not get_setting("cloudiway_token"):
+        return summary
+
+    with conn() as db:
+        rows = db.execute(
+            """SELECT id FROM users
+               WHERE issue_category='credentials'
+                 AND issue_status IN ('open','recovering')
+                 AND manual_action_required=0
+                 AND auto_recovery_attempts < ?
+                 AND (auto_recovery_next_at IS NULL OR auto_recovery_next_at <= UTC_TIMESTAMP())
+               ORDER BY COALESCE(auto_recovery_next_at,issue_detected_at),id
+               LIMIT 25""",
+            (max_attempts,),
+        ).fetchall()
+
+    for row in rows:
+        uid = int(row["id"])
+        summary["checked"] += 1
+        try:
+            result = await recover_credential_issue(uid)
+            if result.get("recovered"):
+                summary["recovered"] += 1
+            elif result.get("resolved"):
+                summary["resolved"] += 1
+            elif "exhausted" in str(result.get("reason") or "").lower():
+                summary["manual"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            log_event(uid, "automatic_issue_recovery_failed", str(exc))
+            with conn() as db:
+                current = db.execute(
+                    "SELECT auto_recovery_attempts FROM users WHERE id=?",
+                    (uid,),
+                ).fetchone()
+                attempts = int(current["auto_recovery_attempts"] or 0) if current else 0
+                if attempts >= max_attempts:
+                    db.execute(
+                        """UPDATE users
+                           SET issue_status='manual_required',manual_action_required=1,
+                               auto_recovery_status='exhausted',auto_recovery_next_at=NULL,
+                               updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (uid,),
+                    )
+    return summary
 
 
 def parse_progress(data) -> tuple[str, float | None, str]:
