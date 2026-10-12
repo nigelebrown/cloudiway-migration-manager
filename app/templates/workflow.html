@@ -165,6 +165,11 @@ table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:8px;bor
 {% elif u.provisioning_status=='m365_ready' %}<span class="good">M365 READY</span>
 {% else %}{{u.provisioning_status}}{% endif %}
 {% if u.error_message %}<br><span class="bad">{{u.error_message}}</span>{% endif %}
+{% if u.cloudiway_object_id and u.migration_status in ['ready','starting','failed','attention','timed_out'] %}
+<form method="post" action="/cloudiway/user/{{u.id}}/start-again" style="margin-top:6px">
+<button class="secondary" title="Reuse this user's existing Cloudiway object and request Mail migration start again. No password is changed and no duplicate user is created.">Start / Restart Cloudiway</button>
+</form>
+{% endif %}
 </td></tr>
 {% endfor %}
 </tbody></table></div></div>
