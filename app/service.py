@@ -707,6 +707,13 @@ async def launch_next_batch(force: bool = False) -> dict:
 
 
 async def refresh_status() -> dict:
+    """Refresh local status from Cloudiway.
+
+    Cloudiway MailProgress is a statistics endpoint. The live job-status
+    endpoint is authoritative for whether a mailbox is NotStarted, active,
+    completed, failed, or stopped. This prevents a successful empty
+    MailProgress response from incorrectly changing a READY user to MIGRATING.
+    """
     cloud = await _cloudiway_client_ready()
     with conn() as db:
         rows = db.execute(
@@ -714,76 +721,137 @@ async def refresh_status() -> dict:
             "WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready')"
         ).fetchall()
 
-    updated = completed = failed = attention = timed_out = 0
+    updated = completed = failed = attention = timed_out = not_started = 0
     for row in rows:
         try:
+            object_id = int(row["cloudiway_object_id"])
+
+            # Always ask the live job-status endpoint first. Cloudiway's web UI
+            # derives NotStarted/Scheduled/Working/Pending/Success/Error/Stop
+            # from job state, while MailProgress only reports counters.
+            job_status_data = None
+            job_state = None
+            try:
+                job_status_data = await cloud.job_status(object_id)
+                job_state, _ = parse_cloudiway_job_status(job_status_data)
+            except Exception as job_exc:
+                log_event(row["id"], "cloudiway_job_status_fetch_failed", str(job_exc))
+
             data = await cloud.progress(
-                int(row["cloudiway_object_id"]),
+                object_id,
                 max(1, settings.progress_window_minutes),
             )
-            status, percent, detail = parse_progress(data)
+            progress_status, percent, progress_detail = parse_progress(data)
 
-            # MailProgress is a cumulative statistics endpoint and sometimes
-            # returns no textual job state. Before treating that as an issue,
-            # ask Cloudiway's live mail job-status endpoint.
-            job_status_data = None
-            if status == "attention":
-                try:
-                    job_status_data = await cloud.job_status(int(row["cloudiway_object_id"]))
-                    job_status, job_percent, job_detail = parse_progress(job_status_data)
-                    if job_status != "attention":
-                        status = job_status
-                        if job_percent is not None:
-                            percent = job_percent
-                        detail = json.dumps(
-                            {"progress": data, "jobStatus": job_status_data},
-                            default=str,
-                        )[:1500]
-                except Exception as job_exc:
-                    log_event(row["id"], "cloudiway_job_status_fetch_failed", str(job_exc))
-
-            error_message = None
-            cloud_status = status
-
-            logs_data = None
-            if status in ("attention", "failed"):
-                try:
-                    logs_data = await cloud.logs(int(row["cloudiway_object_id"]))
-                except Exception as log_exc:
-                    log_event(row["id"], "cloudiway_logs_fetch_failed", str(log_exc))
-
-                status_override, issue_code, friendly = classify_cloudiway_issue(data, logs_data)
-                if status_override:
-                    status = status_override
-                    cloud_status = issue_code or status_override
-                    error_message = friendly
-                    log_event(
-                        row["id"],
-                        issue_code or "cloudiway_known_error",
-                        friendly + " Raw Cloudiway logs: " + json.dumps(logs_data, default=str)[:2200],
-                    )
-                elif status == "attention":
-                    error_message = (
-                        "Cloudiway returned a status/value that requires review. "
-                        "Open Logs & Issues for the raw Cloudiway response."
-                    )
-                    log_event(
-                        row["id"],
-                        "cloudiway_status_attention",
-                        "Cloudiway progress requires review. Raw progress: "
-                        + detail
-                        + " Raw logs: "
-                        + json.dumps(logs_data, default=str)[:2200],
-                    )
+            if job_state == "not_started":
+                status = "ready"
+                cloud_status = "not_started"
+                percent = 0.0 if percent is None else percent
+                error_message = None
+                detail = json.dumps(
+                    {"jobStatus": job_status_data, "progress": data},
+                    default=str,
+                )[:1500]
+                not_started += 1
+                # A previous false-attention/migrating classification should
+                # disappear immediately once Cloudiway says NotStarted.
+                clear_user_issue(
+                    int(row["id"]),
+                    "Cloudiway reports this migration has not started yet.",
+                )
+            else:
+                if job_state in ("migrating", "completed", "failed", "attention"):
+                    status = job_state
                 else:
-                    error_message = "Cloudiway reported the migration as failed. Review Logs & Issues."
-                    log_event(
-                        row["id"],
-                        "cloudiway_status_failed",
-                        "Cloudiway progress reported failure. Raw progress: "
-                        + detail
-                        + " Raw logs: "
-                        + json.dumps(logs_data, default=str)[:2200],
+                    # If Cloudiway job state is unavailable, fall back to
+                    # progress. Do not promote a locally READY user solely from
+                    # an empty successful progress envelope.
+                    status = progress_status
+                    envelope_ok, _ = _successful_mail_progress_envelope(data)
+                    response = data.get("responseData") if isinstance(data, dict) else None
+                    has_activity = False
+                    if isinstance(response, dict):
+                        has_activity = bool(
+                            response.get("startDateTime")
+                            or response.get("lastActivityDateTime")
+                            or int(response.get("totalEmails") or 0) > 0
+                            or int(response.get("migratedEmails") or 0) > 0
+                            or int(response.get("errorEmails") or 0) > 0
+                            or int(response.get("ignoredEmails") or 0) > 0
+                        )
+                    if (
+                        row.get("migration_status") == "ready"
+                        and envelope_ok
+                        and not has_activity
+                        and progress_status == "migrating"
+                    ):
+                        status = "ready"
+
+                detail = json.dumps(
+                    {"jobStatus": job_status_data, "progress": data},
+                    default=str,
+                )[:1500]
+                error_message = None
+                cloud_status = (
+                    "not_started" if status == "ready"
+                    else status
+                )
+
+                logs_data = None
+                if status in ("attention", "failed"):
+                    try:
+                        logs_data = await cloud.logs(object_id)
+                    except Exception as log_exc:
+                        log_event(row["id"], "cloudiway_logs_fetch_failed", str(log_exc))
+
+                    status_override, issue_code, friendly = classify_cloudiway_issue(
+                        {"jobStatus": job_status_data, "progress": data},
+                        logs_data,
+                    )
+                    if status_override:
+                        status = status_override
+                        cloud_status = issue_code or status_override
+                        error_message = friendly
+                        log_event(
+                            row["id"],
+                            issue_code or "cloudiway_known_error",
+                            friendly + " Raw Cloudiway logs: "
+                            + json.dumps(logs_data, default=str)[:2200],
+                        )
+                    elif status == "attention":
+                        error_message = (
+                            "Cloudiway returned a stopped/unknown job state requiring review. "
+                            "Open Issue Center or Cloudiway Details."
+                        )
+                        log_event(
+                            row["id"],
+                            "cloudiway_status_attention",
+                            "Cloudiway job status requires review. Raw job status: "
+                            + json.dumps(job_status_data, default=str)[:1200]
+                            + " Raw progress: "
+                            + progress_detail
+                            + " Raw logs: "
+                            + json.dumps(logs_data, default=str)[:1800],
+                        )
+                    else:
+                        error_message = "Cloudiway reported the migration as failed. Review Issue Center."
+                        log_event(
+                            row["id"],
+                            "cloudiway_status_failed",
+                            "Cloudiway job status reported failure. Raw job status: "
+                            + json.dumps(job_status_data, default=str)[:1200]
+                            + " Raw progress: "
+                            + progress_detail
+                            + " Raw logs: "
+                            + json.dumps(logs_data, default=str)[:1800],
+                        )
+
+                if status in ("migrating", "completed"):
+                    clear_user_issue(
+                        int(row["id"]),
+                        "Cloudiway migration is running normally."
+                        if status == "migrating"
+                        else "Cloudiway migration completed.",
                     )
 
             with conn() as db:
@@ -804,11 +872,6 @@ async def refresh_status() -> dict:
                     effective_code,
                     error_message or "Cloudiway returned a migration issue requiring review.",
                 )
-            elif status in ("migrating", "completed"):
-                clear_user_issue(
-                    int(row["id"]),
-                    "Cloudiway migration is running normally." if status == "migrating" else "Cloudiway migration completed.",
-                )
 
             updated += 1
             completed += int(status == "completed")
@@ -821,7 +884,7 @@ async def refresh_status() -> dict:
         with conn() as db:
             stale = db.execute(
                 """SELECT id FROM users
-                   WHERE migration_status IN ('migrating','ready')
+                   WHERE migration_status='migrating'
                      AND batch_started_at IS NOT NULL
                      AND TIMESTAMPDIFF(MINUTE, batch_started_at, UTC_TIMESTAMP()) >= ?""",
                 (int(settings.batch_timeout_minutes),),
@@ -872,6 +935,7 @@ async def refresh_status() -> dict:
         "failed": failed,
         "attention": attention,
         "timed_out": timed_out,
+        "not_started": not_started,
     }
 
 
@@ -1620,6 +1684,66 @@ def _successful_mail_progress_envelope(data) -> tuple[bool, float | None]:
     except Exception:
         percent = None
     return True, percent
+
+
+def parse_cloudiway_job_status(data) -> tuple[str | None, str]:
+    """Parse Cloudiway's live mail job state.
+
+    MailProgress is statistics, not authoritative job state. Cloudiway's
+    GetListJobStatus endpoint is used to distinguish NotStarted from
+    Scheduled/Pending/Working/Success/Error/Stop.
+    """
+    detail = json.dumps(data, default=str)[:1500]
+    candidates: list[str] = []
+
+    def walk(obj, parent_key=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                lk = str(key).lower().replace("_", "").replace("-", "")
+                if isinstance(value, str):
+                    if lk in (
+                        "status", "state", "jobstatus", "migrationstatus",
+                        "statusname", "jobstatusname", "name",
+                    ):
+                        candidates.append(value)
+                    # Some Cloudiway envelopes put the state directly in
+                    # responseData/message-like fields.
+                    elif lk in ("responsedata", "data") and value:
+                        candidates.append(value)
+                walk(value, lk)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, parent_key)
+        elif isinstance(obj, str) and parent_key in ("responsedata", "data"):
+            candidates.append(obj)
+
+    walk(data)
+
+    normalized = set()
+    for raw in candidates:
+        value = " ".join(
+            str(raw).strip().lower().replace("_", " ").replace("-", " ").split()
+        )
+        if value:
+            normalized.add(value)
+
+    # Include compact forms because Cloudiway's UI/status APIs commonly use
+    # values such as NotStarted.
+    compact = {value.replace(" ", "") for value in normalized}
+
+    if compact & {"notstarted", "notstart", "idle"}:
+        return "not_started", detail
+    if compact & {"scheduled", "working", "pending", "running", "processing",
+                  "started", "starting", "queued", "active", "migrating",
+                  "inprogress"}:
+        return "migrating", detail
+    if compact & {"success", "succeeded", "completed", "complete", "done", "finished"}:
+        return "completed", detail
+    if compact & {"error", "failed", "errored", "faulted"}:
+        return "failed", detail
+    if compact & {"stop", "stopped", "cancelled", "canceled", "aborted", "terminated"}:
+        return "attention", detail
+    return None, detail
 
 
 def parse_progress(data) -> tuple[str, float | None, str]:
