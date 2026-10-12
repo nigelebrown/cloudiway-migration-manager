@@ -964,7 +964,8 @@ def record_user_issue(
 
     with conn() as db:
         row = db.execute(
-            """SELECT issue_code,issue_status,auto_recovery_attempts,cloudiway_object_id,
+            """SELECT issue_code,issue_status,auto_recovery_attempts,auto_recovery_next_at,
+                      auto_recovery_status,cloudiway_object_id,
                       source_credential_password_enc,generated_password_enc
                FROM users WHERE id=?""",
             (user_id,),
@@ -990,11 +991,18 @@ def record_user_issue(
         auto_status = "scheduled" if auto_eligible else "manual_required"
         next_at = now + timedelta(minutes=delay_minutes) if auto_eligible else None
 
+        if same_issue and auto_eligible and row.get("auto_recovery_next_at"):
+            # Do not keep moving the due time forward on every status poll.
+            next_at = row.get("auto_recovery_next_at")
+            auto_status = row.get("auto_recovery_status") or auto_status
+
         if same_issue and row.get("issue_status") == "recovering" and attempts < max_attempts:
             # A restarted job has not yet had time to prove success/failure.
             issue_status = "recovering"
             auto_status = "monitoring"
-            next_at = now + timedelta(minutes=delay_minutes)
+            next_at = row.get("auto_recovery_next_at") or (
+                now + timedelta(minutes=delay_minutes)
+            )
             manual_required = False
 
         db.execute(
