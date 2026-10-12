@@ -2909,6 +2909,35 @@ async def issues_page(
     )
 
 
+@app.post("/issues/user/{user_id}/retry-now")
+async def issue_retry_now(request: Request, user_id: int):
+    require_admin(request)
+    try:
+        result = await recover_credential_issue(user_id, force=True)
+        if result.get("recovered"):
+            request.session["issues_notice"] = (
+                f"Stored credential was pushed to Cloudiway again and the existing migration restarted for user #{user_id}."
+            )
+        elif result.get("resolved"):
+            request.session["issues_notice"] = (
+                f"Cloudiway reports user #{user_id} is already in a healthy state."
+            )
+        else:
+            request.session["issues_error"] = str(result.get("reason") or "Recovery was not performed")
+    except Exception as exc:
+        request.session["issues_error"] = str(exc)
+    return RedirectResponse("/issues?category=credentials", 303)
+
+
+@app.post("/issues/user/{user_id}/resolve")
+async def issue_resolve(request: Request, user_id: int):
+    require_admin(request)
+    clear_user_issue(user_id, "Issue marked resolved by administrator.")
+    log_event(user_id, "issue_marked_resolved", "Administrator marked the current issue resolved.")
+    request.session["issues_notice"] = f"Issue for user #{user_id} marked resolved."
+    return RedirectResponse("/issues", 303)
+
+
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request, level: str = "", q: str = ""):
     redirect = _page_auth(request)
