@@ -965,7 +965,7 @@ def record_user_issue(
     with conn() as db:
         row = db.execute(
             """SELECT issue_code,issue_status,auto_recovery_attempts,auto_recovery_next_at,
-                      auto_recovery_status,cloudiway_object_id,
+                      auto_recovery_status,cloudiway_object_id,provisioning_profile_id,
                       source_credential_password_enc,generated_password_enc
                FROM users WHERE id=?""",
             (user_id,),
@@ -980,11 +980,17 @@ def record_user_issue(
         )
 
         auto_eligible = (
-            category == "credentials"
-            and enabled
-            and credential_available
+            enabled
             and bool(row.get("cloudiway_object_id"))
             and attempts < max_attempts
+            and (
+                (category == "credentials" and credential_available)
+                or (
+                    category == "target_mailbox"
+                    and issue_code == "target_mailbox_missing"
+                    and bool(row.get("provisioning_profile_id"))
+                )
+            )
         )
         manual_required = not auto_eligible
         issue_status = "open" if auto_eligible else "manual_required"
@@ -1251,6 +1257,99 @@ def sync_local_issue_states() -> None:
             )
 
 
+async def recover_target_mailbox_issue(user_id: int) -> dict:
+    """Re-check M365 mailbox readiness and restart the same Cloudiway job when ready."""
+    enabled, delay_minutes, max_attempts = _issue_recovery_settings()
+    if not enabled:
+        return {"recovered": False, "reason": "Automatic issue recovery is disabled"}
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row:
+        return {"recovered": False, "reason": "User not found"}
+    user = dict(row)
+
+    if not user.get("cloudiway_object_id"):
+        return {"recovered": False, "reason": "No Cloudiway object ID"}
+    if not user.get("provisioning_profile_id"):
+        with conn() as db:
+            db.execute(
+                """UPDATE users SET issue_status='manual_required',
+                   manual_action_required=1,auto_recovery_status='manual_required',
+                   auto_recovery_next_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (user_id,),
+            )
+        return {"recovered": False, "reason": "No M365 provisioning profile is linked to this user"}
+
+    attempts = int(user.get("auto_recovery_attempts") or 0)
+    if attempts >= max_attempts:
+        with conn() as db:
+            db.execute(
+                """UPDATE users SET issue_status='manual_required',
+                   manual_action_required=1,auto_recovery_status='exhausted',
+                   auto_recovery_next_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (user_id,),
+            )
+        return {"recovered": False, "reason": "Automatic target-mailbox retries exhausted"}
+
+    from app.provisioning import refresh_m365_user
+
+    readiness = await refresh_m365_user(user_id)
+    if readiness.get("mailbox") != "ready":
+        next_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=delay_minutes)
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET issue_status='open',manual_action_required=0,
+                       auto_recovery_status='waiting_for_mailbox',
+                       auto_recovery_next_at=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (next_at, user_id),
+            )
+        log_event(
+            user_id,
+            "target_mailbox_still_pending",
+            "Microsoft 365 mailbox is not ready yet; background recovery will check again.",
+        )
+        return {"recovered": False, "waiting": True, "reason": "Target mailbox is still provisioning"}
+
+    cloud = await _cloudiway_client_ready()
+    object_id = int(user["cloudiway_object_id"])
+    await cloud.restart_migration(object_id)
+
+    new_attempts = attempts + 1
+    next_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=delay_minutes)
+    with conn() as db:
+        db.execute(
+            """UPDATE users
+               SET migration_status='migrating',
+                   cloudiway_status='auto_target_mailbox_restarted',
+                   issue_status='recovering',manual_action_required=0,
+                   auto_recovery_attempts=?,auto_recovery_status='restarted',
+                   auto_recovery_last_at=CURRENT_TIMESTAMP,auto_recovery_next_at=?,
+                   error_message=?,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (
+                new_attempts,
+                next_at,
+                f"Microsoft 365 mailbox became ready. Existing Cloudiway migration restarted automatically (attempt {new_attempts}/{max_attempts}).",
+                user_id,
+            ),
+        )
+    log_event(
+        user_id,
+        "automatic_target_mailbox_recovery",
+        f"Target mailbox became ready; restarted existing Cloudiway object {object_id} (attempt {new_attempts}/{max_attempts}).",
+    )
+    return {
+        "recovered": True,
+        "attempt": new_attempts,
+        "max_attempts": max_attempts,
+        "object_id": object_id,
+    }
+
+
 async def process_background_issues() -> dict:
     """Handle actionable issues independently of the administrator web session."""
     enabled, _, max_attempts = _issue_recovery_settings()
@@ -1262,7 +1361,7 @@ async def process_background_issues() -> dict:
     with conn() as db:
         rows = db.execute(
             """SELECT id FROM users
-               WHERE issue_category='credentials'
+               WHERE issue_category IN ('credentials','target_mailbox')
                  AND issue_status IN ('open','recovering')
                  AND manual_action_required=0
                  AND auto_recovery_attempts < ?
@@ -1276,7 +1375,15 @@ async def process_background_issues() -> dict:
         uid = int(row["id"])
         summary["checked"] += 1
         try:
-            result = await recover_credential_issue(uid)
+            with conn() as db:
+                issue_row = db.execute(
+                    "SELECT issue_category,issue_code FROM users WHERE id=?",
+                    (uid,),
+                ).fetchone()
+            if issue_row and issue_row.get("issue_category") == "target_mailbox" and issue_row.get("issue_code") == "target_mailbox_missing":
+                result = await recover_target_mailbox_issue(uid)
+            else:
+                result = await recover_credential_issue(uid)
             if result.get("recovered"):
                 summary["recovered"] += 1
             elif result.get("resolved"):
