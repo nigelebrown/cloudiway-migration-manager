@@ -126,6 +126,33 @@ class CloudiwayClient:
             "Could not start Cloudiway migration",
         )
 
+    async def start_mail_migration(self, object_ids: list[int]):
+        """Start mail migration using Cloudiway's mail-specific endpoint."""
+        payload = {
+            "mailUsers": None,
+            "objectIds": [int(x) for x in object_ids],
+            "mailUserSearch": None,
+            "isAllSelected": False,
+            "batchIds": [],
+        }
+        return await self._post(
+            f"/Mail/StartMailJobs/{settings.cloudiway_job_type_migration}",
+            payload,
+            "Could not start Cloudiway mail migration",
+        )
+
+    async def start_batch_migration(self, batch_id: int):
+        """Start the migration job for an existing Cloudiway Mail batch."""
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{settings.cloudiway_base_url}/Jobs/batch/"
+                f"{int(batch_id)}/{settings.cloudiway_job_type_migration}/"
+                f"{settings.cloudiway_product_type_mail}",
+                headers=self._headers(),
+            )
+        self._raise(r, "Could not start Cloudiway migration batch")
+        return r.json() if r.content else {}
+
     async def start_audit(self, object_ids: list[int]):
         return await self._post(
             f"/Jobs/StartJobs/{settings.cloudiway_product_type_mail}/{settings.cloudiway_job_type_audit}",
