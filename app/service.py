@@ -1014,11 +1014,11 @@ def _source_credentials_for_cloudiway(user: dict) -> tuple[str, str, str]:
 
 
 async def prepare_existing_password_user(user_id: int) -> int:
-    """Register an administrator-supplied existing source password with Cloudiway.
+    """Push an uploaded existing source password to Cloudiway without duplicating the mail user.
 
-    This path intentionally performs no Active Directory changes and no Rackspace
-    password reset. The password must have been supplied in the upload and is
-    stored encrypted at rest.
+    If the Cloudiway mail user already exists and its migration is failed/stopped/attention,
+    the existing object is marked for restart after credentials are refreshed. Running or
+    completed objects are never duplicated or blindly restarted.
     """
     with conn() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
@@ -1029,9 +1029,25 @@ async def prepare_existing_password_user(user_id: int) -> int:
     if user.get("password_reset_method") != "existing_password":
         raise RuntimeError("User is not assigned to the existing-password Cloudiway-only workflow")
 
+    prior_local_status = str(user.get("migration_status") or "").strip().lower()
     username, password, credential_origin = _source_credentials_for_cloudiway(user)
     cloud = await _cloudiway_client_ready()
+
+    # Reuse the existing Cloudiway object when one already exists. ensure_cloudiway_user()
+    # verifies by source email before creating anything, so re-uploading credentials does
+    # not create a duplicate Cloudiway mail user.
     object_id = await ensure_cloudiway_user(user)
+
+    remote_status = None
+    remote_detail = None
+    try:
+        progress = await cloud.progress(object_id, max(1, settings.progress_window_minutes))
+        remote_status, _, remote_detail = parse_progress(progress)
+    except Exception as exc:
+        # A never-started object or unavailable progress endpoint should not block
+        # credential refresh. Local terminal state is used as the fallback signal.
+        remote_detail = f"Progress lookup unavailable: {exc}"
+
     token = await cloud.get_self_service_token(object_id)
     log_event(
         user_id,
@@ -1041,26 +1057,47 @@ async def prepare_existing_password_user(user_id: int) -> int:
     )
     await cloud.register_source_credentials(token, username, password)
 
+    if remote_status == "completed":
+        next_cloud_status = "existing_completed"
+        next_migration_status = "completed"
+        action = "credentials_refreshed_existing_completed"
+    elif remote_status == "migrating":
+        next_cloud_status = "existing_migrating"
+        next_migration_status = "migrating"
+        action = "credentials_refreshed_existing_migrating"
+    elif remote_status in ("failed", "attention") or prior_local_status in ("failed", "attention", "timed_out"):
+        next_cloud_status = "restart_required"
+        next_migration_status = "ready"
+        action = "credentials_refreshed_restart_required"
+    else:
+        next_cloud_status = "credentials_set"
+        next_migration_status = "ready"
+        action = "credentials_refreshed_ready_to_start"
+
     with conn() as db:
         db.execute(
             """UPDATE users
-               SET cloudiway_status='credentials_set',
+               SET cloudiway_object_id=?,
+                   cloudiway_status=?,
                    rackspace_status='existing_password',
                    provisioning_status='bypassed',
                    ad_match_status='bypassed',
                    entra_status='bypassed',
                    license_status='bypassed',
                    mailbox_status='bypassed',
-                   migration_status='ready',
+                   migration_status=?,
                    error_message=NULL,
                    updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
-            (user_id,),
+            (object_id, next_cloud_status, next_migration_status, user_id),
         )
+
     log_event(
         user_id,
-        "existing_password_cloudiway_credentials",
-        "Administrator-supplied existing source password registered with Cloudiway; AD and Rackspace reset bypassed",
+        action,
+        "Existing Cloudiway object reused; uploaded source password pushed again. "
+        f"remote_status={remote_status or 'unknown'}; object_id={object_id}; "
+        f"detail={str(remote_detail)[:700]}",
     )
     return object_id
 
@@ -1253,14 +1290,14 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
 
 
 async def start_migration_batch(migration_batch_id: int) -> dict:
-    """Start exactly one selected incremental batch without duplicating preparation."""
+    """Start one selected batch, restarting existing errored Cloudiway objects in place."""
     with conn() as db:
         batch = db.execute(
             "SELECT * FROM migration_batches WHERE id=?",
             (migration_batch_id,),
         ).fetchone()
         rows = db.execute(
-            """SELECT u.id,u.cloudiway_object_id,u.cloudiway_status
+            """SELECT u.id,u.cloudiway_object_id,u.cloudiway_status,u.migration_status
                FROM migration_batch_members m
                JOIN users u ON u.id=m.user_id
                WHERE m.migration_batch_id=?
@@ -1271,69 +1308,119 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
     if not batch:
         return {"started": False, "reason": "Migration batch not found"}
 
-    object_ids = [
-        int(r["cloudiway_object_id"])
-        for r in rows
-        if r.get("cloudiway_object_id")
-    ]
+    object_ids = [int(r["cloudiway_object_id"]) for r in rows if r.get("cloudiway_object_id")]
     already_prepared = (
         batch["workflow_status"] == "ready_to_migrate"
         and len(object_ids) == len(rows)
         and len(rows) > 0
     )
 
-    if already_prepared:
-        prepared = {
-            "ready": True,
-            "migration_batch_id": migration_batch_id,
-            "cloudiway_batch_id": int(batch["cloudiway_batch_id"]),
-            "users": len(rows),
-            "object_ids": object_ids,
-        }
-    else:
+    if not already_prepared:
         prepared = await prepare_migration_batch(migration_batch_id)
         if not prepared.get("ready"):
             return {"started": False, **prepared}
 
+    # Re-read because preparation may have classified existing Cloudiway objects
+    # as restart_required / already migrating / already completed.
     with conn() as db:
-        member_rows = db.execute(
-            "SELECT user_id FROM migration_batch_members WHERE migration_batch_id=?",
+        rows = db.execute(
+            """SELECT u.id,u.cloudiway_object_id,u.cloudiway_status,u.migration_status
+               FROM migration_batch_members m
+               JOIN users u ON u.id=m.user_id
+               WHERE m.migration_batch_id=?
+               ORDER BY u.id""",
             (migration_batch_id,),
         ).fetchall()
-    user_ids = [int(r["user_id"]) for r in member_rows]
 
     cloud = await _cloudiway_client_ready()
-    await cloud.start_migration(prepared["object_ids"])
+    start_ids: list[int] = []
+    restart_rows: list[tuple[int, int]] = []
+    running_user_ids: list[int] = []
+    completed_user_ids: list[int] = []
 
-    if user_ids:
-        placeholders = ",".join("?" for _ in user_ids)
+    for row in rows:
+        uid = int(row["id"])
+        oid = row.get("cloudiway_object_id")
+        if not oid:
+            continue
+        oid = int(oid)
+        state = str(row.get("cloudiway_status") or "")
+        if state == "restart_required":
+            restart_rows.append((uid, oid))
+        elif state == "existing_migrating":
+            running_user_ids.append(uid)
+        elif state == "existing_completed":
+            completed_user_ids.append(uid)
+        else:
+            start_ids.append(oid)
+
+    if start_ids:
+        await cloud.start_migration(start_ids)
+
+    restarted_user_ids: list[int] = []
+    for uid, oid in restart_rows:
+        await cloud.restart_migration(oid)
+        restarted_user_ids.append(uid)
+        log_event(
+            uid,
+            "cloudiway_existing_migration_restarted",
+            f"Reused Cloudiway object {oid}; refreshed source password and restarted existing migration.",
+        )
+
+    active_user_ids = [
+        int(r["id"])
+        for r in rows
+        if int(r["id"]) not in completed_user_ids
+    ]
+    if active_user_ids:
+        placeholders = ",".join("?" for _ in active_user_ids)
         with conn() as db:
             db.execute(
                 f"""UPDATE users
                     SET migration_status='migrating',batch_number=?,
-                        batch_started_at=CURRENT_TIMESTAMP,error_message=NULL,
+                        batch_started_at=COALESCE(batch_started_at,CURRENT_TIMESTAMP),
+                        error_message=NULL,
                         updated_at=CURRENT_TIMESTAMP
                     WHERE id IN ({placeholders})""",
-                (migration_batch_id, *user_ids),
+                (migration_batch_id, *active_user_ids),
             )
+    if completed_user_ids:
+        placeholders = ",".join("?" for _ in completed_user_ids)
+        with conn() as db:
             db.execute(
-                """UPDATE migration_batches
-                   SET workflow_status='migrating',last_error=NULL,
-                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (migration_batch_id,),
+                f"""UPDATE users SET migration_status='completed',
+                    error_message=NULL,updated_at=CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})""",
+                tuple(completed_user_ids),
             )
+
+    with conn() as db:
+        db.execute(
+            """UPDATE migration_batches
+               SET workflow_status=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (
+                "completed" if len(completed_user_ids) == len(rows) and rows else "migrating",
+                migration_batch_id,
+            ),
+        )
 
     set_runtime("automation_running", "1")
     log_event(
         None,
         "migration_batch_started",
-        f"Migration batch {migration_batch_id} started in Cloudiway batch {prepared['cloudiway_batch_id']} with {len(user_ids)} user(s)",
+        f"Migration batch {migration_batch_id}: new starts={len(start_ids)}, "
+        f"existing restarts={len(restarted_user_ids)}, already running={len(running_user_ids)}, "
+        f"already completed={len(completed_user_ids)}",
     )
     return {
-        "started": True,
+        "started": bool(start_ids or restarted_user_ids or running_user_ids),
         "migration_batch_id": migration_batch_id,
-        "cloudiway_batch_id": prepared["cloudiway_batch_id"],
-        "users_started": len(user_ids),
+        "cloudiway_batch_id": int(batch["cloudiway_batch_id"]) if batch.get("cloudiway_batch_id") else None,
+        "users_started": len(start_ids),
+        "users_restarted": len(restarted_user_ids),
+        "users_already_running": len(running_user_ids),
+        "users_already_completed": len(completed_user_ids),
     }
 
 
