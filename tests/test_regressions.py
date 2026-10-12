@@ -926,3 +926,109 @@ def test_notstarted_after_second_start_returns_ready_and_flags_issue(monkeypatch
     assert row["issue_category"] == "cloudiway"
     assert row["issue_status"] == "manual_required"
     assert "two StartJobs requests" in row["error_message"]
+
+
+
+def test_legacy_false_migrating_notstarted_is_repaired_with_batch_start(monkeypatch):
+    class FakeCloud:
+        def __init__(self):
+            self.batch_starts = []
+
+        async def job_status(self, object_id):
+            return {
+                "isSuccess": True,
+                "responseData": {"status": "NotStarted"},
+                "error": [],
+            }
+
+        async def progress(self, object_id, since_minutes):
+            return {
+                "isSuccess": True,
+                "message": "GetMailProgress done",
+                "responseData": {
+                    "blockId": object_id,
+                    "migratedEmails": 0,
+                    "errorEmails": 0,
+                    "ignoredEmails": 0,
+                    "totalEmails": 0,
+                    "recentMigratedEmails": 0,
+                    "windowMinutes": 1,
+                    "startDateTime": None,
+                    "lastActivityDateTime": None,
+                    "error": [],
+                },
+                "error": [],
+            }
+
+        async def start_batch_migration(self, batch_id):
+            self.batch_starts.append(int(batch_id))
+            return {
+                "isSuccess": True,
+                "message": "StartBatch done",
+                "count": 0,
+                "responseData": None,
+                "error": [],
+            }
+
+    cloud = FakeCloud()
+
+    async def fake_ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(batch_name,workflow_mode,workflow_status,total_rows,imported_rows)
+               VALUES(?,?,?,?,?)""",
+            ("LEGACY-U1", "existing_password", "fully_batched", 1, 1),
+        )
+        upload_id = int(up.lastrowid)
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   cloudiway_batch_id,selected_count
+               ) VALUES(?,?,?,?,?,?)""",
+            (upload_id, 1, "LEGACY-U1-B001", "migrating", 14, 1),
+        )
+        batch_id = int(mb.lastrowid)
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,cloudiway_status,
+                   migration_status,batch_number,batch_started_at
+               ) VALUES(?,?,?,?,?,?,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 60 MINUTE))""",
+            (
+                "legacy.start@jcf.gov.jm",
+                "legacy.start@jcf.gov.jm",
+                429,
+                "migrating",
+                "migrating",
+                batch_id,
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='legacy.start@jcf.gov.jm'"
+        ).fetchone()["id"])
+        db.execute(
+            "INSERT INTO upload_batch_members(upload_batch_id,user_id,row_order) VALUES(?,?,?)",
+            (upload_id, uid, 1),
+        )
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (batch_id, uid),
+        )
+
+    import asyncio
+    asyncio.run(service.refresh_status())
+
+    assert cloud.batch_starts == [14]
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        events = db.execute(
+            "SELECT event_type FROM events WHERE user_id=? ORDER BY id",
+            (uid,),
+        ).fetchall()
+
+    assert row["migration_status"] == "starting"
+    assert row["cloudiway_status"] == "start_requested"
+    assert "cloudiway_notstarted_legacy_repair" in [e["event_type"] for e in events]
