@@ -41,6 +41,14 @@
 <p class="hint">For direct-password and Cloudiway recovery imports, a username such as <b>john.brown</b> is resolved to <b>john.brown@{{direct_email_domain}}</b>. The resolved address is used as both source and destination.</p>
 <button>Save Direct Migration Domain</button>
 </form>
+<hr><h3>Background Issue Recovery</h3>
+<form method="post" action="/settings/issue-recovery">
+<div class="field"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {% if issue_auto_recovery_enabled %}checked{% endif %}> Automatically recover explicit Cloudiway credential/password failures</label></div>
+<div class="field"><label>Wait before automatic credential retry (minutes)</label><input name="retry_delay_minutes" type="number" min="1" max="60" value="{{issue_credential_retry_delay_minutes}}" required></div>
+<div class="field"><label>Maximum automatic credential retries</label><input name="retry_max" type="number" min="1" max="10" value="{{issue_credential_retry_max}}" required></div>
+<p class="hint">Only explicit authentication/password errors are restarted automatically. The app re-pushes the stored source credential to the same Cloudiway object and restarts that object. Ambiguous IMAP/network, target-mailbox, AD, and provisioning problems are classified and shown in the Issue Center instead of being restarted blindly.</p>
+<button>Save Issue Recovery Settings</button>
+</form>
 </div>
 
 <div class="card"><h2>Rackspace Password Administration</h2><p class="{{'ok' if rackspace_configured else 'bad'}}">{{'Configured' if rackspace_configured else 'Not configured'}}</p>
