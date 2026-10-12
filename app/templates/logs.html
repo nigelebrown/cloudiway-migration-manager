@@ -9,7 +9,7 @@ a{color:#38bdf8;text-decoration:none}.top{display:flex;justify-content:space-bet
 th,td{padding:8px;border-bottom:1px solid #1f2937;text-align:left;font-size:12px}th{background:#0f172a;position:sticky;top:0}.bad{color:#fca5a5}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;background:#020617;padding:12px;border-radius:8px;max-height:550px;overflow:auto;font-size:12px}
 @media(max-width:800px){.cards{grid-template-columns:1fr 1fr}}
 </style></head><body><div class="wrap">
-<div class="top"><div><h1>Logs & Issues</h1><p><a href="/dashboard">← Dashboard</a></p></div><div><a href="/diagnostics/download">Download Diagnostic ZIP</a></div></div>
+<div class="top"><div><h1>Application Logs</h1><p><a href="/dashboard">← Dashboard</a> &nbsp; <a href="/issues">Migration Issue Center</a></p></div><div><a href="/diagnostics/download">Download Diagnostic ZIP</a></div></div>
 {% if automation_paused %}<div class="notice"><b>Automation paused:</b> {{pause_reason or 'Review required'}}</div>{% endif %}
 <div class="cards">
 <div class="card"><div class="n">{{issue_counts.failed_users}}</div><div class="label">FAILED USERS</div></div>
