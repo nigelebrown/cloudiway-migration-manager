@@ -934,7 +934,7 @@ def test_notstarted_after_second_start_returns_ready_and_flags_issue(monkeypatch
     assert row["issue_code"] == "cloudiway_start_not_started"
     assert row["issue_category"] == "cloudiway"
     assert row["issue_status"] == "manual_required"
-    assert "two StartJobs requests" in row["error_message"]
+    assert "StartJobs request" in row["error_message"]
 
 
 
@@ -942,6 +942,7 @@ def test_legacy_false_migrating_notstarted_is_repaired_with_batch_start(monkeypa
     class FakeCloud:
         def __init__(self):
             self.batch_starts = []
+            self.started = []
 
         async def job_status(self, object_id):
             return {
@@ -969,13 +970,11 @@ def test_legacy_false_migrating_notstarted_is_repaired_with_batch_start(monkeypa
                 "error": [],
             }
 
-        async def start_mail_migration(self, object_ids, batch_ids=None):
-            self.batch_starts.extend(int(x) for x in (batch_ids or []))
+        async def start_migration(self, object_ids):
+            self.started.append(list(object_ids))
             return {
                 "isSuccess": True,
-                "message": "StartMailJobs done",
-                "count": 0,
-                "responseData": None,
+                "message": "StartJobs done",
                 "error": [],
             }
 
@@ -1030,7 +1029,7 @@ def test_legacy_false_migrating_notstarted_is_repaired_with_batch_start(monkeypa
     import asyncio
     asyncio.run(service.refresh_status())
 
-    assert cloud.batch_starts == [14]
+    assert cloud.started == [[429]]
     with conn() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         events = db.execute(
