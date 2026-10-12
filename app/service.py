@@ -770,17 +770,16 @@ async def refresh_status() -> dict:
                     # NotStarted. A non-null batch_started_at proves a start
                     # had previously been requested, so it is safe to retry
                     # using the corrected batch-start path automatically.
-                    if (
-                        row.get("cloudiway_batch_id")
-                        and hasattr(cloud, "start_batch_migration")
-                    ):
-                        repair_response = await cloud.start_batch_migration(
-                            int(row["cloudiway_batch_id"])
-                        )
-                        repair_action = "StartBatch"
-                    else:
-                        repair_response = await cloud.start_migration([object_id])
-                        repair_action = "StartJobs"
+                    repair_batch_ids = (
+                        [int(row["cloudiway_batch_id"])]
+                        if row.get("cloudiway_batch_id")
+                        else []
+                    )
+                    repair_response = await cloud.start_mail_migration(
+                        [object_id],
+                        batch_ids=repair_batch_ids,
+                    )
+                    repair_action = "StartMailJobs"
                     _assert_cloudiway_command_accepted(
                         repair_response,
                         f"{repair_action} legacy repair",
@@ -813,12 +812,16 @@ async def refresh_status() -> dict:
                     # One bounded automatic retry. This handles the real-world
                     # case where StartJobs returned successfully but the portal
                     # remained NotStarted.
-                    if hasattr(cloud, "start_mail_migration"):
-                        retry_response = await cloud.start_mail_migration([object_id])
-                        retry_action = "StartMailJobs"
-                    else:
-                        retry_response = await cloud.start_migration([object_id])
-                        retry_action = "StartJobs"
+                    retry_batch_ids = (
+                        [int(row["cloudiway_batch_id"])]
+                        if row.get("cloudiway_batch_id")
+                        else []
+                    )
+                    retry_response = await cloud.start_mail_migration(
+                        [object_id],
+                        batch_ids=retry_batch_ids,
+                    )
+                    retry_action = "StartMailJobs"
                     _assert_cloudiway_command_accepted(
                         retry_response,
                         f"{retry_action} retry",
@@ -2502,27 +2505,20 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
     ]
 
     if start_ids:
-        # For a brand-new controlled group where every member is starting,
-        # use Cloudiway's dedicated batch-start API. This mirrors the portal's
-        # Batches -> Migration -> Start action. Mixed recovery groups still use
-        # object-level StartJobs so completed/running users are not restarted.
-        can_start_as_batch = (
-            bool(batch.get("cloudiway_batch_id"))
-            and len(start_ids) == len(rows)
-            and not restart_rows
-            and not running_user_ids
-            and not completed_user_ids
+        # This is a mailbox migration. Cloudiway's Mail controller exposes the
+        # purpose-built StartMailJobs endpoint whose DTO accepts both objectIds
+        # and batchIds. Use that as the authoritative start operation.
+        cloud_batch_ids = (
+            [int(batch["cloudiway_batch_id"])]
+            if batch.get("cloudiway_batch_id")
+            else []
         )
-        if can_start_as_batch and hasattr(cloud, "start_batch_migration"):
-            start_response = await cloud.start_batch_migration(
-                int(batch["cloudiway_batch_id"])
-            )
-            _assert_cloudiway_command_accepted(start_response, "StartBatch")
-            start_method = "StartBatch"
-        else:
-            start_response = await cloud.start_migration(start_ids)
-            _assert_cloudiway_command_accepted(start_response, "StartJobs")
-            start_method = "StartJobs"
+        start_response = await cloud.start_mail_migration(
+            start_ids,
+            batch_ids=cloud_batch_ids,
+        )
+        _assert_cloudiway_command_accepted(start_response, "StartMailJobs")
+        start_method = "StartMailJobs"
 
         log_event(
             None,
