@@ -342,3 +342,116 @@ def test_issue_center_exposes_multiple_issue_categories():
         "Migration Timeout",
     ):
         assert label in r.text
+
+
+
+@pytest.mark.asyncio
+async def test_target_mailbox_missing_is_rechecked_and_restarted_when_mailbox_becomes_ready(monkeypatch):
+    cloud = IssueCloud(status="Failed", log_text="The SMTP address has no mailbox associated with it.")
+    configure_cloud(monkeypatch, cloud)
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,provisioning_profile_id,
+                   provisioning_status,mailbox_status,cloudiway_object_id,
+                   cloudiway_status,migration_status,error_message
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                "target.ready@jcf.gov.jm",
+                "target.ready@jcf.gov.jm",
+                1,
+                "mailbox_pending",
+                "pending",
+                61234,
+                "target_mailbox_missing",
+                "failed",
+                "Target mailbox is not provisioned.",
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='target.ready@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    async def fake_refresh(user_id):
+        assert user_id == uid
+        with conn() as db:
+            db.execute(
+                """UPDATE users SET provisioning_status='m365_ready',
+                   mailbox_status='ready' WHERE id=?""",
+                (user_id,),
+            )
+        return {"entra": "synced", "license": "licensed", "mailbox": "ready"}
+
+    import app.provisioning as provisioning
+    monkeypatch.setattr(provisioning, "refresh_m365_user", fake_refresh)
+
+    service.record_user_issue(
+        uid,
+        "target_mailbox_missing",
+        "Target mailbox is not provisioned.",
+    )
+    make_due(uid)
+
+    result = await service.process_background_issues()
+    assert result["recovered"] == 1
+    assert cloud.restarts == [61234]
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    assert row["issue_category"] == "target_mailbox"
+    assert row["issue_status"] == "recovering"
+    assert row["migration_status"] == "migrating"
+    assert row["auto_recovery_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_target_mailbox_pending_waits_without_restarting(monkeypatch):
+    cloud = IssueCloud(status="Failed", log_text="The SMTP address has no mailbox associated with it.")
+    configure_cloud(monkeypatch, cloud)
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,provisioning_profile_id,
+                   provisioning_status,mailbox_status,cloudiway_object_id,
+                   cloudiway_status,migration_status,error_message
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                "target.pending@jcf.gov.jm",
+                "target.pending@jcf.gov.jm",
+                1,
+                "mailbox_pending",
+                "pending",
+                61235,
+                "target_mailbox_missing",
+                "failed",
+                "Target mailbox is not provisioned.",
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='target.pending@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    async def fake_refresh(user_id):
+        return {"entra": "synced", "license": "licensed", "mailbox": "pending"}
+
+    import app.provisioning as provisioning
+    monkeypatch.setattr(provisioning, "refresh_m365_user", fake_refresh)
+
+    service.record_user_issue(
+        uid,
+        "target_mailbox_missing",
+        "Target mailbox is not provisioned.",
+    )
+    make_due(uid)
+
+    result = await service.process_background_issues()
+    assert result["recovered"] == 0
+    assert cloud.restarts == []
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    assert row["issue_status"] == "open"
+    assert row["auto_recovery_status"] == "waiting_for_mailbox"
+    assert row["manual_action_required"] == 0
