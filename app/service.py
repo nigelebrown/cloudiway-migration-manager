@@ -1,4 +1,5 @@
 import json
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 from app.config import settings
@@ -2423,18 +2424,57 @@ def _assert_cloudiway_command_accepted(result, action: str) -> None:
             )
 
 
+async def _cloudiway_live_migration_check(cloud, object_id: int) -> dict:
+    """Return Cloudiway live job state plus whether MailProgress shows activity."""
+    live_payload = None
+    live_state = None
+    progress_payload = None
+    progress_has_activity = False
+
+    try:
+        live_payload = await cloud.job_status(int(object_id))
+        live_state, _ = parse_cloudiway_job_status(live_payload)
+    except Exception:
+        live_payload = None
+        live_state = None
+
+    try:
+        progress_payload = await cloud.progress(
+            int(object_id),
+            max(1, settings.progress_window_minutes),
+        )
+        response = (
+            progress_payload.get("responseData")
+            if isinstance(progress_payload, dict)
+            else None
+        )
+        if isinstance(response, dict):
+            progress_has_activity = bool(
+                response.get("startDateTime")
+                or response.get("lastActivityDateTime")
+                or int(response.get("totalEmails") or 0) > 0
+                or int(response.get("migratedEmails") or 0) > 0
+                or int(response.get("errorEmails") or 0) > 0
+                or int(response.get("ignoredEmails") or 0) > 0
+            )
+    except Exception:
+        progress_payload = None
+
+    return {
+        "state": live_state,
+        "has_activity": progress_has_activity,
+        "job_status": live_payload,
+        "progress": progress_payload,
+    }
+
+
 async def restart_stuck_cloudiway_user(user_id: int) -> dict:
-    """Start or restart one existing Cloudiway mailbox safely in place.
+    """Check Cloudiway first, then start/restart only when needed.
 
-    Cloudiway's GetListJobStatus response is not fully described in Swagger and
-    may not expose a parseable text state. Therefore the app must not treat the
-    local database's 'migrating' value as proof that Cloudiway is running.
-
-    Protection rules:
-    - Completed confirmed by Cloudiway -> do not restart.
-    - Running confirmed by Cloudiway AND MailProgress shows real activity -> do not restart.
-    - Failed/stopped/attention confirmed by Cloudiway -> call Restart.
-    - NotStarted, unknown, or contradictory zero-activity state -> call StartJobs.
+    The app never uses the local database alone to decide that a migration is
+    running. It checks Cloudiway job state and MailProgress first. If Cloudiway
+    is not running, it submits StartJobs/Restart and then re-checks Cloudiway
+    before reporting a confirmed start.
     """
     with conn() as db:
         row = db.execute(
@@ -2455,64 +2495,39 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
     object_id = int(object_id)
 
     cloud = await _cloudiway_client_ready()
-
-    live_state = None
-    live_payload = None
-    try:
-        live_payload = await cloud.job_status(object_id)
-        live_state, _ = parse_cloudiway_job_status(live_payload)
-    except Exception as exc:
-        log_event(user_id, "cloudiway_manual_live_status_failed", str(exc))
-
-    progress_payload = None
-    progress_has_activity = False
-    try:
-        progress_payload = await cloud.progress(
-            object_id,
-            max(1, settings.progress_window_minutes),
-        )
-        response = (
-            progress_payload.get("responseData")
-            if isinstance(progress_payload, dict)
-            else None
-        )
-        if isinstance(response, dict):
-            progress_has_activity = bool(
-                response.get("startDateTime")
-                or response.get("lastActivityDateTime")
-                or int(response.get("totalEmails") or 0) > 0
-                or int(response.get("migratedEmails") or 0) > 0
-                or int(response.get("errorEmails") or 0) > 0
-                or int(response.get("ignoredEmails") or 0) > 0
-            )
-    except Exception as exc:
-        log_event(user_id, "cloudiway_manual_progress_check_failed", str(exc))
+    before = await _cloudiway_live_migration_check(cloud, object_id)
+    live_state = before.get("state")
+    progress_has_activity = bool(before.get("has_activity"))
 
     if live_state == "completed":
         return {
             "started": False,
+            "confirmed": True,
+            "state": "completed",
             "reason": "Cloudiway confirms this migration is completed; restart is blocked.",
         }
 
-    if live_state == "migrating" and progress_has_activity:
+    # Only claim "already running" when Cloudiway reports an active state.
+    # MailProgress activity is supporting evidence, not a substitute for the
+    # actual Cloudiway job state.
+    if live_state == "migrating":
         return {
             "started": False,
-            "reason": "Cloudiway confirms this migration is actively running.",
+            "confirmed": True,
+            "state": "migrating",
+            "reason": "Cloudiway confirms this migration is already running.",
         }
 
-    # A parsed 'migrating' state with zero MailProgress activity contradicts the
-    # portal scenario seen in production (portal = NotStarted, local = migrating).
-    # Do not block the operator on that ambiguous condition.
     if live_state in ("failed", "attention"):
         response = await cloud.restart_migration(object_id)
         _assert_cloudiway_command_accepted(response, "Restart")
         action = "Restart"
-        next_cloud_status = "manual_restart_requested"
+        requested_status = "manual_restart_requested"
     else:
         response = await cloud.start_migration([object_id])
         _assert_cloudiway_command_accepted(response, "StartJobs")
         action = "StartJobs"
-        next_cloud_status = "manual_start_requested"
+        requested_status = "manual_start_requested"
 
     with conn() as db:
         db.execute(
@@ -2523,7 +2538,7 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
                    error_message=NULL,
                    updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
-            (next_cloud_status, int(user_id)),
+            (requested_status, int(user_id)),
         )
         if row.get("batch_number"):
             db.execute(
@@ -2534,27 +2549,90 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
                 (int(row["batch_number"]),),
             )
 
-    clear_user_issue(
-        int(user_id),
-        f"Manual Cloudiway {action} requested.",
-    )
+    clear_user_issue(int(user_id), f"Manual Cloudiway {action} requested.")
+
+    # Verify Cloudiway after the command. A successful HTTP/API response only
+    # means the request was accepted; it does not prove the job transitioned.
+    after = None
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(2)
+        after = await _cloudiway_live_migration_check(cloud, object_id)
+        after_state = after.get("state")
+        if after_state in ("migrating", "completed", "failed", "attention"):
+            break
+
+    after = after or {}
+    after_state = after.get("state")
+    confirmed_running = after_state == "migrating"
+    confirmed_completed = after_state == "completed"
+
+    if confirmed_running:
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET migration_status='migrating',
+                       cloudiway_status='migrating',
+                       error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (int(user_id),),
+            )
+            if row.get("batch_number"):
+                db.execute(
+                    """UPDATE migration_batches
+                       SET workflow_status='migrating',last_error=NULL,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (int(row["batch_number"]),),
+                )
+    elif confirmed_completed:
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET migration_status='completed',
+                       cloudiway_status='completed',
+                       error_message=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (int(user_id),),
+            )
+    elif after_state in ("failed", "attention"):
+        with conn() as db:
+            db.execute(
+                """UPDATE users
+                   SET migration_status=?,
+                       cloudiway_status=?,
+                       error_message='Cloudiway did not enter a running state after the start/restart request.',
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (after_state, after_state, int(user_id)),
+            )
+
     log_event(
         int(user_id),
         "cloudiway_manual_start_restart",
-        f"Manual {action} request sent for Cloudiway object {object_id}; "
-        f"live_state={live_state or 'unknown'}; progress_has_activity={progress_has_activity}; "
-        f"job_status={json.dumps(live_payload, default=str)[:700]}; "
-        f"progress={json.dumps(progress_payload, default=str)[:700]}; "
-        f"response={json.dumps(response, default=str)[:900]}",
+        f"Manual {action} for Cloudiway object {object_id}; "
+        f"before_state={live_state or 'unknown'}; "
+        f"before_activity={progress_has_activity}; "
+        f"response={json.dumps(response, default=str)[:700]}; "
+        f"after_state={after_state or 'unconfirmed'}; "
+        f"after_activity={bool(after.get('has_activity'))}; "
+        f"after_job_status={json.dumps(after.get('job_status'), default=str)[:700]}",
     )
+
     return {
         "started": True,
         "action": action,
+        "confirmed": confirmed_running or confirmed_completed,
+        "confirmed_running": confirmed_running,
+        "state": after_state or "starting",
         "user_id": int(user_id),
         "cloudiway_object_id": object_id,
         "cloudiway_batch_id": int(row["cloudiway_batch_id"]) if row.get("cloudiway_batch_id") else None,
-        "live_state": live_state,
-        "progress_has_activity": progress_has_activity,
+        "before_state": live_state,
+        "before_activity": progress_has_activity,
+        "after_activity": bool(after.get("has_activity")),
     }
 
 
