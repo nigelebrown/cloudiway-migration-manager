@@ -32,6 +32,7 @@ class FakeCloud:
         self.credentials = []
         self.batch_members = []
         self.started = []
+        self.mail_start_requests = []
 
     async def create_mail_batch(self, name):
         return {"id": 99001, "name": name}
@@ -67,6 +68,18 @@ class FakeCloud:
     async def start_migration(self, object_ids):
         self.started.append(list(object_ids))
         return {"ok": True}
+
+    async def start_mail_migration(self, object_ids, batch_ids=None):
+        object_ids = list(object_ids)
+        batch_ids = list(batch_ids or [])
+        self.started.append(object_ids)
+        self.mail_start_requests.append((object_ids, batch_ids))
+        return {
+            "isSuccess": True,
+            "message": "StartMailJobs done",
+            "responseData": None,
+            "error": [],
+        }
 
 
 def configure_cloudiway(monkeypatch):
@@ -541,7 +554,7 @@ def test_individual_push_and_start_requests_cloudiway_start(monkeypatch):
 
 
 
-def test_new_controlled_group_prefers_cloudiway_batch_start_api(monkeypatch):
+def test_new_controlled_group_uses_mail_start_api_with_cloudiway_batch_id(monkeypatch):
     from app import service
 
     class BatchStartCloud(FakeCloud):
@@ -587,8 +600,9 @@ def test_new_controlled_group_prefers_cloudiway_batch_start_api(monkeypatch):
         )
         assert response.status_code == 303
 
-    assert cloud.batch_starts == [99001]
-    assert cloud.started == []
+    assert len(cloud.started) == 1
+    assert len(cloud.started[0]) == 2
+    assert cloud.mail_start_requests == [(cloud.started[0], [99001])]
     with conn() as db:
         batch = db.execute("SELECT * FROM migration_batches").fetchone()
         users = db.execute(
@@ -603,7 +617,7 @@ def test_new_controlled_group_prefers_cloudiway_batch_start_api(monkeypatch):
     assert all(u["cloudiway_status"] == "start_requested" for u in users)
 
 
-def test_individual_push_and_start_uses_one_user_cloudiway_batch_start(monkeypatch):
+def test_individual_push_and_start_uses_mail_start_api_with_batch_id(monkeypatch):
     from app import service
 
     class BatchStartCloud(FakeCloud):
@@ -653,5 +667,6 @@ def test_individual_push_and_start_uses_one_user_cloudiway_batch_start(monkeypat
         )
         assert response.status_code == 303
 
-    assert cloud.batch_starts == [99001]
-    assert cloud.started == []
+    assert len(cloud.started) == 1
+    assert len(cloud.started[0]) == 1
+    assert cloud.mail_start_requests == [(cloud.started[0], [99001])]
