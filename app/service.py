@@ -717,12 +717,14 @@ async def refresh_status() -> dict:
     cloud = await _cloudiway_client_ready()
     with conn() as db:
         rows = db.execute(
-            """SELECT id,cloudiway_object_id,migration_status,cloudiway_status,batch_started_at,
-                      CASE WHEN batch_started_at IS NULL THEN 0
-                           ELSE TIMESTAMPDIFF(SECOND,batch_started_at,UTC_TIMESTAMP()) END AS start_age_seconds
-               FROM users
-               WHERE cloudiway_object_id IS NOT NULL
-                 AND migration_status IN ('migrating','ready','starting')"""
+            """SELECT u.id,u.cloudiway_object_id,u.migration_status,u.cloudiway_status,
+                      u.batch_started_at,mb.cloudiway_batch_id,
+                      CASE WHEN u.batch_started_at IS NULL THEN 0
+                           ELSE TIMESTAMPDIFF(SECOND,u.batch_started_at,UTC_TIMESTAMP()) END AS start_age_seconds
+               FROM users u
+               LEFT JOIN migration_batches mb ON mb.id=u.batch_number
+               WHERE u.cloudiway_object_id IS NOT NULL
+                 AND u.migration_status IN ('migrating','ready','starting')"""
         ).fetchall()
 
     updated = completed = failed = attention = timed_out = not_started = 0
@@ -767,8 +769,16 @@ async def refresh_status() -> dict:
                     # One bounded automatic retry. This handles the real-world
                     # case where StartJobs returned successfully but the portal
                     # remained NotStarted.
-                    retry_response = await cloud.start_migration([object_id])
-                    _assert_cloudiway_command_accepted(retry_response, "StartJobs retry")
+                    if hasattr(cloud, "start_mail_migration"):
+                        retry_response = await cloud.start_mail_migration([object_id])
+                        retry_action = "StartMailJobs"
+                    else:
+                        retry_response = await cloud.start_migration([object_id])
+                        retry_action = "StartJobs"
+                    _assert_cloudiway_command_accepted(
+                        retry_response,
+                        f"{retry_action} retry",
+                    )
                     status = "starting"
                     cloud_status = "start_retry_requested"
                     with conn() as db:
@@ -784,7 +794,7 @@ async def refresh_status() -> dict:
                         int(row["id"]),
                         "cloudiway_start_auto_retry",
                         f"Cloudiway still reported NotStarted after {start_age}s. "
-                        f"StartJobs was sent once more for object {object_id}; response="
+                        f"{retry_action} was sent as the alternate start path for object {object_id}; response="
                         + json.dumps(retry_response, default=str)[:1000],
                     )
                 elif previous_status == "starting" and request_state == "start_retry_requested":
@@ -2448,12 +2458,33 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
     ]
 
     if start_ids:
-        start_response = await cloud.start_migration(start_ids)
-        _assert_cloudiway_command_accepted(start_response, "StartJobs")
+        # For a brand-new controlled group where every member is starting,
+        # use Cloudiway's dedicated batch-start API. This mirrors the portal's
+        # Batches -> Migration -> Start action. Mixed recovery groups still use
+        # object-level StartJobs so completed/running users are not restarted.
+        can_start_as_batch = (
+            bool(batch.get("cloudiway_batch_id"))
+            and len(start_ids) == len(rows)
+            and not restart_rows
+            and not running_user_ids
+            and not completed_user_ids
+        )
+        if can_start_as_batch and hasattr(cloud, "start_batch_migration"):
+            start_response = await cloud.start_batch_migration(
+                int(batch["cloudiway_batch_id"])
+            )
+            _assert_cloudiway_command_accepted(start_response, "StartBatch")
+            start_method = "StartBatch"
+        else:
+            start_response = await cloud.start_migration(start_ids)
+            _assert_cloudiway_command_accepted(start_response, "StartJobs")
+            start_method = "StartJobs"
+
         log_event(
             None,
-            "cloudiway_startjobs_response",
-            "Cloudiway StartJobs accepted for object IDs "
+            "cloudiway_start_request_response",
+            f"Cloudiway {start_method} accepted for batch "
+            f"{batch.get('cloudiway_batch_id') or 'none'}; object IDs="
             + ",".join(str(x) for x in start_ids)
             + "; response="
             + json.dumps(start_response, default=str)[:1200],
