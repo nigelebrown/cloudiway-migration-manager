@@ -223,3 +223,18 @@ This path is independent of Rackspace API access.
 
 The administrative password map contains email, password, source_email, target_email, first_name, last_name, computer_number, upload_batch, and migration_batch.
 
+
+
+## Migration Issue Center and background recovery
+
+The application continuously classifies migration and provisioning problems into actionable categories and exposes them through **Issue Center** and summary cards on the main dashboard.
+
+Current categories include Password / Credentials, Microsoft 365 Target Mailbox, Rackspace Source Mailbox, Source IMAP / Connectivity, AD Identity Review, AD / M365 Provisioning, Migration Timeout, Cloudiway Status, and Other / Unclassified.
+
+Explicit source authentication/password failures are eligible for automatic background recovery. After the configured delay, the application re-checks the live Cloudiway state, pushes the stored encrypted source credential to the same Cloudiway object, and restarts that existing migration. It never creates a duplicate recovery object. Running and completed jobs are not restarted. Automatic retries are bounded; after the configured maximum, the user is moved to **Manual Action Required**.
+
+For a manual credential correction, an administrator can enter the current source mailbox password from the Issue Center. The value is encrypted in MySQL, never written to the event log, pushed to Cloudiway, and the same migration object is restarted.
+
+A `target_mailbox_missing` issue can also be handled in the background when the user is linked to a provisioning profile. The application re-checks Microsoft 365 mailbox readiness and restarts the same Cloudiway migration only after the mailbox becomes ready. Target-mailbox problems without a provisioning profile, ambiguous IMAP/network failures, AD identity conflicts, timeouts, and unknown failures are classified for manual review rather than restarted blindly.
+
+Background issue processing continues while the administrator is logged out, provided the application is running and Cloudiway background connectivity remains configured. Recovery timing and maximum credential retries are configurable under **Settings → Background Issue Recovery**.
