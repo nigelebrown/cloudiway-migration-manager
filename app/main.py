@@ -2938,6 +2938,77 @@ async def issue_resolve(request: Request, user_id: int):
     return RedirectResponse("/issues", 303)
 
 
+@app.post("/issues/user/{user_id}/password-retry")
+async def issue_password_retry(
+    request: Request,
+    user_id: int,
+    new_password: str = Form(...),
+):
+    require_admin(request)
+    value = str(new_password or "")
+    if not value:
+        request.session["issues_error"] = "Enter the current source mailbox password."
+        return RedirectResponse("/issues?category=credentials", 303)
+
+    with conn() as db:
+        row = db.execute(
+            """SELECT id,source_email,password_reset_method
+               FROM users WHERE id=?""",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        encrypted = encrypt_secret(value)
+        if row["password_reset_method"] in ("existing_password","existing_password_retry"):
+            db.execute(
+                """UPDATE users
+                   SET source_credential_username=source_email,
+                       source_credential_password_enc=?,
+                       source_credential_origin='issue_manual_update',
+                       issue_status='open',manual_action_required=0,
+                       auto_recovery_attempts=0,
+                       auto_recovery_status='manual_retry_requested',
+                       auto_recovery_next_at=CURRENT_TIMESTAMP,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (encrypted, user_id),
+            )
+        else:
+            db.execute(
+                """UPDATE users
+                   SET generated_password_enc=?,
+                       issue_status='open',manual_action_required=0,
+                       auto_recovery_attempts=0,
+                       auto_recovery_status='manual_retry_requested',
+                       auto_recovery_next_at=CURRENT_TIMESTAMP,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (encrypted, user_id),
+            )
+
+    log_event(
+        user_id,
+        "issue_source_credential_updated",
+        "Administrator supplied a replacement source mailbox credential from the Issue Center; the secret value is encrypted and not logged.",
+    )
+    try:
+        result = await recover_credential_issue(user_id, force=True)
+        if result.get("recovered"):
+            request.session["issues_notice"] = (
+                f"Credential updated for {row['source_email']}; Cloudiway was updated and the existing migration restarted."
+            )
+        else:
+            request.session["issues_notice"] = (
+                f"Credential updated for {row['source_email']}. {result.get('reason') or 'Recovery is pending.'}"
+            )
+    except Exception as exc:
+        request.session["issues_error"] = (
+            f"Credential was saved, but Cloudiway recovery could not be completed: {exc}"
+        )
+    return RedirectResponse("/issues?category=credentials", 303)
+
+
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request, level: str = "", q: str = ""):
     redirect = _page_auth(request)
