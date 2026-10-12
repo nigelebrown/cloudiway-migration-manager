@@ -2788,6 +2788,11 @@ async def user_cloudiway_logs(request: Request, user_id: int):
                    WHERE id=?""",
                 (status_override, issue_code or status_override, friendly, user_id),
             )
+        record_user_issue(
+            user_id,
+            issue_code or "cloudiway_status_failed",
+            friendly or "Cloudiway returned a migration issue requiring review.",
+        )
         log_event(
             user_id,
             issue_code or "cloudiway_diagnosed",
@@ -2811,8 +2816,27 @@ async def rotate_password(request: Request, user_id: int):
 async def retry_user(request: Request, user_id: int):
     require_admin(request)
     with conn() as db:
+        row = db.execute(
+            "SELECT issue_category FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if row.get("issue_category") == "credentials":
+        try:
+            return await recover_credential_issue(user_id, force=True)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+
+    with conn() as db:
         db.execute(
-            "UPDATE users SET migration_status='waiting',error_message=NULL,progress_percent=NULL,batch_number=NULL,batch_started_at=NULL WHERE id=?",
+            """UPDATE users
+               SET migration_status='waiting',error_message=NULL,progress_percent=NULL,
+                   batch_number=NULL,batch_started_at=NULL,
+                   issue_status='resolved',manual_action_required=0,
+                   auto_recovery_status='resolved',auto_recovery_next_at=NULL
+               WHERE id=?""",
             (user_id,),
         )
     return {"ok": True}
