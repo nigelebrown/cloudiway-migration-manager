@@ -821,6 +821,15 @@ def test_notstarted_start_request_is_automatically_retried_once(monkeypatch):
             self.started.append(list(object_ids))
             return {"isSuccess": True, "message": "StartJobs done", "error": []}
 
+        async def start_mail_migration(self, object_ids, batch_ids=None):
+            self.started.append(list(object_ids))
+            return {
+                "isSuccess": True,
+                "message": "StartMailJobs done",
+                "responseData": None,
+                "error": [],
+            }
+
     cloud = FakeCloud()
 
     async def fake_ready():
@@ -960,11 +969,11 @@ def test_legacy_false_migrating_notstarted_is_repaired_with_batch_start(monkeypa
                 "error": [],
             }
 
-        async def start_batch_migration(self, batch_id):
-            self.batch_starts.append(int(batch_id))
+        async def start_mail_migration(self, object_ids, batch_ids=None):
+            self.batch_starts.extend(int(x) for x in (batch_ids or []))
             return {
                 "isSuccess": True,
-                "message": "StartBatch done",
+                "message": "StartMailJobs done",
                 "count": 0,
                 "responseData": None,
                 "error": [],
