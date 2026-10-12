@@ -554,7 +554,7 @@ def test_individual_push_and_start_requests_cloudiway_start(monkeypatch):
 
 
 
-def test_new_controlled_group_uses_mail_start_api_with_cloudiway_batch_id(monkeypatch):
+def test_new_controlled_group_uses_documented_startjobs_api(monkeypatch):
     from app import service
 
     class BatchStartCloud(FakeCloud):
@@ -602,7 +602,7 @@ def test_new_controlled_group_uses_mail_start_api_with_cloudiway_batch_id(monkey
 
     assert len(cloud.started) == 1
     assert len(cloud.started[0]) == 2
-    assert cloud.mail_start_requests == [(cloud.started[0], [99001])]
+    assert cloud.mail_start_requests == []
     with conn() as db:
         batch = db.execute("SELECT * FROM migration_batches").fetchone()
         users = db.execute(
@@ -617,7 +617,7 @@ def test_new_controlled_group_uses_mail_start_api_with_cloudiway_batch_id(monkey
     assert all(u["cloudiway_status"] == "start_requested" for u in users)
 
 
-def test_individual_push_and_start_uses_mail_start_api_with_batch_id(monkeypatch):
+def test_individual_push_and_start_uses_documented_startjobs_api(monkeypatch):
     from app import service
 
     class BatchStartCloud(FakeCloud):
@@ -669,7 +669,7 @@ def test_individual_push_and_start_uses_mail_start_api_with_batch_id(monkeypatch
 
     assert len(cloud.started) == 1
     assert len(cloud.started[0]) == 1
-    assert cloud.mail_start_requests == [(cloud.started[0], [99001])]
+    assert cloud.mail_start_requests == []
 
 
 
@@ -750,7 +750,8 @@ def test_per_user_start_restart_reuses_existing_cloudiway_object(monkeypatch):
         )
         assert response.status_code == 303
 
-    assert cloud.mail_start_requests == [([429], [77])]
+    assert cloud.started == [[429]]
+    assert cloud.mail_start_requests == []
     assert cloud.users == {}
 
     with conn() as db:
