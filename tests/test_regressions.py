@@ -611,3 +611,23 @@ def test_classify_cannot_connect_imap_client():
     assert status == "failed"
     assert code == "source_imap_connection_failed"
     assert "source imap mailbox" in message.lower()
+
+
+
+def test_cloudiway_missing_access_token_reauthenticates_when_keep_connected(monkeypatch):
+    from app import service as svc
+    import asyncio
+
+    class FreshCloud:
+        def __init__(self):
+            self.token = "fresh-token"
+
+    async def fake_reauth():
+        return FreshCloud()
+
+    monkeypatch.setattr(svc, "_cloudiway_reauthenticate", fake_reauth)
+    set_setting("cloudiway_token", "", True)
+    set_setting("cloudiway_keep_connected", "1")
+
+    client = asyncio.run(svc._cloudiway_client_ready())
+    assert client.token == "fresh-token"
