@@ -133,6 +133,12 @@ class CloudiwayClient:
             "Could not start Cloudiway audit",
         )
 
+    async def restart_migration(self, object_id: int):
+        return await self._get(
+            f"/Jobs/Restart/{int(object_id)}/{settings.cloudiway_product_type_mail}",
+            "Could not restart existing Cloudiway migration",
+        )
+
     async def progress(self, object_id: int, since_minutes: int = 15):
         async with httpx.AsyncClient(timeout=45) as client:
             r = await client.get(
