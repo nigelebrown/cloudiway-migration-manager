@@ -1,0 +1,56 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migration Issue Center</title>
+<style>
+:root{font-family:Inter,system-ui,sans-serif;color-scheme:dark}body{margin:0;background:#07111f;color:#e5e7eb}.wrap{max-width:1600px;margin:0 auto;padding:24px}a{color:#38bdf8;text-decoration:none}
+.top{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.top h1{margin-right:auto}.cards{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:12px;margin:18px 0}.card{display:block;background:#101a2b;border:1px solid #22324a;border-radius:12px;padding:16px;color:#e5e7eb}.card.active{border-color:#38bdf8}.n{font-size:30px;font-weight:900}.label{color:#94a3b8;font-size:12px}.notice{padding:11px 14px;border-radius:8px;margin:10px 0}.ok{background:#064e3b;color:#d1fae5}.err{background:#451a1a;color:#fecaca}.info{background:#0c4a6e;color:#bae6fd}
+.filters,.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0}.filters input,.filters select,.actions input{padding:9px;border-radius:7px;border:1px solid #334155;background:#0b1220;color:#fff}.btn,button{padding:8px 11px;border:0;border-radius:7px;background:#0284c7;color:#fff;font-weight:800;cursor:pointer}.secondary{background:#334155}.danger{background:#b91c1c}.success{background:#047857}
+.tablewrap{overflow:auto;border:1px solid #22324a;border-radius:10px}table{width:100%;border-collapse:collapse;min-width:1450px;background:#101a2b}th,td{padding:9px;border-bottom:1px solid #1f2937;text-align:left;font-size:12px;vertical-align:top}th{background:#0f172a;position:sticky;top:0}.bad{color:#fca5a5}.warn{color:#fde68a}.good{color:#86efac}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}dialog{background:#101a2b;color:#e5e7eb;border:1px solid #334155;border-radius:12px;padding:20px;max-width:900px}dialog::backdrop{background:#0009}
+@media(max-width:900px){.cards{grid-template-columns:1fr 1fr}}
+</style></head><body><div class="wrap">
+<div class="top"><h1>Migration Issue Center</h1><a href="/dashboard">Dashboard</a><a href="/workflow">Migration Workflow</a><a href="/logs">Application Logs</a><a href="/settings">Settings</a></div>
+{% if notice %}<div class="notice ok">{{notice}}</div>{% endif %}{% if error %}<div class="notice err">{{error}}</div>{% endif %}
+<div class="notice info"><b>Background handling:</b> credential failures are {% if auto_recovery_enabled %}enabled for automatic recovery{% else %}not automatically recovered{% endif %}. Retry delay: {{retry_delay_minutes}} minute(s); maximum automatic retries: {{retry_max}}. Other issue types are classified here for targeted action.</div>
+<div class="cards">
+{% for key,label in labels.items() %}
+<a class="card {% if selected_category==key %}active{% endif %}" href="/issues?category={{key}}"><div class="n">{{category_counts.get(key,0)}}</div><div class="label">{{label|upper}}</div></a>
+{% endfor %}
+</div>
+<div class="filters">
+<form method="get" action="/issues" class="filters">
+<input type="hidden" name="category" value="{{selected_category}}">
+<input name="q" value="{{q}}" placeholder="Search user, email or error">
+<select name="state"><option value="">All issue states</option>
+<option value="open" {% if selected_state=='open' %}selected{% endif %}>Open / scheduled</option>
+<option value="recovering" {% if selected_state=='recovering' %}selected{% endif %}>Recovering</option>
+<option value="manual_required" {% if selected_state=='manual_required' %}selected{% endif %}>Manual action required</option>
+</select><button>Filter</button><a class="btn secondary" href="/issues">Clear</a></form>
+</div>
+<div class="tablewrap"><table><thead><tr><th>User</th><th>Issue Type</th><th>State</th><th>Cloudiway</th><th>Automatic Recovery</th><th>Error / Required Action</th><th>Actions</th></tr></thead><tbody>
+{% for u in users %}
+<tr>
+<td><b>{{u.source_email}}</b><br>{{(u.first_name or '')}} {{(u.middle_name or '')}} {{(u.last_name or '')}}<br><span class="mono">{{u.computer_number or ''}}</span></td>
+<td><b>{{labels.get(u.issue_category,u.issue_category)}}</b><br><span class="mono">{{u.issue_code or ''}}</span></td>
+<td class="{{'bad' if u.manual_action_required else ('warn' if u.issue_status in ['open','recovering'] else 'good')}}"><b>{{u.issue_status}}</b><br>Detected: {{u.issue_detected_at or ''}}</td>
+<td>Object: {{u.cloudiway_object_id or '—'}}<br>Status: {{u.cloudiway_status}}<br>Migration: {{u.migration_status}}</td>
+<td>Attempts: {{u.auto_recovery_attempts}} / {{retry_max}}<br>Status: {{u.auto_recovery_status}}<br>Next: {{u.auto_recovery_next_at or '—'}}</td>
+<td class="bad">{{u.error_message or ''}}</td>
+<td>
+<div class="actions">
+{% if u.issue_category=='credentials' %}
+{% if u.has_stored_credential %}<form method="post" action="/issues/user/{{u.id}}/retry-now"><button class="success">Re-push Stored Credential Now</button></form>{% endif %}
+<form method="post" action="/issues/user/{{u.id}}/password-retry"><input type="password" name="new_password" placeholder="Enter new source password" required><button>Save Password & Retry</button></form>
+{% endif %}
+{% if u.cloudiway_object_id %}<button class="secondary" type="button" onclick="showLogs({{u.id}})">Cloudiway Details</button>{% endif %}
+<form method="post" action="/issues/user/{{u.id}}/resolve"><button class="secondary">Mark Resolved</button></form>
+</div>
+</td>
+</tr>
+{% endfor %}
+{% if not users %}<tr><td colspan="7">No users match this issue filter.</td></tr>{% endif %}
+</tbody></table></div>
+<dialog id="detail"><h3>Cloudiway Details</h3><pre id="detailText" style="white-space:pre-wrap;max-height:600px;overflow:auto;background:#020617;padding:12px;border-radius:8px"></pre><p><button class="secondary" onclick="detail.close()">Close</button></p></dialog>
+</div><script>
+const detail=document.getElementById('detail');
+async function showLogs(id){const r=await fetch('/users/'+id+'/cloudiway-logs');let d={};try{d=await r.json()}catch(e){d={detail:'Unexpected server response'}}document.getElementById('detailText').textContent=JSON.stringify(d,null,2);detail.showModal();}
+</script></body></html>
