@@ -771,3 +771,158 @@ def test_refresh_corrects_false_migrating_to_ready_when_cloudiway_is_notstarted(
     assert user["cloudiway_status"] == "not_started"
     assert user["progress_percent"] == 0
     assert batch["workflow_status"] == "ready_to_migrate"
+
+
+
+def test_cloudiway_http_200_application_error_is_rejected():
+    with pytest.raises(RuntimeError, match="StartJobs was rejected"):
+        service._assert_cloudiway_command_accepted(
+            {
+                "isSuccess": False,
+                "message": "StartJobs failed",
+                "error": ["Unable to schedule job"],
+            },
+            "StartJobs",
+        )
+
+
+def test_notstarted_start_request_is_automatically_retried_once(monkeypatch):
+    class FakeCloud:
+        def __init__(self):
+            self.started = []
+
+        async def job_status(self, object_id):
+            return {
+                "isSuccess": True,
+                "responseData": {"status": "NotStarted"},
+                "error": [],
+            }
+
+        async def progress(self, object_id, since_minutes):
+            return {
+                "isSuccess": True,
+                "message": "GetMailProgress done",
+                "responseData": {
+                    "blockId": object_id,
+                    "migratedEmails": 0,
+                    "errorEmails": 0,
+                    "ignoredEmails": 0,
+                    "totalEmails": 0,
+                    "recentMigratedEmails": 0,
+                    "windowMinutes": 1,
+                    "startDateTime": None,
+                    "lastActivityDateTime": None,
+                    "error": [],
+                },
+                "error": [],
+            }
+
+        async def start_migration(self, object_ids):
+            self.started.append(list(object_ids))
+            return {"isSuccess": True, "message": "StartJobs done", "error": []}
+
+    cloud = FakeCloud()
+
+    async def fake_ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,cloudiway_status,
+                   migration_status,batch_started_at
+               ) VALUES(?,?,?,?,?,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 31 SECOND))""",
+            (
+                "retry.start@jcf.gov.jm",
+                "retry.start@jcf.gov.jm",
+                427,
+                "start_requested",
+                "starting",
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='retry.start@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    import asyncio
+    asyncio.run(service.refresh_status())
+
+    assert cloud.started == [[427]]
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        events = db.execute(
+            "SELECT event_type FROM events WHERE user_id=? ORDER BY id",
+            (uid,),
+        ).fetchall()
+
+    assert row["migration_status"] == "starting"
+    assert row["cloudiway_status"] == "start_retry_requested"
+    assert "cloudiway_start_auto_retry" in [e["event_type"] for e in events]
+
+
+def test_notstarted_after_second_start_returns_ready_and_flags_issue(monkeypatch):
+    class FakeCloud:
+        async def job_status(self, object_id):
+            return {
+                "isSuccess": True,
+                "responseData": {"status": "NotStarted"},
+                "error": [],
+            }
+
+        async def progress(self, object_id, since_minutes):
+            return {
+                "isSuccess": True,
+                "message": "GetMailProgress done",
+                "responseData": {
+                    "blockId": object_id,
+                    "migratedEmails": 0,
+                    "errorEmails": 0,
+                    "ignoredEmails": 0,
+                    "totalEmails": 0,
+                    "recentMigratedEmails": 0,
+                    "windowMinutes": 1,
+                    "startDateTime": None,
+                    "lastActivityDateTime": None,
+                    "error": [],
+                },
+                "error": [],
+            }
+
+    async def fake_ready():
+        return FakeCloud()
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", fake_ready)
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,cloudiway_status,
+                   migration_status,batch_started_at
+               ) VALUES(?,?,?,?,?,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 31 SECOND))""",
+            (
+                "retry.failed@jcf.gov.jm",
+                "retry.failed@jcf.gov.jm",
+                428,
+                "start_retry_requested",
+                "starting",
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='retry.failed@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    import asyncio
+    result = asyncio.run(service.refresh_status())
+    assert result["not_started"] == 1
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+    assert row["migration_status"] == "ready"
+    assert row["cloudiway_status"] == "not_started"
+    assert row["issue_code"] == "cloudiway_start_not_started"
+    assert row["issue_category"] == "cloudiway"
+    assert row["issue_status"] == "manual_required"
+    assert "two StartJobs requests" in row["error_message"]
