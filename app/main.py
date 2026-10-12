@@ -1630,12 +1630,6 @@ async def workflow_generate_batch(
 ):
     require_admin(request)
 
-    if not get_setting("cloudiway_token"):
-        request.session["workflow_error"] = (
-            "Connect Cloudiway first. Every released migration group must receive a Cloudiway batch number."
-        )
-        return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
-
     with conn() as db:
         upload = db.execute(
             "SELECT * FROM upload_batches WHERE id=?",
@@ -1828,6 +1822,28 @@ async def workflow_generate_batch(
     )
     return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
+
+
+@app.post("/workflow/{upload_batch_id}/push-user/{user_id}")
+async def workflow_push_single_user(
+    request: Request,
+    upload_batch_id: int,
+    user_id: int,
+):
+    """Create a one-user controlled group and push that user's credential to Cloudiway.
+
+    This uses the same controlled-batch workflow as bulk selection, so the user
+    still receives a Cloudiway batch number and all normal duplicate/safety
+    checks apply. It does not auto-start the migration.
+    """
+    require_admin(request)
+    return await workflow_generate_batch(
+        request=request,
+        upload_batch_id=upload_batch_id,
+        quantity=0,
+        user_ids=[int(user_id)],
+        auto_start="",
+    )
 
 @app.post("/migration-batch/{migration_batch_id}/assess")
 async def migration_batch_assess(request: Request, migration_batch_id: int):
