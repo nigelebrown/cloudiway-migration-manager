@@ -1811,7 +1811,7 @@ def parse_cloudiway_job_status(data) -> tuple[str | None, str]:
                 if isinstance(value, str):
                     if lk in (
                         "status", "state", "jobstatus", "migrationstatus",
-                        "statusname", "jobstatusname", "name",
+                        "statusname", "jobstatusname",
                     ):
                         candidates.append(value)
                     # Some Cloudiway envelopes put the state directly in
@@ -2426,12 +2426,15 @@ def _assert_cloudiway_command_accepted(result, action: str) -> None:
 async def restart_stuck_cloudiway_user(user_id: int) -> dict:
     """Start or restart one existing Cloudiway mailbox safely in place.
 
-    - NotStarted/unknown -> POST /Jobs/StartJobs/5/33
-    - Failed/Stopped/Attention -> GET /Jobs/Restart/{objectId}/5
-    - Migrating -> protected
-    - Completed -> protected
+    Cloudiway's GetListJobStatus response is not fully described in Swagger and
+    may not expose a parseable text state. Therefore the app must not treat the
+    local database's 'migrating' value as proof that Cloudiway is running.
 
-    The existing Cloudiway object and stored credential are reused.
+    Protection rules:
+    - Completed confirmed by Cloudiway -> do not restart.
+    - Running confirmed by Cloudiway AND MailProgress shows real activity -> do not restart.
+    - Failed/stopped/attention confirmed by Cloudiway -> call Restart.
+    - NotStarted, unknown, or contradictory zero-activity state -> call StartJobs.
     """
     with conn() as db:
         row = db.execute(
@@ -2461,21 +2464,51 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
     except Exception as exc:
         log_event(user_id, "cloudiway_manual_live_status_failed", str(exc))
 
-    local_status = str(row.get("migration_status") or "").lower()
-    effective = live_state or local_status
+    progress_payload = None
+    progress_has_activity = False
+    try:
+        progress_payload = await cloud.progress(
+            object_id,
+            max(1, settings.progress_window_minutes),
+        )
+        response = (
+            progress_payload.get("responseData")
+            if isinstance(progress_payload, dict)
+            else None
+        )
+        if isinstance(response, dict):
+            progress_has_activity = bool(
+                response.get("startDateTime")
+                or response.get("lastActivityDateTime")
+                or int(response.get("totalEmails") or 0) > 0
+                or int(response.get("migratedEmails") or 0) > 0
+                or int(response.get("errorEmails") or 0) > 0
+                or int(response.get("ignoredEmails") or 0) > 0
+            )
+    except Exception as exc:
+        log_event(user_id, "cloudiway_manual_progress_check_failed", str(exc))
 
-    if effective == "completed":
-        return {"started": False, "reason": "Completed migrations are protected and cannot be restarted."}
-    if effective == "migrating":
-        return {"started": False, "reason": "Cloudiway already reports this migration as running."}
+    if live_state == "completed":
+        return {
+            "started": False,
+            "reason": "Cloudiway confirms this migration is completed; restart is blocked.",
+        }
 
-    if effective in ("failed", "attention"):
+    if live_state == "migrating" and progress_has_activity:
+        return {
+            "started": False,
+            "reason": "Cloudiway confirms this migration is actively running.",
+        }
+
+    # A parsed 'migrating' state with zero MailProgress activity contradicts the
+    # portal scenario seen in production (portal = NotStarted, local = migrating).
+    # Do not block the operator on that ambiguous condition.
+    if live_state in ("failed", "attention"):
         response = await cloud.restart_migration(object_id)
         _assert_cloudiway_command_accepted(response, "Restart")
         action = "Restart"
         next_cloud_status = "manual_restart_requested"
     else:
-        # Normal start path for NotStarted/ready/unknown.
         response = await cloud.start_migration([object_id])
         _assert_cloudiway_command_accepted(response, "StartJobs")
         action = "StartJobs"
@@ -2509,8 +2542,10 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
         int(user_id),
         "cloudiway_manual_start_restart",
         f"Manual {action} request sent for Cloudiway object {object_id}; "
-        f"live_state={live_state or 'unknown'}; response="
-        + json.dumps(response, default=str)[:1200],
+        f"live_state={live_state or 'unknown'}; progress_has_activity={progress_has_activity}; "
+        f"job_status={json.dumps(live_payload, default=str)[:700]}; "
+        f"progress={json.dumps(progress_payload, default=str)[:700]}; "
+        f"response={json.dumps(response, default=str)[:900]}",
     )
     return {
         "started": True,
@@ -2518,6 +2553,8 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
         "user_id": int(user_id),
         "cloudiway_object_id": object_id,
         "cloudiway_batch_id": int(row["cloudiway_batch_id"]) if row.get("cloudiway_batch_id") else None,
+        "live_state": live_state,
+        "progress_has_activity": progress_has_activity,
     }
 
 
