@@ -1138,9 +1138,15 @@ async def prepare_existing_password_user(user_id: int) -> int:
         )
         return object_id
 
+    # A live running/completed Cloudiway status always wins over stale local
+    # error state. Only fall back to the local terminal state when Cloudiway did
+    # not return a definitive running/completed status.
     should_restart = (
         remote_status in ("failed", "attention")
-        or prior_local_status in ("failed", "attention", "timed_out")
+        or (
+            remote_status not in ("migrating", "completed")
+            and prior_local_status in ("failed", "attention", "timed_out")
+        )
     )
 
     if recovery_only and not should_restart:
@@ -1158,7 +1164,15 @@ async def prepare_existing_password_user(user_id: int) -> int:
     )
     await cloud.register_source_credentials(token, username, password)
 
-    if should_restart:
+    if remote_status == "completed":
+        next_cloud_status = "existing_completed"
+        next_migration_status = "completed"
+        action = "credentials_refreshed_existing_completed"
+    elif remote_status == "migrating":
+        next_cloud_status = "existing_migrating"
+        next_migration_status = "migrating"
+        action = "credentials_refreshed_existing_migrating"
+    elif should_restart:
         next_cloud_status = "restart_required"
         next_migration_status = "ready"
         action = "credentials_refreshed_restart_required"
