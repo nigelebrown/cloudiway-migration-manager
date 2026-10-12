@@ -1793,7 +1793,10 @@ async def workflow_generate_batch(
                 if auto_start:
                     started = await start_migration_batch(migration_batch_id)
                     if started.get("started"):
-                        request.session["workflow_notice"] += " Migration started automatically."
+                        request.session["workflow_notice"] += (
+                            " Cloudiway start was requested automatically. "
+                            "The status will move to MIGRATING only after Cloudiway confirms Scheduled/Pending/Working."
+                        )
             else:
                 request.session["workflow_error"] = str(prepared.get("reason") or "Cloudiway preparation did not complete")
         except Exception as exc:
@@ -1844,6 +1847,23 @@ async def workflow_push_single_user(
         user_ids=[int(user_id)],
         auto_start="",
     )
+
+@app.post("/workflow/{upload_batch_id}/push-start-user/{user_id}")
+async def workflow_push_and_start_single_user(
+    request: Request,
+    upload_batch_id: int,
+    user_id: int,
+):
+    """Push one user's stored credential and immediately request Cloudiway start."""
+    require_admin(request)
+    return await workflow_generate_batch(
+        request=request,
+        upload_batch_id=upload_batch_id,
+        quantity=0,
+        user_ids=[int(user_id)],
+        auto_start="1",
+    )
+
 
 @app.post("/migration-batch/{migration_batch_id}/assess")
 async def migration_batch_assess(request: Request, migration_batch_id: int):
