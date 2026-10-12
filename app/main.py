@@ -1208,7 +1208,10 @@ async def upload_users(
                     workflow_mode == "existing_password"
                     and existing_status in ("failed", "attention", "timed_out")
                 )
-                explicit_recovery = workflow_mode == "existing_password_retry"
+                explicit_recovery = (
+                    workflow_mode == "existing_password_retry"
+                    and existing_status not in ("migrating", "completed")
+                )
                 if not (retry_existing_error or explicit_recovery) and (
                     existing_status in ("preparing", "ready", "migrating", "completed")
                     or int(existing.get("assigned") or 0) > 0
@@ -1346,7 +1349,12 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                           COUNT(ubm.user_id) AS member_count,
                           SUM(mbm.user_id IS NOT NULL) AS assigned_count,
                           SUM(mbm.user_id IS NULL
-                              AND u.migration_status='waiting'
+                              AND (
+                                  (ub.workflow_mode='existing_password_retry'
+                                   AND u.migration_status IN ('waiting','ready','failed','attention','timed_out'))
+                                  OR
+                                  (ub.workflow_mode<>'existing_password_retry' AND u.migration_status='waiting')
+                              )
                               AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.cloudiway_object_id IS NULL)
                               AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.generated_password_enc IS NULL)) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
@@ -1380,7 +1388,12 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                           COUNT(ubm.user_id) AS member_count,
                           SUM(mbm.user_id IS NOT NULL) AS assigned_count,
                           SUM(mbm.user_id IS NULL
-                              AND u.migration_status='waiting'
+                              AND (
+                                  (ub.workflow_mode='existing_password_retry'
+                                   AND u.migration_status IN ('waiting','ready','failed','attention','timed_out'))
+                                  OR
+                                  (ub.workflow_mode<>'existing_password_retry' AND u.migration_status='waiting')
+                              )
                               AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.cloudiway_object_id IS NULL)
                               AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.generated_password_enc IS NULL)) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
@@ -1432,7 +1445,13 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                 available_members = [
                     m for m in members
                     if not m.get("migration_batch_id")
-                    and m.get("migration_status") == "waiting"
+                    and (
+                        (upload.get("workflow_mode") == "existing_password_retry"
+                         and m.get("migration_status") in ("waiting","ready","failed","attention","timed_out"))
+                        or
+                        (upload.get("workflow_mode") != "existing_password_retry"
+                         and m.get("migration_status") == "waiting")
+                    )
                     and (
                         upload.get("workflow_mode") in DIRECT_PASSWORD_MODES
                         or not m.get("cloudiway_object_id")
@@ -1557,7 +1576,11 @@ async def workflow_generate_batch(
                FROM upload_batch_members ubm
                JOIN users u ON u.id=ubm.user_id
                WHERE ubm.upload_batch_id=?
-                 AND u.migration_status='waiting'
+                 AND (
+                     (?='existing_password_retry' AND u.migration_status IN ('waiting','ready','failed','attention','timed_out'))
+                     OR
+                     (?<>'existing_password_retry' AND u.migration_status='waiting')
+                 )
                  AND (? IN ('existing_password','existing_password_retry') OR u.cloudiway_object_id IS NULL)
                  AND (? IN ('existing_password','existing_password_retry') OR u.generated_password_enc IS NULL)
                  AND NOT EXISTS (
@@ -1567,7 +1590,7 @@ async def workflow_generate_batch(
                      WHERE mb.upload_batch_id=? AND mbm.user_id=u.id
                  )
                ORDER BY ubm.row_order,u.id""",
-            (upload_batch_id, upload["workflow_mode"], upload["workflow_mode"], upload_batch_id),
+            (upload_batch_id, upload["workflow_mode"], upload["workflow_mode"], upload["workflow_mode"], upload["workflow_mode"], upload_batch_id),
         ).fetchall()
 
         available_ids = [int(r["id"]) for r in available]
