@@ -455,3 +455,164 @@ async def test_target_mailbox_pending_waits_without_restarting(monkeypatch):
     assert row["issue_status"] == "open"
     assert row["auto_recovery_status"] == "waiting_for_mailbox"
     assert row["manual_action_required"] == 0
+
+
+
+class SubmissionCloud:
+    def __init__(self):
+        self.next_id = 72000
+        self.users = {}
+        self.credentials = []
+        self.batch_members = []
+        self.started = []
+
+    async def verify_mail_user(self, email):
+        for oid, payload in self.users.items():
+            if payload.get("sourceEmail") == email:
+                return {"id": oid}
+        return {}
+
+    async def create_mail_user(self, payload):
+        self.next_id += 1
+        self.users[self.next_id] = dict(payload)
+        return {"id": self.next_id}
+
+    async def get_mail_user(self, object_id):
+        return {"id": object_id, **self.users[object_id]}
+
+    async def get_self_service_token(self, object_id):
+        return f"token-{object_id}"
+
+    async def register_source_credentials(self, token, username, password):
+        self.credentials.append((token, username, password))
+        return {"ok": True}
+
+    async def add_mail_batch_members(self, batch_id, object_ids):
+        self.batch_members.append((batch_id, list(object_ids)))
+        return {"ok": True}
+
+    async def start_migration(self, object_ids):
+        self.started.append(list(object_ids))
+        return {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_failed_direct_submission_is_retried_in_background_without_duplicate_password_reset(monkeypatch):
+    cloud = SubmissionCloud()
+    configure_cloud(monkeypatch, cloud)
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
+               ) VALUES(?,?,?,?,?)""",
+            ("DIRECT-SUBMIT-U1", "existing_password", "partially_batched", 1, 1),
+        )
+        upload_id = int(up.lastrowid)
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   cloudiway_batch_id,selected_count
+               ) VALUES(?,?,?,?,?,?)""",
+            (upload_id, 1, "DIRECT-SUBMIT-U1-B001", "migrating", 99111, 1),
+        )
+        batch_id = int(mb.lastrowid)
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,password_reset_method,
+                   source_credential_username,source_credential_password_enc,
+                   source_credential_origin,migration_status,error_message,batch_number
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                "submit.retry@jcf.gov.jm",
+                "submit.retry@jcf.gov.jm",
+                "existing_password",
+                "submit.retry@jcf.gov.jm",
+                encrypt_secret("Known#SubmitPassword2026"),
+                "uploaded_excel",
+                "failed",
+                "Cloudiway submit failed before object creation",
+                batch_id,
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='submit.retry@jcf.gov.jm'"
+        ).fetchone()["id"])
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (batch_id, uid),
+        )
+
+    service.sync_local_issue_states()
+    make_due(uid)
+    result = await service.process_background_issues()
+
+    assert result["recovered"] == 1
+    assert len(cloud.users) == 1
+    oid = next(iter(cloud.users))
+    assert cloud.credentials == [
+        (f"token-{oid}", "submit.retry@jcf.gov.jm", "Known#SubmitPassword2026")
+    ]
+    assert cloud.batch_members == [(99111, [oid])]
+    assert cloud.started == [[oid]]
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    assert row["cloudiway_object_id"] == oid
+    assert row["migration_status"] == "migrating"
+    assert row["auto_recovery_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_rackspace_workflow_submission_failure_is_not_retried_in_background(monkeypatch):
+    cloud = SubmissionCloud()
+    configure_cloud(monkeypatch, cloud)
+
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
+               ) VALUES(?,?,?,?,?)""",
+            ("AUTO-SUBMIT-U1", "automatic", "partially_batched", 1, 1),
+        )
+        upload_id = int(up.lastrowid)
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   cloudiway_batch_id,selected_count
+               ) VALUES(?,?,?,?,?,?)""",
+            (upload_id, 1, "AUTO-SUBMIT-U1-B001", "migrating", 99222, 1),
+        )
+        batch_id = int(mb.lastrowid)
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,password_reset_method,
+                   migration_status,error_message,batch_number
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                "automatic.retry@jcf.gov.jm",
+                "automatic.retry@jcf.gov.jm",
+                "automatic",
+                "failed",
+                "Cloudiway submit failed before object creation",
+                batch_id,
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='automatic.retry@jcf.gov.jm'"
+        ).fetchone()["id"])
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (batch_id, uid),
+        )
+
+    service.sync_local_issue_states()
+    make_due(uid)
+    await service.process_background_issues()
+
+    assert cloud.users == {}
+    assert cloud.started == []
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    assert row["issue_status"] == "manual_required"
+    assert row["manual_action_required"] == 1
