@@ -717,8 +717,12 @@ async def refresh_status() -> dict:
     cloud = await _cloudiway_client_ready()
     with conn() as db:
         rows = db.execute(
-            "SELECT id,cloudiway_object_id,migration_status FROM users "
-            "WHERE cloudiway_object_id IS NOT NULL AND migration_status IN ('migrating','ready','starting')"
+            """SELECT id,cloudiway_object_id,migration_status,cloudiway_status,batch_started_at,
+                      CASE WHEN batch_started_at IS NULL THEN 0
+                           ELSE TIMESTAMPDIFF(SECOND,batch_started_at,UTC_TIMESTAMP()) END AS start_age_seconds
+               FROM users
+               WHERE cloudiway_object_id IS NOT NULL
+                 AND migration_status IN ('migrating','ready','starting')"""
         ).fetchall()
 
     updated = completed = failed = attention = timed_out = not_started = 0
@@ -744,21 +748,65 @@ async def refresh_status() -> dict:
             progress_status, percent, progress_detail = parse_progress(data)
 
             if job_state == "not_started":
-                status = "ready"
-                cloud_status = "not_started"
-                percent = 0.0 if percent is None else percent
-                error_message = None
                 detail = json.dumps(
                     {"jobStatus": job_status_data, "progress": data},
                     default=str,
                 )[:1500]
-                not_started += 1
-                # A previous false-attention/migrating classification should
-                # disappear immediately once Cloudiway says NotStarted.
-                clear_user_issue(
-                    int(row["id"]),
-                    "Cloudiway reports this migration has not started yet.",
-                )
+                percent = 0.0 if percent is None else percent
+                error_message = None
+                previous_status = str(row.get("migration_status") or "")
+                request_state = str(row.get("cloudiway_status") or "")
+                start_age = int(row.get("start_age_seconds") or 0)
+
+                if previous_status == "starting" and start_age < 30:
+                    # Give Cloudiway a short scheduling window before deciding
+                    # that the accepted start request did not transition.
+                    status = "starting"
+                    cloud_status = request_state or "start_requested"
+                elif previous_status == "starting" and request_state == "start_requested":
+                    # One bounded automatic retry. This handles the real-world
+                    # case where StartJobs returned successfully but the portal
+                    # remained NotStarted.
+                    retry_response = await cloud.start_migration([object_id])
+                    _assert_cloudiway_command_accepted(retry_response, "StartJobs retry")
+                    status = "starting"
+                    cloud_status = "start_retry_requested"
+                    with conn() as db:
+                        db.execute(
+                            """UPDATE users
+                               SET batch_started_at=CURRENT_TIMESTAMP,
+                                   cloudiway_status='start_retry_requested',
+                                   updated_at=CURRENT_TIMESTAMP
+                               WHERE id=?""",
+                            (int(row["id"]),),
+                        )
+                    log_event(
+                        int(row["id"]),
+                        "cloudiway_start_auto_retry",
+                        f"Cloudiway still reported NotStarted after {start_age}s. "
+                        f"StartJobs was sent once more for object {object_id}; response="
+                        + json.dumps(retry_response, default=str)[:1000],
+                    )
+                elif previous_status == "starting" and request_state == "start_retry_requested":
+                    # Do not loop forever. Return the user to a startable state
+                    # and raise a clear issue after the second request fails to
+                    # transition.
+                    status = "ready"
+                    cloud_status = "not_started"
+                    error_message = (
+                        "Cloudiway remained NotStarted after two StartJobs requests. "
+                        "The user is still prepared and the credential is retained; "
+                        "review Cloudiway and use Start again."
+                    )
+                    not_started += 1
+                else:
+                    status = "ready"
+                    cloud_status = "not_started"
+                    not_started += 1
+                    clear_user_issue(
+                        int(row["id"]),
+                        "Cloudiway reports this migration has not started yet.",
+                    )
             else:
                 if job_state in ("migrating", "completed", "failed", "attention"):
                     status = job_state
@@ -871,6 +919,18 @@ async def refresh_status() -> dict:
                     int(row["id"]),
                     effective_code,
                     error_message or "Cloudiway returned a migration issue requiring review.",
+                )
+            elif (
+                status == "ready"
+                and cloud_status == "not_started"
+                and error_message
+                and "two StartJobs requests" in error_message
+            ):
+                record_user_issue(
+                    int(row["id"]),
+                    "cloudiway_start_not_started",
+                    error_message,
+                    category="cloudiway",
                 )
 
             updated += 1
@@ -2285,6 +2345,36 @@ async def prepare_migration_batch(migration_batch_id: int) -> dict:
     }
 
 
+def _assert_cloudiway_command_accepted(result, action: str) -> None:
+    """Treat Cloudiway HTTP-200 envelopes with an application-level error as failures."""
+    if result is None:
+        return
+    if not isinstance(result, dict):
+        return
+
+    if result.get("isSuccess") is False:
+        raise RuntimeError(
+            f"Cloudiway {action} was rejected: "
+            + json.dumps(result, default=str)[:1200]
+        )
+
+    top_error = result.get("error")
+    if top_error not in (None, "", [], {}):
+        raise RuntimeError(
+            f"Cloudiway {action} returned an error: "
+            + json.dumps(result, default=str)[:1200]
+        )
+
+    response = result.get("responseData")
+    if isinstance(response, dict):
+        nested_error = response.get("error")
+        if nested_error not in (None, "", [], {}):
+            raise RuntimeError(
+                f"Cloudiway {action} returned an error: "
+                + json.dumps(result, default=str)[:1200]
+            )
+
+
 async def start_migration_batch(migration_batch_id: int) -> dict:
     """Start one selected batch, restarting existing errored Cloudiway objects in place."""
     with conn() as db:
@@ -2358,11 +2448,21 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
     ]
 
     if start_ids:
-        await cloud.start_migration(start_ids)
+        start_response = await cloud.start_migration(start_ids)
+        _assert_cloudiway_command_accepted(start_response, "StartJobs")
+        log_event(
+            None,
+            "cloudiway_startjobs_response",
+            "Cloudiway StartJobs accepted for object IDs "
+            + ",".join(str(x) for x in start_ids)
+            + "; response="
+            + json.dumps(start_response, default=str)[:1200],
+        )
 
     restarted_user_ids: list[int] = []
     for uid, oid in restart_rows:
-        await cloud.restart_migration(oid)
+        restart_response = await cloud.restart_migration(oid)
+        _assert_cloudiway_command_accepted(restart_response, "Restart")
         restarted_user_ids.append(uid)
         log_event(
             uid,
@@ -2384,7 +2484,7 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
                             WHEN cloudiway_status='restart_required' THEN 'restart_requested'
                             ELSE 'start_requested'
                         END,
-                        batch_started_at=COALESCE(batch_started_at,CURRENT_TIMESTAMP),
+                        batch_started_at=CURRENT_TIMESTAMP,
                         error_message=NULL,
                         updated_at=CURRENT_TIMESTAMP
                     WHERE id IN ({placeholders})""",
