@@ -853,3 +853,152 @@ def test_start_restart_button_visible_for_locally_migrating_cloudiway_record(mon
     assert "Cloudiway #430" in page.text
     assert "Start / Restart" in page.text
     assert f'/cloudiway/user/{uid}/start-again' in page.text
+
+
+
+def test_manual_restart_does_not_trust_local_migrating_when_cloudiway_state_is_unknown_and_progress_is_zero(monkeypatch):
+    from app import service
+
+    class Cloud:
+        def __init__(self):
+            self.started = []
+
+        async def job_status(self, object_id):
+            # Simulates a Cloudiway response whose numeric/opaque state cannot
+            # be translated by Swagger into a named enum.
+            return {"isSuccess": True, "responseData": {"jobStatus": 0}, "error": []}
+
+        async def progress(self, object_id, since_minutes):
+            return {
+                "isSuccess": True,
+                "message": "GetMailProgress done",
+                "responseData": {
+                    "blockId": object_id,
+                    "migratedEmails": 0,
+                    "errorEmails": 0,
+                    "ignoredEmails": 0,
+                    "totalEmails": 0,
+                    "recentMigratedEmails": 0,
+                    "windowMinutes": 1,
+                    "startDateTime": None,
+                    "lastActivityDateTime": None,
+                    "error": [],
+                },
+                "error": [],
+            }
+
+        async def start_migration(self, object_ids):
+            self.started.append(list(object_ids))
+            return {"isSuccess": True, "message": "StartJobs done", "error": []}
+
+    cloud = Cloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,
+                   cloudiway_status,migration_status
+               ) VALUES(?,?,?,?,?)""",
+            (
+                "false.running@jcf.gov.jm",
+                "false.running@jcf.gov.jm",
+                427,
+                "migrating",
+                "migrating",
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='false.running@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    import asyncio
+    result = asyncio.run(service.restart_stuck_cloudiway_user(uid))
+
+    assert result["started"] is True
+    assert result["action"] == "StartJobs"
+    assert result["live_state"] is None
+    assert result["progress_has_activity"] is False
+    assert cloud.started == [[427]]
+
+    with conn() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+    assert row["migration_status"] == "starting"
+    assert row["cloudiway_status"] == "manual_start_requested"
+
+
+def test_manual_restart_blocks_only_confirmed_running_with_real_progress_activity(monkeypatch):
+    from app import service
+
+    class Cloud:
+        def __init__(self):
+            self.started = []
+
+        async def job_status(self, object_id):
+            return {"isSuccess": True, "responseData": {"status": "Working"}, "error": []}
+
+        async def progress(self, object_id, since_minutes):
+            return {
+                "isSuccess": True,
+                "responseData": {
+                    "blockId": object_id,
+                    "migratedEmails": 10,
+                    "errorEmails": 0,
+                    "ignoredEmails": 0,
+                    "totalEmails": 100,
+                    "startDateTime": "2026-10-12T15:00:00Z",
+                    "lastActivityDateTime": "2026-10-12T15:05:00Z",
+                    "error": [],
+                },
+                "error": [],
+            }
+
+        async def start_migration(self, object_ids):
+            self.started.append(list(object_ids))
+            return {"isSuccess": True, "error": []}
+
+    cloud = Cloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+
+    with conn() as db:
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,
+                   cloudiway_status,migration_status
+               ) VALUES(?,?,?,?,?)""",
+            ("real.running@jcf.gov.jm","real.running@jcf.gov.jm",500,"migrating","migrating"),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='real.running@jcf.gov.jm'"
+        ).fetchone()["id"])
+
+    import asyncio
+    result = asyncio.run(service.restart_stuck_cloudiway_user(uid))
+
+    assert result["started"] is False
+    assert "actively running" in result["reason"]
+    assert cloud.started == []
+
+
+def test_job_status_parser_does_not_treat_arbitrary_name_field_as_state():
+    from app import service
+    state, _ = service.parse_cloudiway_job_status(
+        {
+            "isSuccess": True,
+            "responseData": {
+                "name": "migrating",
+                "jobStatus": 0,
+            },
+            "error": [],
+        }
+    )
+    assert state is None
