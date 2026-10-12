@@ -2264,8 +2264,10 @@ async def migration_batch_start(request: Request, migration_batch_id: int):
         result = await start_migration_batch(migration_batch_id)
         if result.get("started"):
             request.session["workflow_notice"] = (
-                f"Migration started for {result.get('users_started', 0)} user(s) in "
-                f"Cloudiway batch {result.get('cloudiway_batch_id')}."
+                f"Cloudiway start request sent for {result.get('users_started', 0)} new user(s) "
+                f"and {result.get('users_restarted', 0)} restart(s) in batch "
+                f"{result.get('cloudiway_batch_id')}. The app will show MIGRATING only after "
+                "Cloudiway's live job status confirms Scheduled/Pending/Working."
             )
         else:
             request.session["workflow_error"] = str(result.get("reason") or "Batch could not be started")
