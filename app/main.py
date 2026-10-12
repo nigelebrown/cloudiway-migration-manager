@@ -65,6 +65,21 @@ templates = Jinja2Templates(directory="app/templates")
 _poller_task: asyncio.Task | None = None
 _login_attempts: dict[str, deque[float]] = defaultdict(deque)
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
+DIRECT_PASSWORD_MODES = ("existing_password", "existing_password_retry")
+
+
+def _direct_email_domain() -> str:
+    domain = (get_setting("direct_email_domain") or "jcf.gov.jm").strip().lower()
+    return domain.lstrip("@").strip()
+
+
+def _resolve_direct_email(value) -> str:
+    raw = _clean_cell(value).lower()
+    if not raw:
+        return ""
+    if "@" not in raw:
+        raw = f"{raw}@{_direct_email_domain()}"
+    return raw if EMAIL_RE.fullmatch(raw) else ""
 
 @app.middleware("http")
 async def diagnostic_request_log(request: Request, call_next):
@@ -435,6 +450,7 @@ async def settings_page(request: Request):
             "source_pool": get_setting("cloudiway_source_pool_id") or "",
             "target_pool": get_setting("cloudiway_target_pool_id") or "",
             "cloudiway_pools": pools,
+            "direct_email_domain": _direct_email_domain(),
             "error": request.session.pop("settings_error", None),
             "notice": request.session.pop("settings_notice", None),
         },
@@ -851,6 +867,21 @@ async def cloudiway_disconnect(request: Request):
     return RedirectResponse("/settings", 303)
 
 
+@app.post("/settings/direct-migration")
+async def save_direct_migration_settings(
+    request: Request,
+    email_domain: str = Form(...),
+):
+    require_admin(request)
+    domain = str(email_domain or "").strip().lower().lstrip("@")
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", domain, re.I):
+        request.session["settings_error"] = "Enter a valid email domain, for example jcf.gov.jm."
+        return RedirectResponse("/settings", 303)
+    set_setting("direct_email_domain", domain)
+    request.session["settings_notice"] = f"Direct migration email domain saved: {domain}"
+    return RedirectResponse("/settings", 303)
+
+
 @app.post("/settings/cloudiway/pools")
 async def save_pools(
     request: Request,
@@ -971,8 +1002,7 @@ async def download_existing_password_template(request: Request):
     ws = wb.active
     ws.title = "Cloudiway Existing Password"
     headers = [
-        "source_email",
-        "target_email",
+        "username",
         "password",
         "first_name",
         "middle_name",
@@ -981,8 +1011,7 @@ async def download_existing_password_template(request: Request):
     ]
     ws.append(headers)
     ws.append([
-        "john.brown@jcf.gov.jm",
-        "john.brown@jcf.gov.jm",
+        "john.brown",
         "ExistingSourcePasswordHere",
         "John",
         "A.",
@@ -992,7 +1021,7 @@ async def download_existing_password_template(request: Request):
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="1F4E78")
-    widths = [34, 34, 34, 20, 18, 22, 18]
+    widths = [34, 34, 20, 18, 22, 18]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + idx)].width = width
     ws.freeze_panes = "A2"
@@ -1000,8 +1029,7 @@ async def download_existing_password_template(request: Request):
     info = wb.create_sheet("Instructions")
     rows = [
         ["Field", "Required", "Purpose"],
-        ["source_email", "Yes", "Existing Rackspace/IMAP source mailbox username."],
-        ["target_email", "Yes", "Existing Microsoft 365 target mailbox."],
+        ["username", "Yes", "Source mailbox username. If it has no @domain, the configured Direct Migration Email Domain is appended automatically. The resolved email is used as both source and target."],
         ["password", "Yes", "Current source mailbox password. Stored encrypted; AD and Rackspace password changes are bypassed."],
         ["first_name", "No", "Optional display/reference field only in this mode."],
         ["middle_name", "No", "Optional display/reference field only in this mode."],
@@ -1043,7 +1071,7 @@ async def upload_users(
 ):
     require_admin(request)
 
-    if workflow_mode not in ("manual_bulk", "automatic", "existing_password"):
+    if workflow_mode not in ("manual_bulk", "automatic", "existing_password", "existing_password_retry"):
         workflow_mode = "manual_bulk"
 
     raw = await file.read()
@@ -1072,6 +1100,8 @@ async def upload_users(
         "middlename": "middle_name",
         "middle name": "middle_name",
         "username": "source_email",
+        "user name": "source_email",
+        "user_name": "source_email",
         "sourceemail": "source_email",
         "source email address": "source_email",
         "targetemail": "target_email",
@@ -1090,8 +1120,8 @@ async def upload_users(
         "rackspacepassword": "password",
     }
     df.rename(columns={col: aliases.get(col, col) for col in df.columns}, inplace=True)
-    if workflow_mode == "existing_password":
-        required_columns = {"source_email", "target_email", "password"}
+    if workflow_mode in DIRECT_PASSWORD_MODES:
+        required_columns = {"source_email", "password"}
     else:
         required_columns = {"computer_number", "source_email", "target_email", "first_name", "last_name"}
     missing_columns = sorted(required_columns - set(df.columns))
@@ -1102,8 +1132,8 @@ async def upload_users(
             context={
                 "request": request,
                 "error": "Missing required upload column(s): " + ", ".join(missing_columns)
-                + (". For Cloudiway-only existing-password mode, source_email, target_email and password are required."
-                   if workflow_mode == "existing_password"
+                + (". For direct Cloudiway password modes, username/email and password are required; source and target are resolved to the same email."
+                   if workflow_mode in DIRECT_PASSWORD_MODES
                    else ". Download and use the standard JCF upload template.")
             },
             status_code=400,
@@ -1125,7 +1155,7 @@ async def upload_users(
                 file.filename,
                 workflow_mode,
                 "staged",
-                None if workflow_mode == "existing_password" else (int(get_active_profile()["id"]) if get_active_profile() else None),
+                None if workflow_mode in DIRECT_PASSWORD_MODES else (int(get_active_profile()["id"]) if get_active_profile() else None),
                 0,
                 total_rows,
             ),
@@ -1139,8 +1169,12 @@ async def upload_users(
 
         row_order = 0
         for _, row in df.iterrows():
-            src = _clean_cell(row.get("source_email")).lower()
-            tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
+            if workflow_mode in DIRECT_PASSWORD_MODES:
+                src = _resolve_direct_email(row.get("source_email"))
+                tgt = src
+            else:
+                src = _clean_cell(row.get("source_email")).lower()
+                tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
             if not EMAIL_RE.fullmatch(src) or not EMAIL_RE.fullmatch(tgt):
                 skipped += 1
                 continue
@@ -1151,7 +1185,7 @@ async def upload_users(
             computer_number = _clean_cell(row.get("computer_number"))
             raw_password = row.get("password")
             supplied_password = "" if raw_password is None or pd.isna(raw_password) else str(raw_password)
-            if workflow_mode == "existing_password":
+            if workflow_mode in DIRECT_PASSWORD_MODES:
                 if not supplied_password:
                     skipped += 1
                     continue
@@ -1174,7 +1208,8 @@ async def upload_users(
                     workflow_mode == "existing_password"
                     and existing_status in ("failed", "attention", "timed_out")
                 )
-                if not retry_existing_error and (
+                explicit_recovery = workflow_mode == "existing_password_retry"
+                if not (retry_existing_error or explicit_recovery) and (
                     existing_status in ("preparing", "ready", "migrating", "completed")
                     or int(existing.get("assigned") or 0) > 0
                 ):
@@ -1211,16 +1246,16 @@ async def upload_users(
             # Keep Cloudiway source credentials in dedicated fields so an
             # uploaded existing password can never be confused with a password
             # generated/reset by the application.
-            source_credential_username = src if workflow_mode == "existing_password" else None
+            source_credential_username = src if workflow_mode in DIRECT_PASSWORD_MODES else None
             source_credential_password_enc = (
-                encrypt_secret(supplied_password) if workflow_mode == "existing_password" else None
+                encrypt_secret(supplied_password) if workflow_mode in DIRECT_PASSWORD_MODES else None
             )
             rackspace_state = (
                 "existing_password"
-                if workflow_mode == "existing_password"
+                if workflow_mode in DIRECT_PASSWORD_MODES
                 else ("not_generated" if workflow_mode == "manual_bulk" else "pending")
             )
-            provisioning_state = "bypassed" if workflow_mode == "existing_password" else "not_checked"
+            provisioning_state = "bypassed" if workflow_mode in DIRECT_PASSWORD_MODES else "not_checked"
             db.execute(
                 """UPDATE users
                    SET generated_password_enc=NULL,
@@ -1232,15 +1267,15 @@ async def upload_users(
                        manual_password_confirmed_at=NULL,
                        rackspace_status=?,
                        provisioning_status=?,
-                       ad_match_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
-                       entra_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
-                       license_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
-                       mailbox_status=CASE WHEN ?='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
-                       cloudiway_status='not_submitted',
-                       migration_status='waiting',
-                       progress_percent=NULL,
-                       progress_detail=NULL,
-                       error_message=NULL,
+                       ad_match_status=CASE WHEN ? IN ('existing_password','existing_password_retry') THEN 'bypassed' ELSE 'not_checked' END,
+                       entra_status=CASE WHEN ? IN ('existing_password','existing_password_retry') THEN 'bypassed' ELSE 'not_checked' END,
+                       license_status=CASE WHEN ? IN ('existing_password','existing_password_retry') THEN 'bypassed' ELSE 'not_checked' END,
+                       mailbox_status=CASE WHEN ? IN ('existing_password','existing_password_retry') THEN 'bypassed' ELSE 'not_checked' END,
+                       cloudiway_status=CASE WHEN ?='existing_password_retry' THEN cloudiway_status ELSE 'not_submitted' END,
+                       migration_status=CASE WHEN ?='existing_password_retry' THEN migration_status ELSE 'waiting' END,
+                       progress_percent=CASE WHEN ?='existing_password_retry' THEN progress_percent ELSE NULL END,
+                       progress_detail=CASE WHEN ?='existing_password_retry' THEN progress_detail ELSE NULL END,
+                       error_message=CASE WHEN ?='existing_password_retry' THEN error_message ELSE NULL END,
                        batch_number=NULL,
                        batch_started_at=NULL,
                        updated_at=CURRENT_TIMESTAMP
@@ -1248,10 +1283,15 @@ async def upload_users(
                 (
                     source_credential_username,
                     source_credential_password_enc,
-                    "uploaded_excel" if workflow_mode == "existing_password" else None,
+                    ("uploaded_recovery" if workflow_mode == "existing_password_retry" else "uploaded_excel") if workflow_mode in DIRECT_PASSWORD_MODES else None,
                     workflow_mode,
                     rackspace_state,
                     provisioning_state,
+                    workflow_mode,
+                    workflow_mode,
+                    workflow_mode,
+                    workflow_mode,
+                    workflow_mode,
                     workflow_mode,
                     workflow_mode,
                     workflow_mode,
@@ -1291,7 +1331,7 @@ async def upload_users(
         f"Upload {batch_name} staged with {imported} user(s). "
         + (
             "Choose how many users to push to Cloudiway next; the supplied source passwords are already stored encrypted."
-            if workflow_mode == "existing_password"
+            if workflow_mode in DIRECT_PASSWORD_MODES
             else "Choose how many users to process next; passwords will only be generated for that selection."
         )
     )
@@ -1307,8 +1347,8 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                           SUM(mbm.user_id IS NOT NULL) AS assigned_count,
                           SUM(mbm.user_id IS NULL
                               AND u.migration_status='waiting'
-                              AND (ub.workflow_mode='existing_password' OR u.cloudiway_object_id IS NULL)
-                              AND (ub.workflow_mode='existing_password' OR u.generated_password_enc IS NULL)) AS available_count,
+                              AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.cloudiway_object_id IS NULL)
+                              AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.generated_password_enc IS NULL)) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -1341,8 +1381,8 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                           SUM(mbm.user_id IS NOT NULL) AS assigned_count,
                           SUM(mbm.user_id IS NULL
                               AND u.migration_status='waiting'
-                              AND (ub.workflow_mode='existing_password' OR u.cloudiway_object_id IS NULL)
-                              AND (ub.workflow_mode='existing_password' OR u.generated_password_enc IS NULL)) AS available_count,
+                              AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.cloudiway_object_id IS NULL)
+                              AND (ub.workflow_mode IN ('existing_password','existing_password_retry') OR u.generated_password_enc IS NULL)) AS available_count,
                           SUM(u.migration_status='migrating') AS migrating_count,
                           SUM(u.migration_status='completed') AS completed_count,
                           SUM(u.migration_status IN ('failed','attention','timed_out')) AS problem_count
@@ -1394,11 +1434,11 @@ def _workflow_context(upload_batch_id: int | None = None) -> dict:
                     if not m.get("migration_batch_id")
                     and m.get("migration_status") == "waiting"
                     and (
-                        upload.get("workflow_mode") == "existing_password"
+                        upload.get("workflow_mode") in DIRECT_PASSWORD_MODES
                         or not m.get("cloudiway_object_id")
                     )
                     and (
-                        upload.get("workflow_mode") == "existing_password"
+                        upload.get("workflow_mode") in DIRECT_PASSWORD_MODES
                         or m.get("rackspace_status") in ("not_generated", "pending")
                     )
                 ]
@@ -1497,8 +1537,8 @@ async def workflow_generate_batch(
     if not upload:
         raise HTTPException(status_code=404, detail="Upload batch not found")
 
-    profile = None if upload["workflow_mode"] == "existing_password" else get_active_profile()
-    if upload["workflow_mode"] != "existing_password" and not profile:
+    profile = None if upload["workflow_mode"] in DIRECT_PASSWORD_MODES else get_active_profile()
+    if upload["workflow_mode"] not in DIRECT_PASSWORD_MODES and not profile:
         request.session["workflow_error"] = (
             "No AD/Microsoft 365 environment profile is active. Configure and activate TEST or PRODUCTION first."
         )
@@ -1518,8 +1558,8 @@ async def workflow_generate_batch(
                JOIN users u ON u.id=ubm.user_id
                WHERE ubm.upload_batch_id=?
                  AND u.migration_status='waiting'
-                 AND (?='existing_password' OR u.cloudiway_object_id IS NULL)
-                 AND (?='existing_password' OR u.generated_password_enc IS NULL)
+                 AND (? IN ('existing_password','existing_password_retry') OR u.cloudiway_object_id IS NULL)
+                 AND (? IN ('existing_password','existing_password_retry') OR u.generated_password_enc IS NULL)
                  AND NOT EXISTS (
                      SELECT 1
                      FROM migration_batch_members mbm
@@ -1581,7 +1621,7 @@ async def workflow_generate_batch(
                 upload_batch_id,
                 seq,
                 batch_name,
-                "ready_for_cloudiway" if upload["workflow_mode"] == "existing_password" else "identity_pending",
+                "ready_for_cloudiway" if upload["workflow_mode"] in DIRECT_PASSWORD_MODES else "identity_pending",
                 int(profile["id"]) if profile else None,
                 1 if auto_start else 0,
                 batch_name,
@@ -1599,8 +1639,8 @@ async def workflow_generate_batch(
             db.execute(
                 """UPDATE users
                    SET provisioning_profile_id=?,
-                       provisioning_status=CASE WHEN password_reset_method='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
-                       ad_match_status=CASE WHEN password_reset_method='existing_password' THEN 'bypassed' ELSE 'not_checked' END,
+                       provisioning_status=CASE WHEN password_reset_method IN ('existing_password','existing_password_retry') THEN 'bypassed' ELSE 'not_checked' END,
+                       ad_match_status=CASE WHEN password_reset_method IN ('existing_password','existing_password_retry') THEN 'bypassed' ELSE 'not_checked' END,
                        ad_conflict_reason=NULL,
                        provisioning_error=NULL,batch_number=?,
                        rackspace_status=CASE
@@ -1629,15 +1669,22 @@ async def workflow_generate_batch(
         )
         return RedirectResponse(f"/workflow/{upload_batch_id}", 303)
 
-    if upload["workflow_mode"] == "existing_password":
+    if upload["workflow_mode"] in DIRECT_PASSWORD_MODES:
         try:
             prepared = await prepare_migration_batch(migration_batch_id)
             if prepared.get("ready"):
-                request.session["workflow_notice"] = (
-                    f"{batch_name} created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
-                    "AD and Rackspace password-reset steps were bypassed. The supplied Excel passwords were "
-                    "registered with Cloudiway and the batch is ready to migrate."
-                )
+                if upload["workflow_mode"] == "existing_password_retry":
+                    request.session["workflow_notice"] = (
+                        f"{batch_name} recovery group created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
+                        "Existing Cloudiway objects were checked. Failed/attention objects had the supplied password pushed again "
+                        "and were marked for in-place restart; running/completed objects were not restarted."
+                    )
+                else:
+                    request.session["workflow_notice"] = (
+                        f"{batch_name} created with {len(selected_ids)} user(s); Cloudiway batch ID {cloud_batch_id}. "
+                        "AD and Rackspace password-reset steps were bypassed. The supplied Excel passwords were "
+                        "registered with Cloudiway and the batch is ready to migrate."
+                    )
                 if auto_start:
                     started = await start_migration_batch(migration_batch_id)
                     if started.get("started"):
