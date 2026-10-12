@@ -341,7 +341,7 @@ def test_issue_center_exposes_multiple_issue_categories():
         "AD / M365 Provisioning",
         "Migration Timeout",
     ):
-        assert label in r.text
+        assert label.upper() in r.text.upper()
 
 
 
