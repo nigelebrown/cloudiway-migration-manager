@@ -758,6 +758,22 @@ async def refresh_status() -> dict:
                        WHERE id=?""",
                     (status, percent, detail, cloud_status, error_message, row["id"]),
                 )
+
+            if status in ("failed", "attention"):
+                effective_code = issue_code or (
+                    "cloudiway_status_attention" if status == "attention" else "cloudiway_status_failed"
+                )
+                record_user_issue(
+                    int(row["id"]),
+                    effective_code,
+                    error_message or "Cloudiway returned a migration issue requiring review.",
+                )
+            elif status in ("migrating", "completed"):
+                clear_user_issue(
+                    int(row["id"]),
+                    "Cloudiway migration is running normally." if status == "migrating" else "Cloudiway migration completed.",
+                )
+
             updated += 1
             completed += int(status == "completed")
             failed += int(status == "failed")
@@ -786,6 +802,16 @@ async def refresh_status() -> dict:
                 timed_out = len(ids)
 
     if timed_out:
+        with conn() as db:
+            timed_out_rows = db.execute(
+                "SELECT id FROM users WHERE migration_status='timed_out' AND cloudiway_status='timed_out'"
+            ).fetchall()
+        for timed_row in timed_out_rows:
+            record_user_issue(
+                int(timed_row["id"]),
+                "timed_out",
+                "Migration exceeded the configured timeout; review Cloudiway before retrying.",
+            )
         log_event(None, "batch_timeout", f"{timed_out} migration(s) exceeded the configured timeout")
 
     if (failed or attention or timed_out) and settings.pause_on_any_failure:
