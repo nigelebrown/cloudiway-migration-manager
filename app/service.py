@@ -2627,7 +2627,7 @@ def refresh_upload_batch_states() -> None:
                       SUM(u.migration_status='completed') completed,
                       SUM(u.migration_status IN ('failed','attention','timed_out')) problems,
                       SUM(u.migration_status='migrating') migrating,
-                      SUM(u.migration_status='starting') starting,
+                      SUM(u.migration_status='starting') starting_count,
                       SUM(u.migration_status='ready') ready
                FROM migration_batches mb
                LEFT JOIN migration_batch_members m ON m.migration_batch_id=mb.id
@@ -2640,7 +2640,7 @@ def refresh_upload_batch_states() -> None:
             completed = int(row["completed"] or 0)
             problems = int(row["problems"] or 0)
             migrating = int(row["migrating"] or 0)
-            starting = int(row["starting"] or 0)
+            starting = int(row["starting_count"] or 0)
             ready = int(row["ready"] or 0)
             new_status = None
             if total and completed == total:
