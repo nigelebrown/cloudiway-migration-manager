@@ -75,6 +75,7 @@ class Cloud:
     async def register_source_credentials(self,t,u,p): self.creds.append((u,p)); return {}
     async def add_mail_batch_members(self,b,o): return {}
     async def start_migration(self,o): self.started.append(list(o)); return {}
+    async def start_mail_migration(self,o,batch_ids=None): self.started.append(list(o)); return {"isSuccess":True,"message":"StartMailJobs done","error":[]}
     async def progress(self,oid,since_minutes): return {"status":"Completed","percentage":100}
 
 def fakes(monkeypatch):
