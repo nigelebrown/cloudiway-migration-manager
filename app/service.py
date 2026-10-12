@@ -964,7 +964,7 @@ def record_user_issue(
 
     with conn() as db:
         row = db.execute(
-            """SELECT issue_code,issue_status,auto_recovery_attempts,
+            """SELECT issue_code,issue_status,auto_recovery_attempts,cloudiway_object_id,
                       source_credential_password_enc,generated_password_enc
                FROM users WHERE id=?""",
             (user_id,),
@@ -982,6 +982,7 @@ def record_user_issue(
             category == "credentials"
             and enabled
             and credential_available
+            and bool(row.get("cloudiway_object_id"))
             and attempts < max_attempts
         )
         manual_required = not auto_eligible
@@ -1191,6 +1192,13 @@ def sync_local_issue_states() -> None:
                  AND provisioning_status NOT IN ('m365_ready','bypassed')
                  AND migration_status IN ('waiting','preparing','ready')"""
         ).fetchall()
+        uncategorized = db.execute(
+            """SELECT id,migration_status,cloudiway_object_id,error_message
+               FROM users
+               WHERE migration_status IN ('failed','attention','timed_out')
+                 AND (issue_code IS NULL OR issue_status IN ('none','resolved'))
+                 AND error_message IS NOT NULL AND error_message<>''"""
+        ).fetchall()
 
     for row in ad_rows:
         record_user_issue(
@@ -1206,6 +1214,33 @@ def sync_local_issue_states() -> None:
             row.get("provisioning_error") or "AD/Microsoft 365 provisioning requires review.",
             category="provisioning",
         )
+
+    for row in uncategorized:
+        uid = int(row["id"])
+        message = str(row.get("error_message") or "")
+        if row.get("migration_status") == "timed_out":
+            record_user_issue(uid, "timed_out", message, category="timeout")
+            continue
+        status_override, issue_code, friendly = classify_cloudiway_issue(
+            {"status": row.get("migration_status")},
+            {"logs": [message]},
+        )
+        if issue_code:
+            record_user_issue(uid, issue_code, friendly or message)
+        elif not row.get("cloudiway_object_id"):
+            record_user_issue(
+                uid,
+                "cloudiway_submission_failed",
+                message or "The user did not reach Cloudiway successfully.",
+                category="cloudiway",
+            )
+        else:
+            record_user_issue(
+                uid,
+                "cloudiway_status_failed" if row.get("migration_status") == "failed" else "cloudiway_status_attention",
+                message or "Migration requires review.",
+                category="cloudiway",
+            )
 
 
 async def process_background_issues() -> dict:
