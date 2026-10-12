@@ -2286,11 +2286,19 @@ async def cloudiway_user_start_again(request: Request, user_id: int):
         raise HTTPException(status_code=404, detail="User or migration batch not found")
     try:
         result = await restart_stuck_cloudiway_user(int(user_id))
-        if result.get("started"):
+        if result.get("confirmed_running"):
             request.session["workflow_notice"] = (
-                f"Cloudiway start/restart requested for object "
-                f"{result.get('cloudiway_object_id')}. The app will show MIGRATING "
-                "only after Cloudiway confirms Scheduled/Pending/Working."
+                f"Cloudiway object {result.get('cloudiway_object_id')} is confirmed running."
+            )
+        elif result.get("started"):
+            request.session["workflow_notice"] = (
+                f"Cloudiway {result.get('action') or 'start'} request was sent for object "
+                f"{result.get('cloudiway_object_id')}, but Cloudiway has not yet confirmed "
+                "a running state. The app will keep checking in the background."
+            )
+        elif result.get("state") == "migrating":
+            request.session["workflow_notice"] = str(
+                result.get("reason") or "Cloudiway confirms this migration is already running."
             )
         else:
             request.session["workflow_error"] = str(
