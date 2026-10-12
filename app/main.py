@@ -1002,7 +1002,8 @@ async def download_existing_password_template(request: Request):
     ws = wb.active
     ws.title = "Cloudiway Existing Password"
     headers = [
-        "username",
+        "source_email",
+        "target_email",
         "password",
         "first_name",
         "middle_name",
@@ -1011,7 +1012,8 @@ async def download_existing_password_template(request: Request):
     ]
     ws.append(headers)
     ws.append([
-        "john.brown",
+        "john.brown@jcf.gov.jm",
+        "john.brown@jcf.gov.jm",
         "ExistingSourcePasswordHere",
         "John",
         "A.",
@@ -1021,7 +1023,7 @@ async def download_existing_password_template(request: Request):
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="1F4E78")
-    widths = [34, 34, 20, 18, 22, 18]
+    widths = [34, 34, 34, 20, 18, 22, 18]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + idx)].width = width
     ws.freeze_panes = "A2"
@@ -1029,7 +1031,8 @@ async def download_existing_password_template(request: Request):
     info = wb.create_sheet("Instructions")
     rows = [
         ["Field", "Required", "Purpose"],
-        ["username", "Yes", "Source mailbox username. If it has no @domain, the configured Direct Migration Email Domain is appended automatically. The resolved email is used as both source and target."],
+        ["source_email", "Yes", "Existing Rackspace/IMAP source mailbox username. A username without @domain is also accepted and uses the configured Direct Migration Email Domain."],
+        ["target_email", "No", "Target Microsoft 365 mailbox. If blank, the resolved source email is used as the target."],
         ["password", "Yes", "Current source mailbox password. Stored encrypted; AD and Rackspace password changes are bypassed."],
         ["first_name", "No", "Optional display/reference field only in this mode."],
         ["middle_name", "No", "Optional display/reference field only in this mode."],
@@ -1052,6 +1055,55 @@ async def download_existing_password_template(request: Request):
         out,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="JCF_Cloudiway_Existing_Password_Upload_Template.xlsx"'},
+    )
+
+
+@app.get("/upload/recovery-template.xlsx")
+async def download_cloudiway_recovery_template(request: Request):
+    require_admin(request)
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cloudiway Error Recovery"
+    headers = ["username", "password", "first_name", "middle_name", "last_name", "computer_number"]
+    ws.append(headers)
+    ws.append(["john.brown", "CurrentSourcePasswordHere", "John", "A.", "Brown", "14323"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="7C2D12")
+    widths = [34, 34, 20, 18, 22, 18]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + idx)].width = width
+    ws.freeze_panes = "A2"
+
+    info = wb.create_sheet("Instructions")
+    rows = [
+        ["Field", "Required", "Purpose"],
+        ["username", "Yes", "Existing Cloudiway/Rackspace mailbox username. If no @domain is present, the configured Direct Migration Email Domain is appended. The resolved address is used as source and target unless target_email is supplied."],
+        ["password", "Yes", "Current source mailbox password to push back into the existing Cloudiway object before restart."],
+        ["first_name", "No", "Reference only."],
+        ["middle_name", "No", "Reference only."],
+        ["last_name", "No", "Reference only."],
+        ["computer_number", "No", "Reference only; AD is bypassed in recovery mode."],
+    ]
+    for row in rows:
+        info.append(row)
+    for cell in info[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="7C2D12")
+    info.column_dimensions["A"].width = 22
+    info.column_dimensions["B"].width = 12
+    info.column_dimensions["C"].width = 105
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="JCF_Cloudiway_Error_Recovery_Template.xlsx"'},
     )
 
 
@@ -1171,7 +1223,8 @@ async def upload_users(
         for _, row in df.iterrows():
             if workflow_mode in DIRECT_PASSWORD_MODES:
                 src = _resolve_direct_email(row.get("source_email"))
-                tgt = src
+                supplied_target = _clean_cell(row.get("target_email")) if "target_email" in df.columns else ""
+                tgt = _resolve_direct_email(supplied_target) if supplied_target else src
             else:
                 src = _clean_cell(row.get("source_email")).lower()
                 tgt = _clean_cell(row.get("target_email")).lower() if "target_email" in df.columns else ""
