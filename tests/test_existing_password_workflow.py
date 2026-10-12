@@ -378,3 +378,109 @@ def test_admin_reveal_shows_exact_username_sent_to_cloudiway_and_uploaded_passwo
     assert payload["username_sent_to_cloudiway"] == "one@rack.example"
     assert payload["password"] == "0012A#$"
     assert payload["password_source"] == "uploaded_excel"
+
+
+
+def test_individual_push_button_creates_one_user_cloudiway_group(monkeypatch):
+    cloud = configure_cloudiway(monkeypatch)
+
+    with TestClient(app) as client:
+        login(client)
+        upload_response = client.post(
+            "/upload",
+            files={"file": ("existing.csv", existing_password_csv(), "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        assert upload_response.status_code == 303
+
+        with conn() as db:
+            upload_id = int(db.execute("SELECT id FROM upload_batches").fetchone()["id"])
+            user_id = int(
+                db.execute(
+                    "SELECT id FROM users WHERE source_email='two@rack.example'"
+                ).fetchone()["id"]
+            )
+
+        page = client.get(f"/workflow/{upload_id}")
+        assert page.status_code == 200
+        assert f'/workflow/{upload_id}/push-user/{user_id}' in page.text
+        assert "Push This User" in page.text
+
+        response = client.post(
+            f"/workflow/{upload_id}/push-user/{user_id}",
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert len(cloud.credentials) == 1
+    _, username, password = cloud.credentials[0]
+    assert username == "two@rack.example"
+    assert password == "P@ss-Two-2026"
+    assert cloud.started == []
+
+    with conn() as db:
+        batch = db.execute("SELECT * FROM migration_batches").fetchone()
+        member = db.execute(
+            """SELECT u.source_email,u.migration_status,u.cloudiway_status
+               FROM migration_batch_members mbm
+               JOIN users u ON u.id=mbm.user_id
+               WHERE mbm.migration_batch_id=?""",
+            (batch["id"],),
+        ).fetchone()
+        remaining = db.execute(
+            """SELECT COUNT(*) c
+               FROM upload_batch_members ubm
+               JOIN users u ON u.id=ubm.user_id
+               WHERE ubm.upload_batch_id=?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM migration_batch_members mbm
+                     JOIN migration_batches mb ON mb.id=mbm.migration_batch_id
+                     WHERE mb.upload_batch_id=? AND mbm.user_id=u.id
+                 )""",
+            (upload_id, upload_id),
+        ).fetchone()["c"]
+
+    assert batch["selected_count"] == 1
+    assert batch["cloudiway_batch_id"] == 99001
+    assert batch["workflow_status"] == "ready_to_migrate"
+    assert member["source_email"] == "two@rack.example"
+    assert member["migration_status"] == "ready"
+    assert member["cloudiway_status"] == "credentials_set"
+    assert remaining == 2
+
+
+def test_workflow_does_not_require_preexisting_access_token_when_service_can_reauthenticate(monkeypatch):
+    from app import service
+
+    cloud = FakeCloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+    set_setting("cloudiway_token", "", True)
+    set_setting("cloudiway_source_pool_id", "4")
+    set_setting("cloudiway_target_pool_id", "3")
+
+    with TestClient(app) as client:
+        login(client)
+        client.post(
+            "/upload",
+            files={"file": ("existing.csv", existing_password_csv(), "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        with conn() as db:
+            upload_id = int(db.execute("SELECT id FROM upload_batches").fetchone()["id"])
+
+        response = client.post(
+            f"/workflow/{upload_id}/generate",
+            data={"quantity": "1"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert len(cloud.credentials) == 1
+    with conn() as db:
+        assert db.execute("SELECT COUNT(*) c FROM migration_batches").fetchone()["c"] == 1
