@@ -631,3 +631,56 @@ def test_cloudiway_missing_access_token_reauthenticates_when_keep_connected(monk
 
     client = asyncio.run(svc._cloudiway_client_ready())
     assert client.token == "fresh-token"
+
+
+
+def test_successful_mail_progress_envelope_without_status_is_migrating_not_attention():
+    from app.service import parse_progress
+
+    payload = {
+        "isSuccess": True,
+        "message": "GetMailProgress done",
+        "count": 1,
+        "responseData": {
+            "blockId": 427,
+            "migratedEmails": 0,
+            "errorEmails": 0,
+            "ignoredEmails": 0,
+            "totalEmails": 0,
+            "recentMigratedEmails": 0,
+            "windowMinutes": 1,
+            "startDateTime": None,
+            "lastActivityDateTime": None,
+            "error": [],
+        },
+        "error": [],
+    }
+    status, percent, detail = parse_progress(payload)
+    assert status == "migrating"
+    assert percent == 0.0
+    assert "GetMailProgress done" in detail
+
+
+def test_mail_progress_envelope_computes_safe_percent_from_counts():
+    from app.service import parse_progress
+
+    payload = {
+        "isSuccess": True,
+        "message": "GetMailProgress done",
+        "responseData": {
+            "blockId": 428,
+            "migratedEmails": 50,
+            "errorEmails": 0,
+            "ignoredEmails": 0,
+            "totalEmails": 100,
+            "recentMigratedEmails": 10,
+            "windowMinutes": 1,
+            "startDateTime": "2026-10-12T14:00:00Z",
+            "lastActivityDateTime": "2026-10-12T14:20:00Z",
+            "error": [],
+        },
+        "error": [],
+    }
+    status, percent, _ = parse_progress(payload)
+    assert status == "migrating"
+    assert percent == 50.0
