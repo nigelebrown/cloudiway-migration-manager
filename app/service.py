@@ -89,7 +89,23 @@ async def _cloudiway_reauthenticate() -> CloudiwayClient:
 
 
 async def _cloudiway_client_ready() -> CloudiwayClient:
-    client = _cloudiway_client()
+    # If the access token is missing but the administrator chose to keep the
+    # Cloudiway connection alive, transparently obtain a fresh session from the
+    # encrypted stored credentials. This lets workflows continue after token
+    # cleanup/expiry without forcing the operator back to Connections first.
+    try:
+        client = _cloudiway_client()
+    except RuntimeError as exc:
+        if "not connected" not in str(exc).lower():
+            raise
+        try:
+            client = await _cloudiway_reauthenticate()
+        except Exception as relogin_exc:
+            raise RuntimeError(
+                "Cloudiway is not connected and automatic reauthentication could not be completed. "
+                "Go to Connections, sign in to Cloudiway, and enable Keep Cloudiway Connected."
+            ) from relogin_exc
+
     expiration = get_setting("cloudiway_token_expiration")
     refresh = decrypt_secret(get_setting("cloudiway_refresh_token"))
 
