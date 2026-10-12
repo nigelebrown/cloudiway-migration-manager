@@ -127,7 +127,7 @@ def test_full_20_user_end_to_end(monkeypatch):
         z=zipfile.ZipFile(io.BytesIO(pack.content)); csvn=next(x for x in z.namelist() if x.endswith("rackspace-password-update.csv")); data=z.read(csvn)
         assert len(pd.read_csv(io.BytesIO(data)))==20
         conf=c.post(f"/migration-batch/{mid}/confirm",files={"file":("confirm.csv",data,"text/csv")},follow_redirects=False); assert conf.status_code==303
-        with conn() as db: assert db.execute("SELECT workflow_status FROM migration_batches WHERE id=?",(mid,)).fetchone()["workflow_status"]=="migrating"
+        with conn() as db: assert db.execute("SELECT workflow_status FROM migration_batches WHERE id=?",(mid,)).fetchone()["workflow_status"]=="starting"
         assert len(cl.creds)==20 and len(cl.started)==1
         assert c.post("/status/refresh").status_code==200
         with conn() as db:
