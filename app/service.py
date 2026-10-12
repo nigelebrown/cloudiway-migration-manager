@@ -1177,10 +1177,42 @@ async def recover_credential_issue(user_id: int, *, force: bool = False) -> dict
     }
 
 
+def sync_local_issue_states() -> None:
+    """Surface AD/provisioning issues in the same issue center."""
+    with conn() as db:
+        ad_rows = db.execute(
+            """SELECT id,ad_conflict_reason FROM users
+               WHERE ad_match_status IN ('manual_review','conflict','identity_conflict')
+                 AND migration_status IN ('waiting','preparing','ready')"""
+        ).fetchall()
+        provisioning_rows = db.execute(
+            """SELECT id,provisioning_error FROM users
+               WHERE provisioning_error IS NOT NULL AND provisioning_error<>''
+                 AND provisioning_status NOT IN ('m365_ready','bypassed')
+                 AND migration_status IN ('waiting','preparing','ready')"""
+        ).fetchall()
+
+    for row in ad_rows:
+        record_user_issue(
+            int(row["id"]),
+            "ad_manual_review",
+            row.get("ad_conflict_reason") or "Active Directory identity requires manual review.",
+            category="ad_identity",
+        )
+    for row in provisioning_rows:
+        record_user_issue(
+            int(row["id"]),
+            "provisioning_failed",
+            row.get("provisioning_error") or "AD/Microsoft 365 provisioning requires review.",
+            category="provisioning",
+        )
+
+
 async def process_background_issues() -> dict:
     """Handle actionable issues independently of the administrator web session."""
     enabled, _, max_attempts = _issue_recovery_settings()
     summary = {"checked": 0, "recovered": 0, "resolved": 0, "manual": 0, "errors": 0}
+    sync_local_issue_states()
     if not enabled or not get_setting("cloudiway_token"):
         return summary
 
