@@ -981,13 +981,17 @@ def record_user_issue(
 
         auto_eligible = (
             enabled
-            and bool(row.get("cloudiway_object_id"))
             and attempts < max_attempts
             and (
-                (category == "credentials" and credential_available)
+                (
+                    category == "credentials"
+                    and credential_available
+                    and bool(row.get("cloudiway_object_id"))
+                )
                 or (
                     category == "target_mailbox"
                     and issue_code == "target_mailbox_missing"
+                    and bool(row.get("cloudiway_object_id"))
                     and bool(row.get("provisioning_profile_id"))
                 )
                 or (
