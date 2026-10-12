@@ -34,6 +34,13 @@
 <p class="hint">Connect to Cloudiway first. The existing Rackspace/IMAP and Microsoft 365 connector pools will then appear automatically.</p>
 {% endif %}
 <pre id="cloudOut">Connector discovery status will appear here.</pre>
+<hr><h3>Direct Migration / Recovery Email Domain</h3>
+<form method="post" action="/settings/direct-migration">
+<div class="field"><label>Email domain used when an uploaded username has no @domain</label>
+<input name="email_domain" value="{{direct_email_domain}}" placeholder="jcf.gov.jm" required></div>
+<p class="hint">For direct-password and Cloudiway recovery imports, a username such as <b>john.brown</b> is resolved to <b>john.brown@{{direct_email_domain}}</b>. The resolved address is used as both source and destination.</p>
+<button>Save Direct Migration Domain</button>
+</form>
 </div>
 
 <div class="card"><h2>Rackspace Password Administration</h2><p class="{{'ok' if rackspace_configured else 'bad'}}">{{'Configured' if rackspace_configured else 'Not configured'}}</p>
