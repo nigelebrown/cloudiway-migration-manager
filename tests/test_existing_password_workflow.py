@@ -243,8 +243,9 @@ def test_existing_password_auto_start_starts_selected_cloudiway_batch(monkeypatc
                WHERE mbm.migration_batch_id=?""",
             (batch["id"],),
         ).fetchone()
-    assert batch["workflow_status"] == "migrating"
-    assert user["migration_status"] == "migrating"
+    assert batch["workflow_status"] == "starting"
+    assert user["migration_status"] == "starting"
+    assert user["cloudiway_status"] == "start_requested"
 
 
 def test_existing_password_mode_requires_password_column():
