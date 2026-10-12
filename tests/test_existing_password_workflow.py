@@ -743,7 +743,7 @@ def test_per_user_start_restart_reuses_existing_cloudiway_object(monkeypatch):
     with TestClient(app) as client:
         login(client)
         page = client.get(f"/workflow/{upload_id}")
-        assert "Start / Restart Cloudiway" in page.text
+        assert "Start / Restart" in page.text
         response = client.post(
             f"/cloudiway/user/{uid}/start-again",
             follow_redirects=False,
@@ -799,3 +799,57 @@ def test_per_user_start_restart_protects_running_and_completed(monkeypatch):
     assert "already reports" in running["reason"]
     assert done["started"] is False
     assert "Completed" in done["reason"]
+
+
+
+def test_start_restart_button_visible_for_locally_migrating_cloudiway_record(monkeypatch):
+    with conn() as db:
+        up = db.execute(
+            """INSERT INTO upload_batches(
+                   batch_name,workflow_mode,workflow_status,total_rows,imported_rows
+               ) VALUES(?,?,?,?,?)""",
+            ("VISIBLE-U1", "existing_password", "fully_batched", 1, 1),
+        )
+        upload_id = int(up.lastrowid)
+        mb = db.execute(
+            """INSERT INTO migration_batches(
+                   upload_batch_id,sequence_number,batch_name,workflow_status,
+                   cloudiway_batch_id,selected_count
+               ) VALUES(?,?,?,?,?,?)""",
+            (upload_id, 1, "VISIBLE-U1-B001", "migrating", 88, 1),
+        )
+        batch_id = int(mb.lastrowid)
+        db.execute(
+            """INSERT INTO users(
+                   source_email,target_email,cloudiway_object_id,cloudiway_status,
+                   migration_status,batch_number
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                "visible@jcf.gov.jm",
+                "visible@jcf.gov.jm",
+                430,
+                "migrating",
+                "migrating",
+                batch_id,
+            ),
+        )
+        uid = int(db.execute(
+            "SELECT id FROM users WHERE source_email='visible@jcf.gov.jm'"
+        ).fetchone()["id"])
+        db.execute(
+            "INSERT INTO upload_batch_members(upload_batch_id,user_id,row_order) VALUES(?,?,?)",
+            (upload_id, uid, 1),
+        )
+        db.execute(
+            "INSERT INTO migration_batch_members(migration_batch_id,user_id) VALUES(?,?)",
+            (batch_id, uid),
+        )
+
+    with TestClient(app) as client:
+        login(client)
+        page = client.get(f"/workflow/{upload_id}")
+
+    assert page.status_code == 200
+    assert "Cloudiway #430" in page.text
+    assert "Start / Restart" in page.text
+    assert f'/cloudiway/user/{uid}/start-again' in page.text
