@@ -36,3 +36,22 @@ async def test_register_source_credentials_posts_exact_username_and_password(mon
         "userName": "member@jcf.gov.jm",
         "password": "Exact#Password2026",
     }
+
+
+@pytest.mark.asyncio
+async def test_restart_existing_migration_uses_same_cloudiway_object(monkeypatch):
+    from app.config import settings
+
+    client = CloudiwayClient(token="abc", project_header="JCF")
+    captured = {}
+
+    async def fake_get(path, error, include_project=True):
+        captured["path"] = path
+        captured["error"] = error
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    await client.restart_migration(45821)
+
+    assert captured["path"] == f"/Jobs/Restart/45821/{settings.cloudiway_product_type_mail}"
+    assert "restart existing" in captured["error"].lower()
