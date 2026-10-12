@@ -2432,6 +2432,87 @@ def _assert_cloudiway_command_accepted(result, action: str) -> None:
             )
 
 
+async def restart_stuck_cloudiway_user(user_id: int) -> dict:
+    """Manually start/restart one prepared Cloudiway mailbox in place.
+
+    This never creates a duplicate Cloudiway object and never changes the
+    stored source password. It reuses the existing object ID and Cloudiway
+    batch, then sends Cloudiway's mail-specific StartMailJobs request.
+    """
+    with conn() as db:
+        row = db.execute(
+            """SELECT u.id,u.source_email,u.cloudiway_object_id,u.cloudiway_status,
+                      u.migration_status,u.batch_number,mb.cloudiway_batch_id
+               FROM users u
+               LEFT JOIN migration_batches mb ON mb.id=u.batch_number
+               WHERE u.id=?""",
+            (int(user_id),),
+        ).fetchone()
+
+    if not row:
+        return {"started": False, "reason": "User not found"}
+
+    status = str(row.get("migration_status") or "").lower()
+    if status == "completed":
+        return {"started": False, "reason": "Completed migrations are protected and cannot be restarted."}
+    if status == "migrating":
+        return {"started": False, "reason": "Cloudiway already reports this migration as running."}
+
+    object_id = row.get("cloudiway_object_id")
+    if not object_id:
+        return {"started": False, "reason": "This user does not yet have a Cloudiway object ID."}
+
+    cloud = await _cloudiway_client_ready()
+    batch_ids = (
+        [int(row["cloudiway_batch_id"])]
+        if row.get("cloudiway_batch_id")
+        else []
+    )
+    response = await cloud.start_mail_migration(
+        [int(object_id)],
+        batch_ids=batch_ids,
+    )
+    _assert_cloudiway_command_accepted(response, "StartMailJobs manual restart")
+
+    with conn() as db:
+        db.execute(
+            """UPDATE users
+               SET migration_status='starting',
+                   cloudiway_status='manual_start_requested',
+                   batch_started_at=CURRENT_TIMESTAMP,
+                   error_message=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (int(user_id),),
+        )
+        if row.get("batch_number"):
+            db.execute(
+                """UPDATE migration_batches
+                   SET workflow_status='starting',last_error=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (int(row["batch_number"]),),
+            )
+
+    clear_user_issue(
+        int(user_id),
+        "Manual Cloudiway start/restart requested.",
+    )
+    log_event(
+        int(user_id),
+        "cloudiway_manual_start_restart",
+        f"Manual StartMailJobs request sent for Cloudiway object {int(object_id)} "
+        f"in batch {batch_ids[0] if batch_ids else 'none'}; response="
+        + json.dumps(response, default=str)[:1200],
+    )
+    return {
+        "started": True,
+        "user_id": int(user_id),
+        "cloudiway_object_id": int(object_id),
+        "cloudiway_batch_id": batch_ids[0] if batch_ids else None,
+    }
+
+
 async def start_migration_batch(migration_batch_id: int) -> dict:
     """Start one selected batch, restarting existing errored Cloudiway objects in place."""
     with conn() as db:
