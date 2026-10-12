@@ -770,16 +770,8 @@ async def refresh_status() -> dict:
                     # NotStarted. A non-null batch_started_at proves a start
                     # had previously been requested, so it is safe to retry
                     # using the corrected batch-start path automatically.
-                    repair_batch_ids = (
-                        [int(row["cloudiway_batch_id"])]
-                        if row.get("cloudiway_batch_id")
-                        else []
-                    )
-                    repair_response = await cloud.start_mail_migration(
-                        [object_id],
-                        batch_ids=repair_batch_ids,
-                    )
-                    repair_action = "StartMailJobs"
+                    repair_response = await cloud.start_migration([object_id])
+                    repair_action = "StartJobs"
                     _assert_cloudiway_command_accepted(
                         repair_response,
                         f"{repair_action} legacy repair",
@@ -851,9 +843,9 @@ async def refresh_status() -> dict:
                     status = "ready"
                     cloud_status = "not_started"
                     error_message = (
-                        "Cloudiway remained NotStarted after two StartJobs requests. "
-                        "The user is still prepared and the credential is retained; "
-                        "review Cloudiway and use Start again."
+                        "Cloudiway remained NotStarted after the documented StartJobs request "
+                        "and the Mail StartMailJobs fallback. The user is still prepared and "
+                        "the credential is retained; review the Cloudiway response logs before retrying."
                     )
                     not_started += 1
                 else:
@@ -2433,11 +2425,14 @@ def _assert_cloudiway_command_accepted(result, action: str) -> None:
 
 
 async def restart_stuck_cloudiway_user(user_id: int) -> dict:
-    """Manually start/restart one prepared Cloudiway mailbox in place.
+    """Start or restart one existing Cloudiway mailbox safely in place.
 
-    This never creates a duplicate Cloudiway object and never changes the
-    stored source password. It reuses the existing object ID and Cloudiway
-    batch, then sends Cloudiway's mail-specific StartMailJobs request.
+    - NotStarted/unknown -> POST /Jobs/StartJobs/5/33
+    - Failed/Stopped/Attention -> GET /Jobs/Restart/{objectId}/5
+    - Migrating -> protected
+    - Completed -> protected
+
+    The existing Cloudiway object and stored credential are reused.
     """
     with conn() as db:
         row = db.execute(
@@ -2452,38 +2447,51 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
     if not row:
         return {"started": False, "reason": "User not found"}
 
-    status = str(row.get("migration_status") or "").lower()
-    if status == "completed":
-        return {"started": False, "reason": "Completed migrations are protected and cannot be restarted."}
-    if status == "migrating":
-        return {"started": False, "reason": "Cloudiway already reports this migration as running."}
-
     object_id = row.get("cloudiway_object_id")
     if not object_id:
         return {"started": False, "reason": "This user does not yet have a Cloudiway object ID."}
+    object_id = int(object_id)
 
     cloud = await _cloudiway_client_ready()
-    batch_ids = (
-        [int(row["cloudiway_batch_id"])]
-        if row.get("cloudiway_batch_id")
-        else []
-    )
-    response = await cloud.start_mail_migration(
-        [int(object_id)],
-        batch_ids=batch_ids,
-    )
-    _assert_cloudiway_command_accepted(response, "StartMailJobs manual restart")
+
+    live_state = None
+    live_payload = None
+    try:
+        live_payload = await cloud.job_status(object_id)
+        live_state, _ = parse_cloudiway_job_status(live_payload)
+    except Exception as exc:
+        log_event(user_id, "cloudiway_manual_live_status_failed", str(exc))
+
+    local_status = str(row.get("migration_status") or "").lower()
+    effective = live_state or local_status
+
+    if effective == "completed":
+        return {"started": False, "reason": "Completed migrations are protected and cannot be restarted."}
+    if effective == "migrating":
+        return {"started": False, "reason": "Cloudiway already reports this migration as running."}
+
+    if effective in ("failed", "attention"):
+        response = await cloud.restart_migration(object_id)
+        _assert_cloudiway_command_accepted(response, "Restart")
+        action = "Restart"
+        next_cloud_status = "manual_restart_requested"
+    else:
+        # Normal start path for NotStarted/ready/unknown.
+        response = await cloud.start_migration([object_id])
+        _assert_cloudiway_command_accepted(response, "StartJobs")
+        action = "StartJobs"
+        next_cloud_status = "manual_start_requested"
 
     with conn() as db:
         db.execute(
             """UPDATE users
                SET migration_status='starting',
-                   cloudiway_status='manual_start_requested',
+                   cloudiway_status=?,
                    batch_started_at=CURRENT_TIMESTAMP,
                    error_message=NULL,
                    updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
-            (int(user_id),),
+            (next_cloud_status, int(user_id)),
         )
         if row.get("batch_number"):
             db.execute(
@@ -2496,21 +2504,23 @@ async def restart_stuck_cloudiway_user(user_id: int) -> dict:
 
     clear_user_issue(
         int(user_id),
-        "Manual Cloudiway start/restart requested.",
+        f"Manual Cloudiway {action} requested.",
     )
     log_event(
         int(user_id),
         "cloudiway_manual_start_restart",
-        f"Manual StartMailJobs request sent for Cloudiway object {int(object_id)} "
-        f"in batch {batch_ids[0] if batch_ids else 'none'}; response="
+        f"Manual {action} request sent for Cloudiway object {object_id}; "
+        f"live_state={live_state or 'unknown'}; response="
         + json.dumps(response, default=str)[:1200],
     )
     return {
         "started": True,
+        "action": action,
         "user_id": int(user_id),
-        "cloudiway_object_id": int(object_id),
-        "cloudiway_batch_id": batch_ids[0] if batch_ids else None,
+        "cloudiway_object_id": object_id,
+        "cloudiway_batch_id": int(row["cloudiway_batch_id"]) if row.get("cloudiway_batch_id") else None,
     }
+
 
 
 async def start_migration_batch(migration_batch_id: int) -> dict:
@@ -2586,20 +2596,14 @@ async def start_migration_batch(migration_batch_id: int) -> dict:
     ]
 
     if start_ids:
-        # This is a mailbox migration. Cloudiway's Mail controller exposes the
-        # purpose-built StartMailJobs endpoint whose DTO accepts both objectIds
-        # and batchIds. Use that as the authoritative start operation.
-        cloud_batch_ids = (
-            [int(batch["cloudiway_batch_id"])]
-            if batch.get("cloudiway_batch_id")
-            else []
-        )
-        start_response = await cloud.start_mail_migration(
-            start_ids,
-            batch_ids=cloud_batch_ids,
-        )
-        _assert_cloudiway_command_accepted(start_response, "StartMailJobs")
-        start_method = "StartMailJobs"
+        # Cloudiway's JCF API quick-reference and Swagger define the normal
+        # Mail migration start as POST /Jobs/StartJobs/5/33 with an array of
+        # object IDs. Use that documented route first. The Mail-controller
+        # StartMailJobs route is retained only as a bounded fallback if the
+        # live job status remains NotStarted.
+        start_response = await cloud.start_migration(start_ids)
+        _assert_cloudiway_command_accepted(start_response, "StartJobs")
+        start_method = "StartJobs"
 
         log_event(
             None,
