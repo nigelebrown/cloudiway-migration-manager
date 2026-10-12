@@ -965,7 +965,7 @@ def record_user_issue(
     with conn() as db:
         row = db.execute(
             """SELECT issue_code,issue_status,auto_recovery_attempts,auto_recovery_next_at,
-                      auto_recovery_status,cloudiway_object_id,provisioning_profile_id,
+                      auto_recovery_status,cloudiway_object_id,provisioning_profile_id,batch_number,
                       source_credential_password_enc,generated_password_enc
                FROM users WHERE id=?""",
             (user_id,),
@@ -989,6 +989,11 @@ def record_user_issue(
                     category == "target_mailbox"
                     and issue_code == "target_mailbox_missing"
                     and bool(row.get("provisioning_profile_id"))
+                )
+                or (
+                    category == "cloudiway"
+                    and issue_code == "cloudiway_submission_failed"
+                    and bool(row.get("batch_number"))
                 )
             )
         )
@@ -1350,6 +1355,132 @@ async def recover_target_mailbox_issue(user_id: int) -> dict:
     }
 
 
+async def recover_cloudiway_submission_issue(user_id: int) -> dict:
+    """Retry a user that failed before it was successfully submitted/prepared in Cloudiway.
+
+    Automatic recovery is intentionally limited to workflows that do not perform
+    a new live Rackspace password reset. The automatic Rackspace-API workflow is
+    held for manual review because retrying it could change the mailbox password
+    again.
+    """
+    enabled, delay_minutes, max_attempts = _issue_recovery_settings()
+    if not enabled:
+        return {"recovered": False, "reason": "Automatic issue recovery is disabled"}
+
+    with conn() as db:
+        user_row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user_row:
+            return {"recovered": False, "reason": "User not found"}
+        user = dict(user_row)
+        if not user.get("batch_number"):
+            return {"recovered": False, "reason": "User is not linked to a migration batch"}
+        batch = db.execute(
+            """SELECT mb.*,ub.workflow_mode
+               FROM migration_batches mb
+               JOIN upload_batches ub ON ub.id=mb.upload_batch_id
+               WHERE mb.id=?""",
+            (int(user["batch_number"]),),
+        ).fetchone()
+
+    if not batch:
+        return {"recovered": False, "reason": "Migration batch not found"}
+
+    workflow_mode = str(batch.get("workflow_mode") or "")
+    if workflow_mode in ("automatic", "existing_password_retry"):
+        with conn() as db:
+            db.execute(
+                """UPDATE users SET issue_status='manual_required',
+                   manual_action_required=1,auto_recovery_status='manual_required',
+                   auto_recovery_next_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (user_id,),
+            )
+        return {
+            "recovered": False,
+            "reason": "This workflow requires manual review before retrying submission",
+        }
+
+    attempts = int(user.get("auto_recovery_attempts") or 0)
+    if attempts >= max_attempts:
+        with conn() as db:
+            db.execute(
+                """UPDATE users SET issue_status='manual_required',
+                   manual_action_required=1,auto_recovery_status='exhausted',
+                   auto_recovery_next_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (user_id,),
+            )
+        return {"recovered": False, "reason": "Automatic submission retries exhausted"}
+
+    if workflow_mode == "manual_bulk":
+        if user.get("rackspace_status") != "manual_confirmed":
+            with conn() as db:
+                db.execute(
+                    """UPDATE users SET issue_status='manual_required',
+                       manual_action_required=1,auto_recovery_status='manual_required',
+                       auto_recovery_next_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (user_id,),
+                )
+            return {"recovered": False, "reason": "Rackspace password confirmation is required"}
+        object_id = await prepare_manual_user(user_id)
+    elif workflow_mode == "existing_password":
+        object_id = await prepare_existing_password_user(user_id)
+    else:
+        return {"recovered": False, "reason": f"Workflow mode {workflow_mode!r} is not safe for automatic submission retry"}
+
+    cloud = await _cloudiway_client_ready()
+    cloud_batch_id = batch.get("cloudiway_batch_id")
+    if cloud_batch_id:
+        await cloud.add_mail_batch_members(int(cloud_batch_id), [int(object_id)])
+
+    should_start = batch.get("workflow_status") == "migrating" or int(batch.get("auto_start") or 0) == 1
+    if should_start:
+        await cloud.start_migration([int(object_id)])
+        migration_status = "migrating"
+        cloud_status = "auto_submission_recovered_started"
+    else:
+        migration_status = "ready"
+        cloud_status = "auto_submission_recovered_ready"
+
+    new_attempts = attempts + 1
+    next_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=delay_minutes)
+    with conn() as db:
+        db.execute(
+            """UPDATE users
+               SET cloudiway_object_id=?,cloudiway_status=?,migration_status=?,
+                   issue_status=?,manual_action_required=0,
+                   auto_recovery_attempts=?,auto_recovery_status='submission_retried',
+                   auto_recovery_last_at=CURRENT_TIMESTAMP,auto_recovery_next_at=?,
+                   error_message=NULL,updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (
+                int(object_id),
+                cloud_status,
+                migration_status,
+                "recovering" if should_start else "resolved",
+                new_attempts,
+                next_at if should_start else None,
+                user_id,
+            ),
+        )
+
+    log_event(
+        user_id,
+        "automatic_cloudiway_submission_recovery",
+        f"Retried Cloudiway preparation for workflow={workflow_mode}; object={object_id}; "
+        f"batch={cloud_batch_id or 'none'}; started={should_start}; attempt={new_attempts}/{max_attempts}.",
+    )
+    if not should_start:
+        clear_user_issue(
+            user_id,
+            "Cloudiway preparation succeeded after an automatic retry; user is ready for the batch to start.",
+        )
+    return {
+        "recovered": True,
+        "object_id": int(object_id),
+        "started": should_start,
+        "attempt": new_attempts,
+    }
+
+
 async def process_background_issues() -> dict:
     """Handle actionable issues independently of the administrator web session."""
     enabled, _, max_attempts = _issue_recovery_settings()
@@ -1361,7 +1492,7 @@ async def process_background_issues() -> dict:
     with conn() as db:
         rows = db.execute(
             """SELECT id FROM users
-               WHERE issue_category IN ('credentials','target_mailbox')
+               WHERE issue_category IN ('credentials','target_mailbox','cloudiway')
                  AND issue_status IN ('open','recovering')
                  AND manual_action_required=0
                  AND auto_recovery_attempts < ?
@@ -1382,6 +1513,8 @@ async def process_background_issues() -> dict:
                 ).fetchone()
             if issue_row and issue_row.get("issue_category") == "target_mailbox" and issue_row.get("issue_code") == "target_mailbox_missing":
                 result = await recover_target_mailbox_issue(uid)
+            elif issue_row and issue_row.get("issue_category") == "cloudiway" and issue_row.get("issue_code") == "cloudiway_submission_failed":
+                result = await recover_cloudiway_submission_issue(uid)
             else:
                 result = await recover_credential_issue(uid)
             if result.get("recovered"):
