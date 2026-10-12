@@ -32,7 +32,8 @@ button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#
 <select id="workflowMode" name="workflow_mode" onchange="showModeHelp()">
 <option value="manual_bulk" selected>Manual Rackspace bulk reset — generate new passwords later</option>
 <option value="automatic">Automatic Rackspace API reset — use Rackspace API when available</option>
-<option value="existing_password">Existing source password in Excel — Cloudiway only, skip AD and password reset</option>
+<option value="existing_password">Existing source password — new/direct Cloudiway migration</option>
+<option value="existing_password_retry">Cloudiway error recovery — push password again & restart failed migration</option>
 </select></div>
 
 <div id="normalHelp" class="modebox">
@@ -43,10 +44,14 @@ button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#
 
 <div id="existingHelp" class="modebox" style="display:none">
 <h3>Existing password → Cloudiway only</h3>
-<p>Required columns: <code>source_email</code>, <code>target_email</code>, <code>password</code>.</p>
+<p>Required columns: <code>username</code> (or email) and <code>password</code>. If username has no @domain, the saved Direct Migration Email Domain is appended automatically. The resolved email is used as both source and destination.</p>
 <p>Optional reference columns: <code>first_name</code>, <code>middle_name</code>, <code>last_name</code>, <code>computer_number</code>.</p>
-<div class="warn"><b>No AD work is performed in this mode.</b> The app does not create, modify, enable, or validate an AD account and does not reset the Rackspace password. It encrypts the supplied password, sends that source credential to Cloudiway for the selected users, and uses the existing configured Cloudiway source/target connectors. The Microsoft 365 target mailbox therefore needs to already exist and be usable.</div>
-<p class="hint">The password is stored encrypted in MySQL and is not written to application logs. Use the exact current IMAP/Rackspace source password in the spreadsheet.</p>
+<div class="warn"><b>No AD work is performed in this mode.</b> The supplied password is encrypted and registered with Cloudiway. Use this option for a new/direct migration where the Cloudiway user may need to be created.</div>
+</div>
+<div id="retryHelp" class="modebox" style="display:none">
+<h3>Cloudiway error recovery</h3>
+<p>Required columns: <code>username</code> (or email) and <code>password</code>. The same source=destination email resolution is used.</p>
+<div class="warn"><b>Recovery is existing-object only.</b> The app finds the existing Cloudiway mail user, checks its live state, pushes the supplied source password again only when the job is failed/attention, then restarts that same Cloudiway object in place. Running or completed migrations are not restarted, and a missing Cloudiway user is not created by this recovery option.</div>
 </div>
 
 <button>Upload & Stage Master List</button>
@@ -54,9 +59,12 @@ button{background:#0284c7;color:white;border:0;font-weight:800}code{background:#
 </div></div>
 <script>
 function showModeHelp(){
-  const direct=document.getElementById('workflowMode').value==='existing_password';
+  const mode=document.getElementById('workflowMode').value;
+  const direct=mode==='existing_password';
+  const retry=mode==='existing_password_retry';
   document.getElementById('existingHelp').style.display=direct?'block':'none';
-  document.getElementById('normalHelp').style.display=direct?'none':'block';
+  document.getElementById('retryHelp').style.display=retry?'block':'none';
+  document.getElementById('normalHelp').style.display=(direct||retry)?'none':'block';
 }
 showModeHelp();
 </script></body></html>
