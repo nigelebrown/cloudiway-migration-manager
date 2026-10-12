@@ -538,3 +538,120 @@ def test_individual_push_and_start_requests_cloudiway_start(monkeypatch):
     assert member["source_email"] == "two@rack.example"
     assert member["migration_status"] == "starting"
     assert member["cloudiway_status"] == "start_requested"
+
+
+
+def test_new_controlled_group_prefers_cloudiway_batch_start_api(monkeypatch):
+    from app import service
+
+    class BatchStartCloud(FakeCloud):
+        def __init__(self):
+            super().__init__()
+            self.batch_starts = []
+
+        async def start_batch_migration(self, batch_id):
+            self.batch_starts.append(int(batch_id))
+            return {
+                "isSuccess": True,
+                "message": "StartBatch done",
+                "count": 0,
+                "responseData": None,
+                "error": [],
+            }
+
+    cloud = BatchStartCloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+    set_setting("cloudiway_token", encrypt_secret("test-cloudiway-token"), True)
+    set_setting("cloudiway_source_pool_id", "4")
+    set_setting("cloudiway_target_pool_id", "3")
+
+    with TestClient(app) as client:
+        login(client)
+        client.post(
+            "/upload",
+            files={"file": ("existing.csv", existing_password_csv(), "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        with conn() as db:
+            upload_id = int(db.execute("SELECT id FROM upload_batches").fetchone()["id"])
+
+        response = client.post(
+            f"/workflow/{upload_id}/generate",
+            data={"quantity": "2", "auto_start": "1"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert cloud.batch_starts == [99001]
+    assert cloud.started == []
+    with conn() as db:
+        batch = db.execute("SELECT * FROM migration_batches").fetchone()
+        users = db.execute(
+            """SELECT u.migration_status,u.cloudiway_status
+               FROM migration_batch_members mbm
+               JOIN users u ON u.id=mbm.user_id
+               WHERE mbm.migration_batch_id=?""",
+            (batch["id"],),
+        ).fetchall()
+    assert batch["workflow_status"] == "starting"
+    assert all(u["migration_status"] == "starting" for u in users)
+    assert all(u["cloudiway_status"] == "start_requested" for u in users)
+
+
+def test_individual_push_and_start_uses_one_user_cloudiway_batch_start(monkeypatch):
+    from app import service
+
+    class BatchStartCloud(FakeCloud):
+        def __init__(self):
+            super().__init__()
+            self.batch_starts = []
+
+        async def start_batch_migration(self, batch_id):
+            self.batch_starts.append(int(batch_id))
+            return {
+                "isSuccess": True,
+                "message": "StartBatch done",
+                "count": 0,
+                "responseData": None,
+                "error": [],
+            }
+
+    cloud = BatchStartCloud()
+
+    async def ready():
+        return cloud
+
+    monkeypatch.setattr(service, "_cloudiway_client_ready", ready)
+    set_setting("cloudiway_token", encrypt_secret("test-cloudiway-token"), True)
+    set_setting("cloudiway_source_pool_id", "4")
+    set_setting("cloudiway_target_pool_id", "3")
+
+    with TestClient(app) as client:
+        login(client)
+        client.post(
+            "/upload",
+            files={"file": ("existing.csv", existing_password_csv(), "text/csv")},
+            data={"workflow_mode": "existing_password"},
+            follow_redirects=False,
+        )
+        with conn() as db:
+            upload_id = int(db.execute("SELECT id FROM upload_batches").fetchone()["id"])
+            user_id = int(
+                db.execute(
+                    "SELECT id FROM users WHERE source_email='two@rack.example'"
+                ).fetchone()["id"]
+            )
+
+        response = client.post(
+            f"/workflow/{upload_id}/push-start-user/{user_id}",
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    assert cloud.batch_starts == [99001]
+    assert cloud.started == []
